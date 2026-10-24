@@ -22,11 +22,10 @@ for the M0 spike is:
 ```
 
 It contains the single-node cluster (consensus module, service container,
-client, `echo` / `basic-auction` businesses), which is all the M0 spike needs.
-The missing pieces listed in
-[`docs/reviews/deepmsg_移植缺口分析_cluster_archive_2026-10-24.md`](reviews/deepmsg_移植缺口分析_cluster_archive_2026-10-24.md)
-(`Cluster.aeron()`, `context()`, vectored offer, `ClusteredMediaDriver`) are
-**not** on the M0 path; they matter at M4/M5.
+client, `echo` / `basic-auction` businesses), which is all the spike needs.
+The known gaps (`Cluster.aeron()`, `Cluster.context()`, vectored offer, and an
+all-in-one `ClusteredMediaDriver` binary) are not on the spike path; they
+matter once the engine is hosted in the cluster. See ADR 0001.
 
 ## Cargo.toml shape
 

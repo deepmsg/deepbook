@@ -10,8 +10,8 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0 — skeleton**. The workspace builds and the tests run, but there
-> is no engine, gateway, or wire protocol yet. See the milestone table below.
+> Status: **skeleton**. The workspace builds and the tests run, but there is no
+> engine, gateway, or wire protocol yet.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -49,21 +49,11 @@ A single-node cluster is the default deployment. Three nodes are used only for
 the failover demo; a single node is a first-class configuration (quorum of one),
 not a degraded mode.
 
-## Milestones
+## Design
 
-| Stage | Days | Deliverable | Acceptance |
-|---|---|---|---|
-| M0 | 3 | skeleton, `types` v0, SBE schema v0, cluster spike | `cargo test` green; Rust CM + container + client echo |
-| M1 | 5 | FIX 4.4 session subset (epoll), NewOrderSingle, ExecutionReport, outbound journal | QuickFIX/J logon, order, report; resend/gap rules |
-| M2 | 4 | `engine-core`: limit/market, GTC/IOC/FOK, cancel/replace; counting allocator; Vec oracle | unit + proptest + differential oracle green |
-| M3 | 3 | market data incremental + snapshot + recovery; loss-generator test | subscriber recovers from a forced gap |
-| M4 | 4 | single-node cluster integration; snapshot + recovery + determinism | replay twice → same hashes; kill -9 recovery |
-| M5 | 3 | io_uring, benchmark, Grafana, UI | client-side RTT table; epoll vs io_uring |
-| M6 (optional) | 4 | three-node failover; price-band array | leader kill → recovery under 5 s, no duplicate fills |
-
-The full design is in [`docs/design/deepbook_架构设计_v0.3.md`](docs/design/deepbook_架构设计_v0.3.md).
-Reviews and porting notes are under [`docs/reviews/`](docs/reviews/) and
-[`docs/notes/`](docs/notes/).
+Decisions that affect the code are recorded as ADRs in [`docs/adr/`](docs/adr/).
+Longer design documents are maintained outside this repository. The deepmsg pin
+and the local patch recipe are in [`docs/deps.md`](docs/deps.md).
 
 ## Layout
 
@@ -80,7 +70,7 @@ crates/
   ui/              static dashboard (not a workspace member)
 schemas/           SBE XML
 deploy/            compose, bind-core scripts, spike scripts
-docs/              design, reviews, ADRs
+docs/              ADRs and dependency notes
 tests/             integration / conformance / differential / replay
 ```
 

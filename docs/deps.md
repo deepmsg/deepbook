@@ -14,12 +14,17 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 
 ## Current pin
 
-Not wired yet (M0 skeleton has no deepmsg dependency). The intended first pin
-for the M0 spike is:
+Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
 8c70972
 ```
+
+The cluster checks in `crates/spike` consume those crates and run deepmsg's
+**production binaries** from `DEEPBOOK_DEEPMSG_DIR` (default `../deepmsg`). The
+spike strips every `DEEPMSG_*` and `AERON_*` variable from its children: deepmsg
+lets `DEEPMSG_DIR` beat a `-D` argument, so a parent that sets it to locate the
+binaries must not leak it into the driver process.
 
 It contains the single-node cluster (consensus module, service container,
 client, `echo` / `basic-auction` businesses), which is all the spike needs.

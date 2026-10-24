@@ -54,5 +54,106 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepbook-spike"
+version = "0.1.0"
+dependencies = [
+ "deepmsg-client",
+ "deepmsg-cluster-client",
+ "deepmsg-cluster-common",
+ "deepmsg-cnc",
+ "deepmsg-core",
+]
+
+[[package]]
 name = "deepbook-types"
 version = "0.1.0"
+
+[[package]]
+name = "deepmsg-client"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+dependencies = [
+ "deepmsg-cnc",
+ "deepmsg-core",
+]
+
+[[package]]
+name = "deepmsg-cluster-client"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+dependencies = [
+ "deepmsg-client",
+ "deepmsg-cluster-common",
+ "deepmsg-cnc",
+ "deepmsg-codec",
+ "deepmsg-core",
+]
+
+[[package]]
+name = "deepmsg-cluster-common"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+dependencies = [
+ "deepmsg-cnc",
+ "deepmsg-codec-cluster-mark",
+ "deepmsg-core",
+]
+
+[[package]]
+name = "deepmsg-cnc"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+dependencies = [
+ "deepmsg-core",
+]
+
+[[package]]
+name = "deepmsg-codec"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+dependencies = [
+ "deepmsg-codec-archive",
+ "deepmsg-codec-archive-mark",
+ "deepmsg-codec-cluster",
+ "deepmsg-codec-cluster-mark",
+ "deepmsg-codec-cluster-node-state",
+]
+
+[[package]]
+name = "deepmsg-codec-archive"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+
+[[package]]
+name = "deepmsg-codec-archive-mark"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+
+[[package]]
+name = "deepmsg-codec-cluster"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+
+[[package]]
+name = "deepmsg-codec-cluster-mark"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+
+[[package]]
+name = "deepmsg-codec-cluster-node-state"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+
+[[package]]
+name = "deepmsg-core"
+version = "0.1.0"
+source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"

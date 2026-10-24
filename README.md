@@ -11,7 +11,8 @@ market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
 > Status: **skeleton**. The workspace builds and the tests run, but there is no
-> engine, gateway, or wire protocol yet.
+> engine, gateway, or wire protocol yet. The cluster checks live in
+> `crates/spike`.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -67,6 +68,7 @@ crates/
   marketdata/      incremental/snapshot/recovery
   admin/           HTTP/WS, kill switch, queries
   bench/           open-loop client, latency harness
+  spike/           cluster checks: process control, latency, recovery
   ui/              static dashboard (not a workspace member)
 schemas/           SBE XML
 deploy/            compose, bind-core scripts, spike scripts

@@ -1,0 +1,13 @@
+[package]
+name = "deepbook-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: integer price/quantity types, order ids and the log/sequence identifiers"
+
+[lints]
+workspace = true
+
+[dependencies]

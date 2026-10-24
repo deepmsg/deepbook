@@ -1,0 +1,14 @@
+[package]
+name = "deepbook-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: open-loop FIX client and latency harness"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepbook-types = { path = "../types" }

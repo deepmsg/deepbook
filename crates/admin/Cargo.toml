@@ -1,0 +1,14 @@
+[package]
+name = "deepbook-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: HTTP/WS, kill switch, queries and the UI host"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepbook-types = { path = "../types" }

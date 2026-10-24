@@ -1,0 +1,5 @@
+[licenses]
+allow = ["Apache-2.0", "MIT", "ISC", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
+
+[bans]
+multiple-versions = "warn"

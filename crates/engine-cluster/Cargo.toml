@@ -1,0 +1,18 @@
+[package]
+name = "deepbook-engine-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: ClusteredService adapter and snapshot serialization"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepbook-types = { path = "../types" }
+deepbook-engine-core = { path = "../engine-core" }
+
+# Added at M4, pinned by revision (see docs/deps.md):
+# deepmsg-cluster-service = { workspace = true }

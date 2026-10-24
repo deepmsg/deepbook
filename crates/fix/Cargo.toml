@@ -1,0 +1,14 @@
+[package]
+name = "deepbook-fix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: FIX 4.4 session layer, codec and outbound journal"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepbook-types = { path = "../types" }

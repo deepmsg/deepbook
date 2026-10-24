@@ -1,0 +1,15 @@
+[package]
+name = "deepbook-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: FIX acceptor, session registry and cluster client"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepbook-types = { path = "../types" }
+deepbook-fix = { path = "../fix" }

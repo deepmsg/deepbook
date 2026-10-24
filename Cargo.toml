@@ -9,6 +9,7 @@ members = [
     "crates/marketdata",
     "crates/admin",
     "crates/bench",
+    "crates/spike",
 ]
 
 [workspace.package]
@@ -17,6 +18,14 @@ edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/deepmsg/deepbook"
+
+[workspace.dependencies]
+# deepmsg is pinned by revision; see docs/deps.md. Never use a branch here.
+deepmsg-client = { git = "https://github.com/deepmsg/deepmsg", rev = "8c70972" }
+deepmsg-core = { git = "https://github.com/deepmsg/deepmsg", rev = "8c70972" }
+deepmsg-cnc = { git = "https://github.com/deepmsg/deepmsg", rev = "8c70972" }
+deepmsg-cluster-client = { git = "https://github.com/deepmsg/deepmsg", rev = "8c70972" }
+deepmsg-cluster-common = { git = "https://github.com/deepmsg/deepmsg", rev = "8c70972" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

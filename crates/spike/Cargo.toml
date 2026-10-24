@@ -1,0 +1,23 @@
+[package]
+name = "deepbook-spike"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: M0 cluster spike — process control, latency and recovery checks"
+publish = false
+
+[[bin]]
+name = "cluster-spike"
+path = "src/bin/cluster-spike.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+deepmsg-client = { workspace = true }
+deepmsg-core = { workspace = true }
+deepmsg-cnc = { workspace = true }
+deepmsg-cluster-client = { workspace = true }
+deepmsg-cluster-common = { workspace = true }

@@ -10,9 +10,9 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **skeleton**. The workspace builds and the tests run, but there is no
-> engine, gateway, or wire protocol yet. The cluster checks live in
-> `crates/spike`.
+> Status: **M0 complete; M1a landed.** The cluster checks pass and the FIX 4.4
+> codec, session state machine and outbound journal are in `crates/fix`. The
+> epoll acceptor, gateway event loop, engine and market data are still to come.
 
 ## What deepmsg provides, and what deepbook brings
 

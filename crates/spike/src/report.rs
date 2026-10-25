@@ -67,6 +67,12 @@ pub fn micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e6
 }
 
+/// Format a duration in milliseconds with one decimal.
+#[must_use]
+pub fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1e3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -27,7 +27,7 @@ use deepmsg_cnc::file::CncFile;
 
 use crate::config::{Config, Paths, Ports};
 
-const READY_TIMEOUT: Duration = Duration::from_secs(20);
+pub(crate) const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One single-node cluster, owned as child processes.
@@ -229,41 +229,11 @@ impl Processes {
     }
 
     fn wait_for_driver(&mut self, aeron: &Path, log: &Path) -> Result<(), String> {
-        let cnc = aeron.join("cnc.dat");
-        let deadline = Instant::now() + READY_TIMEOUT;
-
-        while Instant::now() < deadline {
-            if let Some(driver) = self.driver.as_mut() {
-                if let Some(status) = driver
-                    .try_wait()
-                    .map_err(|error| format!("driver wait: {error}"))?
-                {
-                    return Err(format!(
-                        "the driver exited before it was ready ({status}):\n{}",
-                        tail(log)
-                    ));
-                }
-            }
-            // The log line, not the mark file: the mark file is persistent and
-            // exists from the previous generation, so waiting for it made a
-            // restart look ready before the new archive had served anything.
-            let archive_running =
-                std::fs::read_to_string(log).is_ok_and(|text| text.contains("archive running"));
-            if cnc.exists() && archive_running {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let archive_running =
-            std::fs::read_to_string(log).is_ok_and(|text| text.contains("archive running"));
-        Err(format!(
-            "the driver did not become ready in {READY_TIMEOUT:?} \
-             (cnc={} archive_running={}):\n{}",
-            cnc.exists(),
-            archive_running,
-            tail(log)
-        ))
+        let driver = self
+            .driver
+            .as_mut()
+            .ok_or_else(|| "the driver was not started".to_owned())?;
+        wait_for_driver_ready(aeron, log, driver)
     }
 
     fn logs(&self) -> &Path {
@@ -373,11 +343,11 @@ pub const fn connect_timeout() -> Duration {
     CONNECT_TIMEOUT
 }
 
-fn d(name: &str, value: impl std::fmt::Display) -> String {
+pub(crate) fn d(name: &str, value: impl std::fmt::Display) -> String {
     format!("-D{name}={value}")
 }
 
-fn spawn(binary: &Path, args: &[String], log: &Path) -> Result<Child, String> {
+pub(crate) fn spawn(binary: &Path, args: &[String], log: &Path) -> Result<Child, String> {
     let stdout = File::create(log).map_err(|error| format!("{}: {error}", log.display()))?;
     let stderr = stdout
         .try_clone()
@@ -407,10 +377,52 @@ fn spawn(binary: &Path, args: &[String], log: &Path) -> Result<Child, String> {
         .map_err(|error| format!("{}: {error}", binary.display()))
 }
 
-fn tail(path: &Path) -> String {
+pub(crate) fn tail(path: &Path) -> String {
     let Ok(text) = std::fs::read_to_string(path) else {
         return "<no log>".to_owned();
     };
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(40)..].join("\n")
+}
+
+/// Wait until the driver's CnC file exists **and** its archive is serving.
+///
+/// The log line, not the mark file: the mark file is persistent and exists
+/// from a previous generation, so waiting for it would let a restart look
+/// ready before the new archive had served anything.
+pub(crate) fn wait_for_driver_ready(
+    aeron: &Path,
+    log: &Path,
+    driver: &mut Child,
+) -> Result<(), String> {
+    let cnc = aeron.join("cnc.dat");
+    let deadline = Instant::now() + READY_TIMEOUT;
+
+    while Instant::now() < deadline {
+        if let Some(status) = driver
+            .try_wait()
+            .map_err(|error| format!("driver wait: {error}"))?
+        {
+            return Err(format!(
+                "the driver exited before it was ready ({status}):\n{}",
+                tail(log)
+            ));
+        }
+        let archive_running =
+            std::fs::read_to_string(log).is_ok_and(|text| text.contains("archive running"));
+        if cnc.exists() && archive_running {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let archive_running =
+        std::fs::read_to_string(log).is_ok_and(|text| text.contains("archive running"));
+    Err(format!(
+        "the driver did not become ready in {READY_TIMEOUT:?} \
+         (cnc={} archive_running={}):\n{}",
+        cnc.exists(),
+        archive_running,
+        tail(log)
+    ))
 }

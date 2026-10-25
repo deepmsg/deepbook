@@ -201,15 +201,88 @@ impl Ports {
         self.base + 40
     }
 
+    /// The ingress port of `member` in a multi-member cluster.
+    #[must_use]
+    pub const fn ingress_of(self, member: usize) -> u16 {
+        self.base + member as u16
+    }
+
+    /// The consensus port of `member` in a multi-member cluster.
+    #[must_use]
+    pub const fn consensus_of(self, member: usize) -> u16 {
+        self.base + 10 + member as u16
+    }
+
+    /// The log port of `member` in a multi-member cluster.
+    #[must_use]
+    pub const fn log_of(self, member: usize) -> u16 {
+        self.base + 20 + member as u16
+    }
+
+    /// The archive control port of `member` in a multi-member cluster.
+    #[must_use]
+    pub const fn archive_of(self, member: usize) -> u16 {
+        self.base + 40 + member as u16
+    }
+
+    /// The archive control port of the client's own driver, which is not a
+    /// member and never dials or is dialled by the cluster.
+    #[must_use]
+    pub const fn client_archive(self) -> u16 {
+        self.base + 43
+    }
+
     /// `id,ingress,consensus,log,catchup,archive` for one member.
     #[must_use]
     pub fn member_string(self) -> String {
-        format!(
-            "0,localhost:{},localhost:{},localhost:{},localhost:0,localhost:{}",
-            self.ingress(),
-            self.consensus(),
-            self.log(),
-            self.archive()
-        )
+        self.members_string(1)
+    }
+
+    /// The member string of a `count`-member cluster, members `0..count`.
+    ///
+    /// Each member's ingress, consensus, log and archive endpoints are its own;
+    /// the catchup endpoint is `:0` because it is resolved at run time
+    /// (`ClusterMember.java:561-564`).
+    #[must_use]
+    pub fn members_string(self, count: usize) -> String {
+        (0..count)
+            .map(|member| {
+                format!(
+                    "{member},localhost:{},localhost:{},localhost:{},localhost:0,localhost:{}",
+                    self.ingress_of(member),
+                    self.consensus_of(member),
+                    self.log_of(member),
+                    self.archive_of(member)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_member_string_has_one_entry_per_member() {
+        let ports = Ports::new(25_000);
+        let members = ports.members_string(3);
+        let entries: Vec<&str> = members.split('|').collect();
+        assert_eq!(3, entries.len());
+        assert_eq!(
+            "0,localhost:25000,localhost:25010,localhost:25020,localhost:0,localhost:25040",
+            entries[0]
+        );
+        assert_eq!(
+            "2,localhost:25002,localhost:25012,localhost:25022,localhost:0,localhost:25042",
+            entries[2]
+        );
+    }
+
+    #[test]
+    fn the_single_member_string_is_the_first_entry() {
+        let ports = Ports::new(25_000);
+        assert_eq!(ports.members_string(1), ports.member_string());
     }
 }

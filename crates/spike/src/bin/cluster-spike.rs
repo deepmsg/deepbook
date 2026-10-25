@@ -4,6 +4,7 @@
 //! cluster-spike smoke
 //! cluster-spike p99 [--rate N] [--samples N] [--warmup N]
 //! cluster-spike gate3 [--bids N]
+//! cluster-spike gate4 [--bids N]
 //! ```
 //!
 //! Common options: `--deepmsg-dir PATH`, `--profile release|debug`,
@@ -40,7 +41,10 @@ fn main() -> ExitCode {
             "--deepmsg-dir" => deepmsg_dir = Some(take(&args, &mut index, "deepmsg-dir")),
             "--profile" => profile = Some(take(&args, &mut index, "profile")),
             "--base-port" => base_port = Some(take(&args, &mut index, "base-port")),
-            "--keep" => keep = true,
+            "--keep" => {
+                keep = true;
+                index += 1;
+            }
             "--help" | "-h" => {
                 usage();
                 return ExitCode::SUCCESS;
@@ -67,6 +71,7 @@ fn main() -> ExitCode {
         "smoke" => scenarios::smoke::run(config),
         "p99" => scenarios::p99::run(config, rate, samples, warmup),
         "gate3" => scenarios::gate3::run(config, bids),
+        "gate4" => scenarios::gate4::run(config, bids),
         other => {
             eprintln!("unknown command: {other}");
             usage();
@@ -98,6 +103,6 @@ fn take<T: std::str::FromStr>(args: &[String], index: &mut usize, name: &str) ->
 
 fn usage() {
     eprintln!(
-        "usage:\n  cluster-spike smoke\n  cluster-spike p99 [--rate N] [--samples N] [--warmup N]\n  cluster-spike gate3 [--bids N]\n\ncommon: --deepmsg-dir PATH --profile release|debug --base-port N --keep"
+        "usage:\n  cluster-spike smoke\n  cluster-spike p99 [--rate N] [--samples N] [--warmup N]\n  cluster-spike gate3 [--bids N]\n  cluster-spike gate4 [--bids N]\n\ncommon: --deepmsg-dir PATH --profile release|debug --base-port N --keep"
     );
 }

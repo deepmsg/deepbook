@@ -178,8 +178,9 @@ order, the levels, the idempotency window, the open-order counts and the kill
 switches. A restored engine has the same book hash and produces the same future
 order ids and events as the engine that wrote the snapshot.
 
-`engine-cluster` has the versioned `DBS1` snapshot record. The
-`ClusteredService` adapter, the deepbook container binary, the gateway's
+`engine-cluster` has the versioned `DBS1` snapshot record, the `EngineService`
+`ClusteredService` adapter (command/event wire, per-session egress, chunked
+snapshot write and restore) and the `engine-container` binary. The gateway's
 cluster client and the process-based single-node kill/restart e2e are the
 remaining M4 slices; ADR 0005 records the snapshot decisions.
 

@@ -1,6 +1,6 @@
 # ADR 0005: Engine snapshot state and record
 
-- Status: **Accepted** — 2026-10-25, implemented by M4a (the cluster adapter is M4b)
+- Status: **Accepted** — 2026-10-25, implemented by M4a/M4b (the gateway cluster client and e2e are M4c)
 - Date: 2026-10-25
 - Deciders: project owner
 
@@ -50,6 +50,7 @@ silently changed by a snapshot.
 - The snapshot size grows with the number of used orders plus one generation
   byte per slab slot; the free list is explicit. This is the price of identical
   future order ids. M6 can compact it once the allocation scheme changes.
-- `engine-cluster`'s `ClusteredService` adapter (M4b) calls `Engine::snapshot`
-  in `on_take_snapshot` and `Engine::restore` in `on_start`.
-- The gateway's cluster client and the single-node process e2e are still M4b.
+- `engine-cluster`'s `ClusteredService` adapter (`service.rs`) calls
+  `Engine::snapshot` in `on_take_snapshot` and `Engine::restore` in `on_start`;
+  the `engine-container` binary hosts it.
+- The gateway's cluster client and the single-node process e2e are M4c.

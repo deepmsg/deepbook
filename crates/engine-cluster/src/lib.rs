@@ -7,6 +7,8 @@
 //! gateway uses the `CommandLog` seam.
 #![forbid(unsafe_code)]
 
+pub mod service;
 pub mod snapshot;
 
+pub use service::{EngineService, ServiceError};
 pub use snapshot::{CodecError, decode, encode};

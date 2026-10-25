@@ -6,9 +6,12 @@
 //! journal directory keyed by the CompID pair, so a reconnect resumes the same
 //! session rather than starting a new one.
 //!
-//! M1b does not decide what an accepted order becomes. `Action::Deliver` goes
-//! to the [`CommandSink`]; M1c implements the sink and sends the
-//! `ExecutionReport` back through the session.
+//! The acceptor does not decide what an accepted order becomes.
+//! `Action::Deliver` goes to the [`Engine`]; the engine publishes reports
+//! through its [`crate::EventSource`], and `drain_engine_events` sends each
+//! one back to the session that owns it. M1c's [`crate::StubEngine`] is the
+//! in-process implementation; M2 replaces it with `engine-core` and M4 with
+//! the cluster client behind the same seam.
 //!
 //! M1b accepts the **one** CompID pair named by [`GatewayConfig`]. The
 //! registry key and journal directory are already per pair; letting a gateway
@@ -27,7 +30,7 @@ use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
 use crate::frame::FrameDecoder;
-use crate::sink::{CommandSink, SessionKey};
+use crate::sink::{Engine, SessionKey};
 
 const LISTENER_TOKEN: Token = Token(0);
 const EVENT_CAPACITY: usize = 256;
@@ -125,24 +128,24 @@ impl Connection {
 }
 
 /// One acceptor thread's state.
-pub struct Gateway<S: CommandSink> {
+pub struct Gateway<E: Engine> {
     poll: Poll,
     listener: TcpListener,
     config: GatewayConfig,
     key: SessionKey,
-    sink: S,
+    engine: E,
     events: Events,
     connections: HashMap<u64, Connection>,
     next_token: u64,
 }
 
-impl<S: CommandSink> Gateway<S> {
+impl<E: Engine> Gateway<E> {
     /// Bind and register the listener.
     ///
     /// # Errors
     ///
     /// The address cannot be bound or the poller cannot be created.
-    pub fn bind(config: GatewayConfig, sink: S) -> io::Result<Self> {
+    pub fn bind(config: GatewayConfig, engine: E) -> io::Result<Self> {
         let mut listener = TcpListener::bind(config.bind)?;
         let poll = Poll::new()?;
         poll.registry()
@@ -153,7 +156,7 @@ impl<S: CommandSink> Gateway<S> {
             listener,
             config,
             key,
-            sink,
+            engine,
             events: Events::with_capacity(EVENT_CAPACITY),
             connections: HashMap::new(),
             next_token: 1,
@@ -210,6 +213,7 @@ impl<S: CommandSink> Gateway<S> {
         }
 
         work += self.tick_sessions()?;
+        work += self.drain_engine_events()?;
         self.connections
             .retain(|_, connection| !connection.finished());
         Ok(work)
@@ -463,6 +467,10 @@ impl<S: CommandSink> Gateway<S> {
     }
 
     fn apply_actions(&mut self, id: u64, actions: Vec<Action>) -> usize {
+        let key = self
+            .connections
+            .get(&id)
+            .map(|connection| connection.key.clone());
         let mut work = 0;
         for action in actions {
             work += 1;
@@ -472,7 +480,11 @@ impl<S: CommandSink> Gateway<S> {
                         connection.outbound.push_back(raw);
                     }
                 }
-                Action::Deliver(message) => self.sink.deliver(message),
+                Action::Deliver(message) => {
+                    if let Some(key) = &key {
+                        self.engine.deliver(key, message);
+                    }
+                }
                 Action::Disconnect { .. } => {
                     if let Some(connection) = self.connections.get_mut(&id) {
                         connection.close_after_flush = true;
@@ -482,6 +494,33 @@ impl<S: CommandSink> Gateway<S> {
             }
         }
         work
+    }
+
+    /// Give the engine's reports back to the session that owns them.
+    fn drain_engine_events(&mut self) -> io::Result<usize> {
+        let now = SystemClock.now_millis();
+        let mut work = 0;
+        while let Some(event) = self.engine.poll_event() {
+            let Some(id) = self
+                .connections
+                .iter()
+                .find(|(_, connection)| connection.key == event.session)
+                .map(|(id, _)| *id)
+            else {
+                // The session disconnected before its report came back.
+                continue;
+            };
+            let action = self
+                .connections
+                .get_mut(&id)
+                .map(|connection| connection.session.send_application(&event.message, now));
+            if let Some(Ok(action)) = action {
+                work += self.apply_actions(id, vec![action]);
+            }
+            self.flush_connection(id);
+            self.update_interest(id)?;
+        }
+        Ok(work)
     }
 
     fn flush_connection(&mut self, id: u64) {

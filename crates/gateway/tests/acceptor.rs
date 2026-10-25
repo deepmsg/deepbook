@@ -9,15 +9,23 @@ use std::time::{Duration, Instant};
 use deepbook_fix::ApplicationMessage;
 use deepbook_fix::codec::{MessageBuilder, MsgType, ParsedMessage, tag};
 use deepbook_gateway::frame::FrameDecoder;
-use deepbook_gateway::{CommandSink, Gateway, GatewayConfig, SessionKey};
+use deepbook_gateway::{
+    CommandSink, EventSource, Gateway, GatewayConfig, SessionEvent, SessionKey,
+};
 
 struct RecordingSink {
     messages: Arc<Mutex<Vec<ApplicationMessage>>>,
 }
 
 impl CommandSink for RecordingSink {
-    fn deliver(&mut self, message: ApplicationMessage) {
+    fn deliver(&mut self, _session: &SessionKey, message: ApplicationMessage) {
         self.messages.lock().expect("sink").push(message);
+    }
+}
+
+impl EventSource for RecordingSink {
+    fn poll_event(&mut self) -> Option<SessionEvent> {
+        None
     }
 }
 

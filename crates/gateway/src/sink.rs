@@ -1,20 +1,45 @@
 //! The gateway-to-engine seam.
 //!
-//! M1c implements the sink with an in-process engine; M4 swaps in the cluster
-//! client. The FIX layer never calls the engine directly: the session emits
-//! `Action::Deliver(ApplicationMessage)` and the gateway hands it here.
+//! The FIX layer never calls the engine directly: the session emits
+//! `Action::Deliver(ApplicationMessage)` and the gateway hands it to
+//! [`CommandSink::deliver`]. The engine answers through
+//! [`EventSource::poll_event`], and the gateway routes each event back to the
+//! session named by its [`SessionKey`]. That is the same shape M4's cluster
+//! egress has: a command goes out, a report comes back later.
 
 use deepbook_fix::ApplicationMessage;
 
 /// Where an accepted FIX command goes.
 pub trait CommandSink {
-    /// Take one application message.
+    /// Take one application message for `session`.
     ///
-    /// The sink owns the decision of what an accepted order becomes: M1c will
-    /// turn it into an `ExecutionReport` (or a reject) and hand that back to
-    /// the session.
-    fn deliver(&mut self, message: ApplicationMessage);
+    /// The sink owns the decision of what an accepted order becomes. It
+    /// publishes reports through [`EventSource`], not by returning them.
+    fn deliver(&mut self, session: &SessionKey, message: ApplicationMessage);
 }
+
+/// One report on its way back to a FIX session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEvent {
+    /// The session the report belongs to.
+    pub session: SessionKey,
+    /// The FIX message to send.
+    pub message: ApplicationMessage,
+}
+
+/// Where the engine's reports come from.
+pub trait EventSource {
+    /// The next report, or `None`.
+    fn poll_event(&mut self) -> Option<SessionEvent>;
+}
+
+/// The engine seam: commands in, reports out.
+///
+/// Blanket-implemented for anything that is both halves, so a test engine is
+/// one type and a cluster adapter can be one type too.
+pub trait Engine: CommandSink + EventSource {}
+
+impl<T: CommandSink + EventSource> Engine for T {}
 
 /// The identity of one FIX session: our `SenderCompID` and the peer's
 /// `TargetCompID`.

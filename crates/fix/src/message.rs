@@ -88,6 +88,8 @@ pub enum ExecType {
     Rejected,
     /// `F`.
     Trade,
+    /// `I`.
+    OrderStatus,
 }
 
 impl ExecType {
@@ -100,6 +102,7 @@ impl ExecType {
             Self::Replaced => '5',
             Self::Rejected => '8',
             Self::Trade => 'F',
+            Self::OrderStatus => 'I',
         }
     }
 
@@ -110,6 +113,7 @@ impl ExecType {
             b'5' => Some(Self::Replaced),
             b'8' => Some(Self::Rejected),
             b'F' => Some(Self::Trade),
+            b'I' => Some(Self::OrderStatus),
             _ => None,
         }
     }

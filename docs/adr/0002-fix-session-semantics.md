@@ -47,8 +47,10 @@ interoperability oracle (M1d).
    fix crate.
 9. **The engine seam is `CommandSink`.** The session emits
    `Action::Deliver(ApplicationMessage)`; the gateway's sink owns the engine
-   call. M1c supplies an in-process sink, M4 the cluster client. The session
-   never calls the engine and the engine never sees a FIX byte.
+   call, and the engine answers through `EventSource`, which the gateway
+   routes back by `SessionKey`. M1c supplies an in-process stub engine, M4 the
+   cluster client. The session never calls the engine and the engine never sees
+   a FIX byte.
 
 ## Consequences
 

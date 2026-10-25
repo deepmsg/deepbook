@@ -10,9 +10,10 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0 complete; M1a landed.** The cluster checks pass and the FIX 4.4
-> codec, session state machine and outbound journal are in `crates/fix`. The
-> epoll acceptor, gateway event loop, engine and market data are still to come.
+> Status: **M0 complete; M1 in progress.** The FIX 4.4 codec, session state
+> machine, outbound journal, epoll acceptor and the `CommandSink` engine seam
+> are in place. The M1 engine is a stub that acknowledges orders; matching,
+> market data and the cluster wiring are still to come.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -88,6 +89,18 @@ just check
 ```
 
 Toolchain: Rust 1.95.0 (`rust-toolchain.toml`), edition 2024, MSRV 1.85.
+
+## Run the FIX gateway
+
+```bash
+cargo run -p deepbook-gateway --bin fix-gateway -- \
+  --bind 127.0.0.1:9876 --session-dir target/fix-sessions
+```
+
+It accepts the configured `SenderCompID`/`TargetCompID` pair (default
+`DEEPBOOK`/`CLIENT`) and journals each session under `--session-dir`. The M1
+engine acknowledges NewOrderSingle, cancel, replace and status with
+ExecutionReports; it does not match yet (M2). `--help` lists the options.
 
 ## Dependency on deepmsg
 

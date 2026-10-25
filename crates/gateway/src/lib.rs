@@ -11,12 +11,19 @@
 //! [`FrameDecoder`] per connection, and one [`Session`](deepbook_fix::Session)
 //! per CompID pair. A session's journal directory is keyed by the pair, so a
 //! reconnect resumes the sequence numbers and the resend window.
+//!
+//! M1c is [`StubEngine`]: the gateway hands an accepted command to
+//! [`CommandSink`] and routes the reports the engine publishes through
+//! [`EventSource`] back to the same session. M2 replaces the stub with
+//! `engine-core`; the seam does not change.
 #![forbid(unsafe_code)]
 
 pub mod acceptor;
 pub mod frame;
 pub mod sink;
+pub mod stub;
 
 pub use acceptor::{Gateway, GatewayConfig};
 pub use frame::{FrameDecoder, FrameError};
-pub use sink::{CommandSink, SessionKey};
+pub use sink::{CommandSink, Engine, EventSource, SessionEvent, SessionKey};
+pub use stub::StubEngine;

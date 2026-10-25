@@ -32,12 +32,14 @@
 
 pub mod clock;
 pub mod codec;
+pub mod frame;
 pub mod journal;
 pub mod message;
 pub mod session;
 
 pub use clock::{Clock, ManualClock, SystemClock, format_utc};
 pub use codec::{CodecError, MessageBuilder, MsgType, ParsedMessage, parse};
+pub use frame::{FrameDecoder, FrameError};
 pub use journal::{
     FileJournal, FileSequenceStore, Journal, JournalEntry, SequenceStore, Sequences,
 };

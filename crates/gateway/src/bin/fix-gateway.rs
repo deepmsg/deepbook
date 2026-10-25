@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use deepbook_fix::journal::SyncPolicy;
 use deepbook_gateway::{
     ClusterEngine, ClusterEngineConfig, Engine, Gateway, GatewayConfig, SessionKey, StubEngine,
 };
@@ -42,6 +43,12 @@ fn run() -> Result<(), String> {
     );
     config.heart_bt_int = options.heartbeat;
     config.journal_capacity = options.journal;
+    config.tick = std::time::Duration::from_micros(options.tick_us);
+    config.journal_sync = if options.journal_sync_batch {
+        SyncPolicy::Every(options.journal_batch)
+    } else {
+        SyncPolicy::Each
+    };
 
     if options.cluster {
         let aeron_dir = options
@@ -100,6 +107,9 @@ struct Options {
     target: String,
     heartbeat: u32,
     journal: usize,
+    tick_us: u64,
+    journal_sync_batch: bool,
+    journal_batch: u32,
     cluster: bool,
     aeron_dir: Option<PathBuf>,
     ingress_channel: String,
@@ -123,6 +133,9 @@ impl Options {
             target: "CLIENT".to_owned(),
             heartbeat: 30,
             journal: 4096,
+            tick_us: 100_000,
+            journal_sync_batch: false,
+            journal_batch: 64,
             cluster: false,
             aeron_dir: None,
             ingress_channel: "aeron:ipc".to_owned(),
@@ -165,6 +178,25 @@ impl Options {
                     options.journal = value("--journal")?
                         .parse()
                         .map_err(|_| "--journal must be a number".to_owned())?;
+                }
+                "--tick-us" => {
+                    options.tick_us = value("--tick-us")?
+                        .parse()
+                        .map_err(|_| "--tick-us must be a number".to_owned())?;
+                }
+                "--journal-sync" => {
+                    options.journal_sync_batch = match value("--journal-sync")?.as_str() {
+                        "each" => false,
+                        "batch" => true,
+                        other => {
+                            return Err(format!("--journal-sync {other}: expected each|batch"));
+                        }
+                    };
+                }
+                "--journal-batch" => {
+                    options.journal_batch = value("--journal-batch")?
+                        .parse()
+                        .map_err(|_| "--journal-batch must be a number".to_owned())?;
                 }
                 "--cluster" => options.cluster = true,
                 "--aeron-dir" => options.aeron_dir = Some(value("--aeron-dir")?.into()),
@@ -212,6 +244,8 @@ fn print_usage() {
         "usage: fix-gateway [--bind IP:PORT] [--session-dir PATH]\n\
          \x20                  [--sender COMPID] [--target COMPID]\n\
          \x20                  [--heartbeat SECONDS] [--journal ENTRIES]\n\
+         \x20                  [--tick-us MICROSECONDS]\n\
+         \x20                  [--journal-sync each|batch] [--journal-batch N]\n\
          \x20                  [--cluster --aeron-dir PATH]\n\
          \x20                  [--ingress-channel URI] [--ingress-stream-id N]\n\
          \x20                  [--egress-channel URI] [--egress-stream-id N]\n\

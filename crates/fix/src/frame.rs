@@ -6,7 +6,7 @@
 //! first `8=` are discarded, which is what a reconnect after a half-written
 //! message looks like.
 
-use deepbook_fix::codec::{CodecError, ParsedMessage, parse};
+use crate::codec::{CodecError, ParsedMessage, parse};
 
 const START_MARKER: &[u8] = b"8=FIX.4.4\x01";
 const CHECKSUM_LENGTH: usize = 7; // "10=ddd" + SOH
@@ -164,7 +164,7 @@ fn parse_u32(bytes: &[u8]) -> Result<u32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deepbook_fix::codec::{MessageBuilder, MsgType, tag};
+    use crate::codec::{MessageBuilder, MsgType, tag};
 
     fn logon() -> Vec<u8> {
         MessageBuilder::new(

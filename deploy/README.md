@@ -31,9 +31,33 @@ deepbook engine:
 The script and the exact property values land with the M0 spike; this file is
 the checklist, not a claim that the script exists.
 
+## M5 benchmark (`bench.sh`)
+
+`bench.sh` is the one-click M5 measurement. It prints the machine fingerprint
+(kernel, CPU, rustc, commit, binary digests, `io_uring_disabled`), starts one
+driver + one consensus module + `engine-container` + `fix-gateway --cluster`
+in a `/dev/shm` run directory, runs `fix-bench`, and tears everything down.
+
+```bash
+deploy/bench.sh --rate 10000 --samples 20000 --warmup 2000
+deploy/bench.sh --journal-sync each ...    # M1's one-sync-per-message policy
+deploy/bench.sh --tick-us 50 ...           # epoll poll ceiling (default 100 ms)
+deploy/bench.sh --json ...                 # the client's JSON object
+deploy/bench.sh --keep ...                 # keep the run directory and logs
+```
+
+Environment: `DEEPBOOK_DEEPMSG_DIR` (default `../deepmsg`), `DEEPMSG_PROFILE`
+(default `release`), `BENCH_RUN_DIR`, `BENCH_BASE_PORT`. The deepmsg binaries
+must be built first (see `crates/spike/README.md`).
+
+`--journal-sync batch --journal-batch N` is the default: the session journal
+and sequence file sync once per N appends (ADR 0007). The default deployment
+still uses `each`.
+
 ## Later
 
 - `docker-compose.yml` for driver / cluster / gateway / market-data / admin /
   prometheus / grafana.
 - A three-node profile for the failover demo, no CPU pinning.
 - Bind-core and huge-page scripts for the benchmark machine.
+- The io_uring backend selector and the epoll-vs-uring ABBA run in `bench.sh`.

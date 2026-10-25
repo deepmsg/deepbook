@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use deepbook_fix::clock::{Clock, SystemClock};
-use deepbook_fix::journal::{FileJournal, FileSequenceStore};
+use deepbook_fix::journal::{FileJournal, FileSequenceStore, SyncPolicy};
 use deepbook_fix::session::{Action, Session, SessionConfig};
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
@@ -55,6 +55,9 @@ pub struct GatewayConfig {
     pub tick: Duration,
     /// How long a connection may sit without a Logon.
     pub logon_timeout_millis: i64,
+    /// The journal and sequence-file durability policy. M1's promise is
+    /// [`SyncPolicy::Each`]; M5 measures the batching policies.
+    pub journal_sync: SyncPolicy,
 }
 
 impl GatewayConfig {
@@ -76,6 +79,7 @@ impl GatewayConfig {
             journal_capacity: 4_096,
             tick: Duration::from_millis(100),
             logon_timeout_millis: 10_000,
+            journal_sync: SyncPolicy::Each,
         }
     }
 }
@@ -319,10 +323,14 @@ impl<E: Engine> Gateway<E> {
         now_millis: i64,
     ) -> Result<Session<FileJournal, FileSequenceStore>, io::Error> {
         let directory = self.config.session_dir.join(self.key.directory_name());
-        let journal =
-            FileJournal::open(directory.join("journal.bin"), self.config.journal_capacity)
-                .map_err(io::Error::other)?;
-        let sequences = FileSequenceStore::new(directory.join("sequences"));
+        let journal = FileJournal::open_with_sync(
+            directory.join("journal.bin"),
+            self.config.journal_capacity,
+            self.config.journal_sync,
+        )
+        .map_err(io::Error::other)?;
+        let sequences =
+            FileSequenceStore::with_sync(directory.join("sequences"), self.config.journal_sync);
         let mut config = SessionConfig::new(
             &self.config.sender_comp_id,
             &self.config.target_comp_id,
@@ -514,8 +522,10 @@ impl<E: Engine> Gateway<E> {
                 .connections
                 .get_mut(&id)
                 .map(|connection| connection.session.send_application(&event.message, now));
-            if let Some(Ok(action)) = action {
-                work += self.apply_actions(id, vec![action]);
+            match action {
+                Some(Ok(action)) => work += self.apply_actions(id, vec![action]),
+                Some(Err(error)) => eprintln!("gateway: send_application failed: {error}"),
+                None => {}
             }
             self.flush_connection(id);
             self.update_interest(id)?;

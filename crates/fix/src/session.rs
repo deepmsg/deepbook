@@ -206,6 +206,21 @@ impl<J: Journal, S: SequenceStore> Session<J, S> {
         self.next_out
     }
 
+    /// Force the journal and the sequence file to stable storage.
+    ///
+    /// A batching [`SyncPolicy`](crate::journal::SyncPolicy) defers writes;
+    /// this closes the window on logout or disconnect. [`Drop`] calls it, so
+    /// a caller that owns the session does not have to.
+    ///
+    /// # Errors
+    ///
+    /// A storage error.
+    pub fn flush(&mut self) -> Result<(), SessionError> {
+        self.journal.sync()?;
+        self.sequences.flush()?;
+        Ok(())
+    }
+
     /// The session state.
     #[must_use]
     pub const fn state(&self) -> SessionState {
@@ -734,6 +749,13 @@ fn application_msg_type(message: &ApplicationMessage) -> MsgType {
         ApplicationMessage::ExecutionReport(_) => MsgType::ExecutionReport,
         ApplicationMessage::OrderCancelReject(_) => MsgType::OrderCancelReject,
         ApplicationMessage::OrderStatusRequest(_) => MsgType::OrderStatusRequest,
+    }
+}
+
+impl<J: Journal, S: SequenceStore> Drop for Session<J, S> {
+    fn drop(&mut self) {
+        // A deferred journal/sequence write must not be lost with the socket.
+        let _ = self.flush();
     }
 }
 

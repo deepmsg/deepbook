@@ -27,3 +27,8 @@ marketdata-loss:
 engine-e2e:
     cargo build -p deepbook-engine-cluster --bin engine-container
     cargo test -p deepbook-gateway --test cluster_e2e -- --ignored --nocapture
+
+# M5: one member + engine-container + fix-gateway, measured by fix-bench.
+# `just bench --rate 20000 --samples 50000` forwards the script's options.
+bench *args:
+    ./deploy/bench.sh {{args}}

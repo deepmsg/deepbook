@@ -112,6 +112,8 @@ dependencies = [
 name = "deepbook-bench"
 version = "0.1.0"
 dependencies = [
+ "deepbook-fix",
+ "deepbook-gateway",
  "deepbook-types",
 ]
 

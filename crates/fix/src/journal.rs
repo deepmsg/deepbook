@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use crate::codec::MsgType;
 
@@ -81,6 +82,36 @@ fn io_error(path: &Path, source: io::Error) -> JournalError {
     }
 }
 
+/// When a durable store writes through to the operating system.
+///
+/// M1's promise is [`SyncPolicy::Each`]: the peer never sees a message the
+/// journal would lose. M5 measures the price of that promise and offers two
+/// bounded alternatives. A crash can lose at most the messages (or the
+/// sequence update) since the last sync; the engine's `(account, ClOrdID)`
+/// idempotency window is what makes a retry safe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SyncPolicy {
+    /// One `fdatasync` (or atomic sequence write) per append.
+    #[default]
+    Each,
+    /// Sync after this many appends.
+    Every(u32),
+    /// Sync when this many milliseconds have passed since the last sync.
+    AfterMillis(u64),
+}
+
+impl SyncPolicy {
+    /// Whether `unsynced` appends, or `elapsed` since the last sync, are due.
+    #[must_use]
+    pub fn is_due(self, unsynced: u32, elapsed: Duration) -> bool {
+        match self {
+            Self::Each => true,
+            Self::Every(every) => unsynced >= every.max(1),
+            Self::AfterMillis(millis) => elapsed >= Duration::from_millis(millis.max(1)),
+        }
+    }
+}
+
 /// The journal a session writes to.
 pub trait Journal {
     /// Append one message. The session calls this before the send.
@@ -113,6 +144,15 @@ pub trait Journal {
     ///
     /// A storage error.
     fn clear(&mut self) -> Result<(), JournalError>;
+
+    /// Force the deferred writes of a batching policy.
+    ///
+    /// # Errors
+    ///
+    /// A storage error.
+    fn sync(&mut self) -> Result<(), JournalError> {
+        Ok(())
+    }
 }
 
 /// The last `capacity` messages, in memory.
@@ -198,24 +238,42 @@ const HEADER_LENGTH: usize = 4 + 1 + 8 + 2 + 1 + 4;
 
 /// A journal backed by one append-only file.
 ///
-/// Every append is `write` followed by `sync_data`; a crash can lose the
-/// message being written, never a message the peer already saw. On open, a
-/// truncated tail is discarded so the next append does not continue after a
-/// half record.
+/// The default policy is `write` followed by `sync_data` on every append; a
+/// crash can lose the message being written, never a message the peer already
+/// saw. A batching policy trades that promise for throughput and leaves at
+/// most its window unsynced. On open, a truncated tail is discarded so the
+/// next append does not continue after a half record.
 #[derive(Debug)]
 pub struct FileJournal {
     path: PathBuf,
     file: File,
     memory: MemoryJournal,
+    sync: SyncPolicy,
+    unsynced: u32,
+    last_sync: Instant,
 }
 
 impl FileJournal {
-    /// Open (or create) `path`, recovering the last `capacity` entries.
+    /// Open (or create) `path`, recovering the last `capacity` entries, with
+    /// the M1 one-sync-per-append policy.
     ///
     /// # Errors
     ///
     /// A filesystem error.
     pub fn open(path: impl Into<PathBuf>, capacity: usize) -> Result<Self, JournalError> {
+        Self::open_with_sync(path, capacity, SyncPolicy::Each)
+    }
+
+    /// Open (or create) `path` with `sync` as its durability policy.
+    ///
+    /// # Errors
+    ///
+    /// A filesystem error.
+    pub fn open_with_sync(
+        path: impl Into<PathBuf>,
+        capacity: usize,
+        sync: SyncPolicy,
+    ) -> Result<Self, JournalError> {
         let path = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
@@ -258,6 +316,9 @@ impl FileJournal {
             path,
             file,
             memory: MemoryJournal::from_parts(capacity, entries, last_seq),
+            sync,
+            unsynced: 0,
+            last_sync: Instant::now(),
         })
     }
 
@@ -281,9 +342,14 @@ impl Journal for FileJournal {
         self.file
             .write_all(&record)
             .map_err(|error| io_error(&self.path, error))?;
-        self.file
-            .sync_data()
-            .map_err(|error| io_error(&self.path, error))?;
+        self.unsynced = self.unsynced.saturating_add(1);
+        if self.sync.is_due(self.unsynced, self.last_sync.elapsed()) {
+            self.file
+                .sync_data()
+                .map_err(|error| io_error(&self.path, error))?;
+            self.unsynced = 0;
+            self.last_sync = Instant::now();
+        }
         self.memory.append(entry)
     }
 
@@ -313,7 +379,20 @@ impl Journal for FileJournal {
         self.file
             .sync_data()
             .map_err(|error| io_error(&self.path, error))?;
+        self.unsynced = 0;
+        self.last_sync = Instant::now();
         self.memory.clear()
+    }
+
+    fn sync(&mut self) -> Result<(), JournalError> {
+        if self.unsynced > 0 {
+            self.file
+                .sync_data()
+                .map_err(|error| io_error(&self.path, error))?;
+            self.unsynced = 0;
+            self.last_sync = Instant::now();
+        }
+        Ok(())
     }
 }
 
@@ -413,6 +492,15 @@ pub trait SequenceStore {
     ///
     /// A storage error.
     fn store(&mut self, sequences: Sequences) -> Result<(), JournalError>;
+
+    /// Write a deferred update now.
+    ///
+    /// # Errors
+    ///
+    /// A storage error.
+    fn flush(&mut self) -> Result<(), JournalError> {
+        Ok(())
+    }
 }
 
 /// Sequence numbers held in memory.
@@ -444,19 +532,67 @@ impl SequenceStore for MemorySequenceStore {
 #[derive(Clone, Debug)]
 pub struct FileSequenceStore {
     path: PathBuf,
+    sync: SyncPolicy,
+    pending: Option<Sequences>,
+    unsynced: u32,
+    last_store: Instant,
 }
 
 impl FileSequenceStore {
-    /// A store at `path`.
+    /// A store at `path` with the M1 one-write-per-message policy.
     #[must_use]
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self::with_sync(path, SyncPolicy::Each)
+    }
+
+    /// A store at `path` with `sync` as its durability policy.
+    #[must_use]
+    pub fn with_sync(path: impl Into<PathBuf>, sync: SyncPolicy) -> Self {
+        Self {
+            path: path.into(),
+            sync,
+            pending: None,
+            unsynced: 0,
+            last_store: Instant::now(),
+        }
     }
 
     /// The file this store writes.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn write(&self, sequences: Sequences) -> Result<(), JournalError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
+        }
+        let temporary = self.path.with_extension("tmp");
+        {
+            let mut file = File::create(&temporary).map_err(|error| io_error(&temporary, error))?;
+            writeln!(file, "{} {}", sequences.next_in, sequences.next_out)
+                .map_err(|error| io_error(&temporary, error))?;
+            file.sync_all()
+                .map_err(|error| io_error(&temporary, error))?;
+        }
+        std::fs::rename(&temporary, &self.path).map_err(|error| io_error(&self.path, error))?;
+        if let Some(parent) = self.path.parent() {
+            // Make the rename durable. Opening a directory read-only is enough
+            // for fsync on Linux.
+            if let Ok(directory) = File::open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    fn write_pending(&mut self) -> Result<(), JournalError> {
+        if let Some(sequences) = self.pending.take() {
+            self.write(sequences)?;
+            self.unsynced = 0;
+            self.last_store = Instant::now();
+        }
+        Ok(())
     }
 }
 
@@ -489,26 +625,16 @@ impl SequenceStore for FileSequenceStore {
     }
 
     fn store(&mut self, sequences: Sequences) -> Result<(), JournalError> {
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| io_error(parent, error))?;
-        }
-        let temporary = self.path.with_extension("tmp");
-        {
-            let mut file = File::create(&temporary).map_err(|error| io_error(&temporary, error))?;
-            writeln!(file, "{} {}", sequences.next_in, sequences.next_out)
-                .map_err(|error| io_error(&temporary, error))?;
-            file.sync_all()
-                .map_err(|error| io_error(&temporary, error))?;
-        }
-        std::fs::rename(&temporary, &self.path).map_err(|error| io_error(&self.path, error))?;
-        if let Some(parent) = self.path.parent() {
-            // Make the rename durable. Opening a directory read-only is enough
-            // for fsync on Linux.
-            if let Ok(directory) = File::open(parent) {
-                let _ = directory.sync_all();
-            }
+        self.pending = Some(sequences);
+        self.unsynced = self.unsynced.saturating_add(1);
+        if self.sync.is_due(self.unsynced, self.last_store.elapsed()) {
+            self.write_pending()?;
         }
         Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), JournalError> {
+        self.write_pending()
     }
 }
 
@@ -623,6 +749,62 @@ mod tests {
         assert!(journal.is_empty());
         assert_eq!(1, journal.next_seq());
         assert_eq!(0, std::fs::metadata(&path).expect("metadata").len());
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn a_sync_policy_says_when_it_is_due() {
+        assert!(SyncPolicy::Each.is_due(0, Duration::ZERO));
+        assert!(!SyncPolicy::Every(4).is_due(3, Duration::ZERO));
+        assert!(SyncPolicy::Every(4).is_due(4, Duration::ZERO));
+        assert!(!SyncPolicy::AfterMillis(5).is_due(0, Duration::from_millis(4)));
+        assert!(SyncPolicy::AfterMillis(5).is_due(0, Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn a_batched_sequence_store_defers_until_flush() {
+        let directory = temporary_directory("sequences-batched");
+        let path = directory.join("sequences");
+        let mut store = FileSequenceStore::with_sync(&path, SyncPolicy::AfterMillis(60_000));
+        store
+            .store(Sequences {
+                next_in: 7,
+                next_out: 9,
+            })
+            .expect("store");
+        assert!(
+            !path.exists(),
+            "nothing is written before the window closes"
+        );
+        store.flush().expect("flush");
+        assert_eq!(
+            Sequences {
+                next_in: 7,
+                next_out: 9
+            },
+            store.load().expect("load")
+        );
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
+    fn a_batched_journal_recovers_every_append() {
+        let directory = temporary_directory("journal-batched");
+        let path = directory.join("journal.bin");
+        {
+            let mut journal =
+                FileJournal::open_with_sync(&path, 16, SyncPolicy::Every(8)).expect("open");
+            journal.append(entry(1, MsgType::Logon)).expect("1");
+            journal
+                .append(entry(2, MsgType::NewOrderSingle))
+                .expect("2");
+            // Dropped without an explicit sync: the write is already in the
+            // file, and the session's Drop closes the durability window.
+        }
+        let journal = FileJournal::open(&path, 16).expect("reopen");
+        assert_eq!(3, journal.next_seq());
+        assert_eq!(2, journal.len());
+        assert_eq!(Some(2), journal.get(2).map(|entry| entry.seq));
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 

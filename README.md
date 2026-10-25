@@ -10,11 +10,11 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0–M2 merged; M3 implemented on this branch.** The FIX 4.4 session,
-> epoll acceptor, engine seam, QuickFIX/J conformance and deterministic
-> matching engine are in place. `marketdata` now has incremental and snapshot
-> channels, gap recovery and a driver-loss test. Cluster wiring (M4) and the
-> bench/io_uring work (M5) are next.
+> Status: **M0–M3 merged; M4 in progress on this branch.** The FIX session,
+> epoll acceptor, engine seam, matching engine and market-data channels are in
+> place. The engine now has snapshot/restore and a versioned snapshot record;
+> the `ClusteredService` adapter, gateway cluster client and the single-node
+> process e2e are still to come.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -166,9 +166,22 @@ DEEPBOOK_DEEPMSG_DIR=../deepmsg cargo test -p deepbook-marketdata \
 `tests/recovery.rs` drives a simulated lossy link (including a blackout longer
 than the ring), and `tests/deepmsg_loss.rs` starts the production media driver
 with `deepmsg.debug.send.data.loss.drop.every=4`, publishes 1024-byte frames,
-and proves the subscriber catches up with the same book. The driver test skips
-when the deepmsg checkout is absent, so the default workspace run needs no
-external build. ADR 0004 records the channel and recovery semantics.
+and proves the subscriber catches up with the same book. The driver test skips when the
+deepmsg checkout is absent, so the default workspace run needs no external
+build. ADR 0004 records the channel and recovery semantics.
+
+## Cluster integration (M4, in progress)
+
+`engine-core` now has `Engine::snapshot()` / `Engine::restore()`:
+the snapshot preserves the slab slots, every slot's generation, the free-list
+order, the levels, the idempotency window, the open-order counts and the kill
+switches. A restored engine has the same book hash and produces the same future
+order ids and events as the engine that wrote the snapshot.
+
+`engine-cluster` has the versioned `DBS1` snapshot record. The
+`ClusteredService` adapter, the deepbook container binary, the gateway's
+cluster client and the process-based single-node kill/restart e2e are the
+remaining M4 slices; ADR 0005 records the snapshot decisions.
 
 ## Dependency on deepmsg
 

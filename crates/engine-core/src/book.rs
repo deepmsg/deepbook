@@ -16,6 +16,7 @@ use deepbook_types::{
 };
 
 use crate::ids::{ClientOrderId, EMPTY_SLOT, MAX_SLOTS, next_generation, pack, slot_of};
+use crate::snapshot::{BookSnapshot, LevelSnapshot, OrderSlotSnapshot, SnapshotError};
 
 /// One resting order's hot fields.
 #[derive(Clone, Copy, Debug)]
@@ -412,6 +413,182 @@ impl Book {
             slot = order.next;
         }
     }
+    /// The book state for a snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> BookSnapshot {
+        let mut slots = Vec::new();
+        let mut free = Vec::new();
+        for (index, order) in self.orders.iter().enumerate() {
+            if order.id == EMPTY_ORDER_ID {
+                free.push(u32::try_from(index).expect("slot <= 2^24"));
+            } else {
+                slots.push(OrderSlotSnapshot {
+                    slot: u32::try_from(index).expect("slot <= 2^24"),
+                    id: order.id,
+                    price: order.price,
+                    qty: order.qty,
+                    filled: order.filled,
+                    notional: order.notional,
+                    account: order.account,
+                    prev: order.prev,
+                    next: order.next,
+                    side: order.side,
+                    state: order.state,
+                    is_market: order.is_market,
+                    cl_ord_id: self.cold[index].cl_ord_id,
+                });
+            }
+        }
+        BookSnapshot {
+            slots,
+            generations: self.generations.clone(),
+            free,
+            free_head: self.free_head,
+            bids: self
+                .bids
+                .iter()
+                .map(|(price, level)| LevelSnapshot {
+                    price: *price,
+                    total_qty: level.total_qty,
+                    head: level.head,
+                    tail: level.tail,
+                })
+                .collect(),
+            asks: self
+                .asks
+                .iter()
+                .map(|(price, level)| LevelSnapshot {
+                    price: *price,
+                    total_qty: level.total_qty,
+                    head: level.head,
+                    tail: level.tail,
+                })
+                .collect(),
+            last_trade: self.last_trade,
+            md_seq: self.md_seq,
+        }
+    }
+
+    /// Rebuild a book from a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot's capacity, slots, free list or levels are inconsistent.
+    pub fn restore(
+        snapshot: &BookSnapshot,
+        capacity: usize,
+        symbol: SymbolId,
+    ) -> Result<Self, SnapshotError> {
+        if snapshot.generations.len() != capacity {
+            return Err(SnapshotError::WrongCapacity {
+                expected: capacity,
+                actual: snapshot.generations.len(),
+            });
+        }
+        let mut orders = vec![OrderHot::free(EMPTY_SLOT); capacity];
+        let mut cold = vec![OrderCold::default(); capacity];
+        let mut present = vec![false; capacity];
+
+        for (index, slot) in snapshot.free.iter().enumerate() {
+            let slot_index = usize::try_from(*slot).map_err(|_| SnapshotError::BadSlot(*slot))?;
+            if slot_index >= capacity {
+                return Err(SnapshotError::BadSlot(*slot));
+            }
+            if present[slot_index] {
+                return Err(SnapshotError::DuplicateSlot(*slot));
+            }
+            present[slot_index] = true;
+            let next = snapshot.free.get(index + 1).copied().unwrap_or(EMPTY_SLOT);
+            orders[slot_index] = OrderHot::free(next);
+        }
+        let expected_head = snapshot.free.first().copied().unwrap_or(EMPTY_SLOT);
+        if snapshot.free_head != expected_head {
+            return Err(SnapshotError::Corrupt(
+                "free-list head does not match the free slots".to_owned(),
+            ));
+        }
+
+        for entry in &snapshot.slots {
+            let slot_index =
+                usize::try_from(entry.slot).map_err(|_| SnapshotError::BadSlot(entry.slot))?;
+            if slot_index >= capacity {
+                return Err(SnapshotError::BadSlot(entry.slot));
+            }
+            if present[slot_index] {
+                return Err(SnapshotError::DuplicateSlot(entry.slot));
+            }
+            present[slot_index] = true;
+            orders[slot_index] = OrderHot {
+                id: entry.id,
+                price: entry.price,
+                qty: entry.qty,
+                filled: entry.filled,
+                notional: entry.notional,
+                account: entry.account,
+                prev: entry.prev,
+                next: entry.next,
+                side: entry.side,
+                state: entry.state,
+                is_market: entry.is_market,
+            };
+            cold[slot_index] = OrderCold {
+                cl_ord_id: entry.cl_ord_id,
+            };
+        }
+        for (slot, present) in present.iter().enumerate() {
+            if !present {
+                return Err(SnapshotError::MissingSlot(
+                    u32::try_from(slot).expect("slot <= 2^24"),
+                ));
+            }
+        }
+
+        let mut bids = BTreeMap::new();
+        for level in &snapshot.bids {
+            check_level(level, capacity)?;
+            bids.insert(
+                level.price,
+                PriceLevel {
+                    total_qty: level.total_qty,
+                    head: level.head,
+                    tail: level.tail,
+                },
+            );
+        }
+        let mut asks = BTreeMap::new();
+        for level in &snapshot.asks {
+            check_level(level, capacity)?;
+            asks.insert(
+                level.price,
+                PriceLevel {
+                    total_qty: level.total_qty,
+                    head: level.head,
+                    tail: level.tail,
+                },
+            );
+        }
+
+        Ok(Self {
+            symbol,
+            bids,
+            asks,
+            orders,
+            cold,
+            generations: snapshot.generations.clone(),
+            free_head: snapshot.free_head,
+            last_trade: snapshot.last_trade,
+            md_seq: snapshot.md_seq,
+        })
+    }
+}
+
+fn check_level(level: &LevelSnapshot, capacity: usize) -> Result<(), SnapshotError> {
+    for slot in [level.head, level.tail] {
+        if slot != EMPTY_SLOT && usize::try_from(slot).map_or(true, |slot| slot >= capacity) {
+            return Err(SnapshotError::BadLevel { price: level.price });
+        }
+    }
+    Ok(())
 }
 
 /// A small deterministic FNV-1a hasher.

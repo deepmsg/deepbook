@@ -6,3 +6,7 @@
 //! engine snapshot. The deepmsg dependency is added at M4; until then the
 //! gateway uses the `CommandLog` seam.
 #![forbid(unsafe_code)]
+
+pub mod snapshot;
+
+pub use snapshot::{CodecError, decode, encode};

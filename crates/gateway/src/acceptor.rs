@@ -1,40 +1,37 @@
-//! The single-threaded FIX acceptor.
+//! The single-threaded FIX acceptor over a completion event loop.
 //!
-//! One thread owns every connection. `mio`'s Linux backend is epoll; the loop
-//! is deliberately the only place that blocks. Each connection has its own
-//! [`FrameDecoder`] and its own [`Session`], and every session is backed by a
-//! journal directory keyed by the CompID pair, so a reconnect resumes the same
-//! session rather than starting a new one.
+//! One thread owns every connection. The loop is [`deepbook_io::EventLoop`]:
+//! the default backend is `mio`/epoll, and `--backend uring` selects
+//! io_uring. Both report the same completions (accept, read, written), so the
+//! FIX logic, the session state machine and the journals do not know which
+//! one is underneath.
+//!
+//! Each connection has its own [`FrameDecoder`] and its own [`Session`], and
+//! every session is backed by a journal directory keyed by the CompID pair, so
+//! a reconnect resumes the same session rather than starting a new one.
 //!
 //! The acceptor does not decide what an accepted order becomes.
 //! `Action::Deliver` goes to the [`Engine`]; the engine publishes reports
-//! through its [`crate::EventSource`], and `drain_engine_events` sends each
-//! one back to the session that owns it. M1c's [`crate::StubEngine`] is the
-//! in-process implementation; M2 replaces it with `engine-core` and M4 with
-//! the cluster client behind the same seam.
+//! through its [`crate::EventSource`], and `drain_engine_events` queues each
+//! one on the session that owns it.
 //!
 //! M1b accepts the **one** CompID pair named by [`GatewayConfig`]. The
 //! registry key and journal directory are already per pair; letting a gateway
 //! host several peers is a later slice, not a rewrite.
 
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use deepbook_fix::clock::{Clock, SystemClock};
+use deepbook_fix::frame::FrameDecoder;
 use deepbook_fix::journal::{FileJournal, FileSequenceStore, SyncPolicy};
 use deepbook_fix::session::{Action, Session, SessionConfig};
-use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
+use deepbook_io::{BackendKind, Event, EventLoop};
 
-use crate::frame::FrameDecoder;
 use crate::sink::{Engine, SessionKey};
-
-const LISTENER_TOKEN: Token = Token(0);
-const EVENT_CAPACITY: usize = 256;
-const READ_BUFFER: usize = 8_192;
 
 /// The acceptor's configuration.
 #[derive(Clone, Debug)]
@@ -51,18 +48,20 @@ pub struct GatewayConfig {
     pub heart_bt_int: u32,
     /// Outbound journal entries kept per session.
     pub journal_capacity: usize,
-    /// The longest `epoll_wait`; also the heartbeat timer granularity.
+    /// The longest poll; also the heartbeat timer granularity.
     pub tick: Duration,
     /// How long a connection may sit without a Logon.
     pub logon_timeout_millis: i64,
     /// The journal and sequence-file durability policy. M1's promise is
     /// [`SyncPolicy::Each`]; M5 measures the batching policies.
     pub journal_sync: SyncPolicy,
+    /// The I/O backend.
+    pub backend: BackendKind,
 }
 
 impl GatewayConfig {
     /// A configuration with the design's defaults: heartbeat 30 s, journal
-    /// 4096, a 100 ms tick and a 10 s logon timeout.
+    /// 4096, a 100 ms tick, a 10 s logon timeout and epoll.
     #[must_use]
     pub fn new(
         bind: SocketAddr,
@@ -80,90 +79,52 @@ impl GatewayConfig {
             tick: Duration::from_millis(100),
             logon_timeout_millis: 10_000,
             journal_sync: SyncPolicy::Each,
+            backend: BackendKind::Epoll,
         }
     }
 }
 
 struct Connection {
-    stream: TcpStream,
     key: SessionKey,
     decoder: FrameDecoder,
     session: Session<FileJournal, FileSequenceStore>,
     outbound: VecDeque<Vec<u8>>,
-    interest: Interest,
+    writing: bool,
     close_after_flush: bool,
 }
 
 impl Connection {
-    /// Write everything the socket will take. `true` means the connection is
-    /// broken and must be dropped.
-    fn flush(&mut self) -> bool {
-        let Self {
-            stream, outbound, ..
-        } = self;
-        while let Some(front) = outbound.front_mut() {
-            match stream.write(front) {
-                Ok(0) => return true,
-                Ok(written) => {
-                    front.drain(..written);
-                    if front.is_empty() {
-                        outbound.pop_front();
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return false,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(_) => return true,
-            }
-        }
-        false
-    }
-
-    fn desired_interest(&self) -> Interest {
-        if self.outbound.is_empty() {
-            Interest::READABLE
-        } else {
-            Interest::READABLE | Interest::WRITABLE
-        }
-    }
-
     fn finished(&self) -> bool {
-        self.close_after_flush && self.outbound.is_empty()
+        self.close_after_flush && self.outbound.is_empty() && !self.writing
     }
 }
 
 /// One acceptor thread's state.
 pub struct Gateway<E: Engine> {
-    poll: Poll,
-    listener: TcpListener,
+    io: Box<dyn EventLoop>,
     config: GatewayConfig,
     key: SessionKey,
     engine: E,
-    events: Events,
     connections: HashMap<u64, Connection>,
-    next_token: u64,
 }
 
 impl<E: Engine> Gateway<E> {
-    /// Bind and register the listener.
+    /// Bind and arm the first accept.
     ///
     /// # Errors
     ///
-    /// The address cannot be bound or the poller cannot be created.
+    /// The address cannot be bound, the backend cannot be created, or the
+    /// accept cannot be armed.
     pub fn bind(config: GatewayConfig, engine: E) -> io::Result<Self> {
-        let mut listener = TcpListener::bind(config.bind)?;
-        let poll = Poll::new()?;
-        poll.registry()
-            .register(&mut listener, LISTENER_TOKEN, Interest::READABLE)?;
+        let mut io = deepbook_io::open(config.backend, config.bind)?;
+        io.start_accept()?;
         let key = SessionKey::new(&config.sender_comp_id, &config.target_comp_id);
         Ok(Self {
-            poll,
-            listener,
+            io,
             config,
             key,
             engine,
-            events: Events::with_capacity(EVENT_CAPACITY),
             connections: HashMap::new(),
-            next_token: 1,
         })
     }
 
@@ -173,7 +134,7 @@ impl<E: Engine> Gateway<E> {
     ///
     /// The socket has no address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.listener.local_addr()
+        self.io.local_addr()
     }
 
     /// How many connections are open.
@@ -182,44 +143,45 @@ impl<E: Engine> Gateway<E> {
         self.connections.len()
     }
 
-    /// Run one poll cycle: accept, read, write, then tick every session.
+    /// The backend this gateway runs.
+    #[must_use]
+    pub const fn backend(&self) -> BackendKind {
+        self.config.backend
+    }
+
+    /// Run one poll cycle: completions, timers, then engine reports.
     ///
     /// # Errors
     ///
-    /// The poller or the listener failed. A broken connection is closed, not
-    /// returned.
+    /// The event loop failed. A broken connection is closed, not returned.
     pub fn poll_once(&mut self, timeout: Duration) -> io::Result<usize> {
-        let timeout = timeout.min(self.config.tick);
-        self.poll.poll(&mut self.events, Some(timeout))?;
-
-        let events: Vec<(Token, bool, bool, bool, bool)> = self
-            .events
-            .iter()
-            .map(|event| {
-                (
-                    event.token(),
-                    event.is_readable(),
-                    event.is_writable(),
-                    event.is_read_closed() || event.is_write_closed(),
-                    event.is_error(),
-                )
-            })
-            .collect();
-
+        let mut events = Vec::new();
+        self.io.wait(timeout.min(self.config.tick), &mut events)?;
         let mut work = 0;
-        for (token, readable, writable, closed, error) in events {
-            if token == LISTENER_TOKEN {
-                work += self.accept_ready()?;
-                continue;
+        for event in events {
+            match event {
+                Event::Accepted { id, peer } => {
+                    work += self.add_connection(id, peer);
+                }
+                Event::AcceptFailed(error) => {
+                    eprintln!("gateway: accept: {error}");
+                    work += 1;
+                }
+                Event::Read { id, result } => {
+                    work += self.read_completion(id, result);
+                }
+                Event::Written { id, result } => {
+                    work += self.write_completion(id, result);
+                }
             }
-            let id = u64::try_from(usize::from(token)).unwrap_or(u64::MAX);
-            work += self.process_connection(id, readable, writable, closed, error)?;
         }
+        // The accept is one-shot on io_uring; arming it here also restarts it
+        // after an accept error. epoll only sets a flag.
+        self.io.start_accept()?;
 
-        work += self.tick_sessions()?;
+        work += self.tick_sessions();
         work += self.drain_engine_events()?;
-        self.connections
-            .retain(|_, connection| !connection.finished());
+        self.close_finished();
         Ok(work)
     }
 
@@ -247,29 +209,21 @@ impl<E: Engine> Gateway<E> {
         }
     }
 
-    /// Close every connection and stop listening.
+    /// Close every connection and stop accepting.
     pub fn shutdown(&mut self) {
-        self.connections.clear();
-        let _ = self.poll.registry().deregister(&mut self.listener);
-    }
-
-    fn accept_ready(&mut self) -> io::Result<usize> {
-        let mut accepted = 0;
-        loop {
-            match self.listener.accept() {
-                Ok((stream, peer)) => {
-                    self.add_connection(stream, peer);
-                    accepted += 1;
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
+        for id in self.connections.keys().copied().collect::<Vec<_>>() {
+            self.io.close(id);
         }
-        Ok(accepted)
+        self.connections.clear();
     }
 
-    fn add_connection(&mut self, mut stream: TcpStream, peer: SocketAddr) {
+    /// The journal directory of a session.
+    #[must_use]
+    pub fn session_directory(&self) -> PathBuf {
+        self.config.session_dir.join(self.key.directory_name())
+    }
+
+    fn add_connection(&mut self, id: u64, peer: SocketAddr) -> usize {
         // A new TCP connection for the same CompID pair replaces the old
         // session. The old file handles must be closed before the new session
         // opens the same journal.
@@ -279,8 +233,8 @@ impl<E: Engine> Gateway<E> {
             .filter(|(_, connection)| connection.key == self.key)
             .map(|(id, _)| *id)
             .collect();
-        for id in replaced {
-            self.connections.remove(&id);
+        for replaced in replaced {
+            self.drop_connection(replaced);
         }
 
         let now = SystemClock.now_millis();
@@ -288,34 +242,25 @@ impl<E: Engine> Gateway<E> {
             Ok(session) => session,
             Err(error) => {
                 eprintln!("gateway: cannot open session for {peer}: {error}");
-                return;
+                self.io.close(id);
+                return 1;
             }
         };
-
-        let id = self.next_token;
-        self.next_token += 1;
-        let token = Token(usize::try_from(id).unwrap_or(usize::MAX));
-        if let Err(error) = self
-            .poll
-            .registry()
-            .register(&mut stream, token, Interest::READABLE)
-        {
-            eprintln!("gateway: cannot register {peer}: {error}");
-            return;
-        }
-
         self.connections.insert(
             id,
             Connection {
-                stream,
                 key: self.key.clone(),
                 decoder: FrameDecoder::new(),
                 session,
                 outbound: VecDeque::new(),
-                interest: Interest::READABLE,
+                writing: false,
                 close_after_flush: false,
             },
         );
+        if self.io.start_read(id).is_err() {
+            self.drop_connection(id);
+        }
+        1
     }
 
     fn open_session(
@@ -340,72 +285,45 @@ impl<E: Engine> Gateway<E> {
         Session::new(config, journal, sequences, now_millis).map_err(io::Error::other)
     }
 
-    fn process_connection(
-        &mut self,
-        id: u64,
-        readable: bool,
-        writable: bool,
-        closed: bool,
-        error: bool,
-    ) -> io::Result<usize> {
-        if !self.connections.contains_key(&id) {
-            return Ok(0);
-        }
-        if error {
-            self.connections.remove(&id);
-            return Ok(1);
-        }
-
-        let mut work = 0;
-        if readable {
-            work += self.read_connection(id)?;
-        }
-        if writable {
-            work += 1;
-        }
-        // A half-close may arrive with the last message. The read above has
-        // consumed it; let the reply drain before the descriptor goes.
-        if closed {
-            if let Some(connection) = self.connections.get_mut(&id) {
-                connection.close_after_flush = true;
-            }
-            work += 1;
-        }
-        self.flush_connection(id);
-        self.update_interest(id)?;
-        Ok(work)
+    fn drop_connection(&mut self, id: u64) {
+        self.connections.remove(&id);
+        self.io.close(id);
     }
 
-    fn read_connection(&mut self, id: u64) -> io::Result<usize> {
-        let now = SystemClock.now_millis();
-        let mut bytes_read = 0;
-        let mut eof = false;
-        {
-            let Some(connection) = self.connections.get_mut(&id) else {
-                return Ok(0);
-            };
-            let mut buffer = [0_u8; READ_BUFFER];
-            loop {
-                match connection.stream.read(&mut buffer) {
-                    Ok(0) => {
-                        eof = true;
-                        break;
-                    }
-                    Ok(count) => {
-                        connection.decoder.push(&buffer[..count]);
-                        bytes_read += count;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                    Err(_) => {
-                        eof = true;
-                        break;
-                    }
-                }
-            }
+    fn close_finished(&mut self) {
+        let finished: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.finished())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in finished {
+            self.drop_connection(id);
         }
+    }
 
-        let mut work = usize::from(bytes_read > 0);
+    fn read_completion(&mut self, id: u64, result: io::Result<usize>) -> usize {
+        let count = match result {
+            Ok(0) => {
+                if let Some(connection) = self.connections.get_mut(&id) {
+                    connection.close_after_flush = true;
+                }
+                return 1;
+            }
+            Ok(count) => count,
+            Err(_) => {
+                self.drop_connection(id);
+                return 1;
+            }
+        };
+        let bytes = self.io.read_data(id).get(..count).unwrap_or(&[]).to_vec();
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return 1;
+        };
+        connection.decoder.push(&bytes);
+
+        let now = SystemClock.now_millis();
+        let mut work = 1;
         loop {
             let frame = self
                 .connections
@@ -414,24 +332,22 @@ impl<E: Engine> Gateway<E> {
             let Some(frame) = frame else {
                 break;
             };
-            let result = {
-                let Some(connection) = self.connections.get_mut(&id) else {
-                    return Ok(work);
-                };
-                match frame {
-                    Ok(message) => Some(connection.session.on_inbound(message.raw(), now)),
-                    Err(_) => None,
-                }
+            let Ok(message) = frame else {
+                self.drop_connection(id);
+                return work;
             };
+            let result = self
+                .connections
+                .get_mut(&id)
+                .map(|connection| connection.session.on_inbound(message.raw(), now));
             let Some(result) = result else {
-                self.connections.remove(&id);
-                return Ok(work + 1);
+                break;
             };
             match result {
                 Ok(actions) => work += self.apply_actions(id, actions),
                 Err(_) => {
-                    self.connections.remove(&id);
-                    return Ok(work + 1);
+                    self.drop_connection(id);
+                    return work;
                 }
             }
             if self
@@ -442,16 +358,66 @@ impl<E: Engine> Gateway<E> {
                 break;
             }
         }
-        if eof {
-            if let Some(connection) = self.connections.get_mut(&id) {
-                connection.close_after_flush = true;
-            }
+        if self
+            .connections
+            .get(&id)
+            .is_some_and(|connection| !connection.close_after_flush)
+            && self.io.start_read(id).is_err()
+        {
+            self.drop_connection(id);
             work += 1;
         }
-        Ok(work)
+        self.submit_next_write(id);
+        work
     }
 
-    fn tick_sessions(&mut self) -> io::Result<usize> {
+    fn write_completion(&mut self, id: u64, result: io::Result<usize>) -> usize {
+        match result {
+            Ok(0) => {
+                self.drop_connection(id);
+            }
+            Ok(count) => {
+                if let Some(connection) = self.connections.get_mut(&id) {
+                    if let Some(front) = connection.outbound.front_mut() {
+                        let count = count.min(front.len());
+                        front.drain(..count);
+                        if front.is_empty() {
+                            connection.outbound.pop_front();
+                        }
+                    }
+                    connection.writing = false;
+                }
+                self.submit_next_write(id);
+            }
+            Err(_) => {
+                self.drop_connection(id);
+            }
+        }
+        1
+    }
+
+    /// Submit the front of `outbound` if no write is in flight.
+    fn submit_next_write(&mut self, id: u64) {
+        let front = match self.connections.get(&id) {
+            Some(connection) if !connection.writing && !connection.outbound.is_empty() => {
+                connection.outbound.front().cloned()
+            }
+            _ => return,
+        };
+        let Some(front) = front else {
+            return;
+        };
+        match self.io.submit_write(id, &front) {
+            Ok(()) => {
+                if let Some(connection) = self.connections.get_mut(&id) {
+                    connection.writing = true;
+                }
+            }
+            Err(_) => self.drop_connection(id),
+        }
+    }
+
+    fn tick_sessions(&mut self) -> usize {
         let now = SystemClock.now_millis();
         let ids: Vec<u64> = self.connections.keys().copied().collect();
         let mut work = 0;
@@ -463,22 +429,16 @@ impl<E: Engine> Gateway<E> {
             match actions {
                 Some(Ok(actions)) => work += self.apply_actions(id, actions),
                 Some(Err(_)) => {
-                    self.connections.remove(&id);
+                    self.drop_connection(id);
                     work += 1;
                 }
                 None => {}
             }
-            self.flush_connection(id);
-            self.update_interest(id)?;
         }
-        Ok(work)
+        work
     }
 
     fn apply_actions(&mut self, id: u64, actions: Vec<Action>) -> usize {
-        let key = self
-            .connections
-            .get(&id)
-            .map(|connection| connection.key.clone());
         let mut work = 0;
         for action in actions {
             work += 1;
@@ -489,8 +449,12 @@ impl<E: Engine> Gateway<E> {
                     }
                 }
                 Action::Deliver(message) => {
-                    if let Some(key) = &key {
-                        self.engine.deliver(key, message);
+                    let key = self
+                        .connections
+                        .get(&id)
+                        .map(|connection| connection.key.clone());
+                    if let Some(key) = key {
+                        self.engine.deliver(&key, message);
                     }
                 }
                 Action::Disconnect { .. } => {
@@ -501,6 +465,7 @@ impl<E: Engine> Gateway<E> {
                 }
             }
         }
+        self.submit_next_write(id);
         work
     }
 
@@ -527,41 +492,24 @@ impl<E: Engine> Gateway<E> {
                 Some(Err(error)) => eprintln!("gateway: send_application failed: {error}"),
                 None => {}
             }
-            self.flush_connection(id);
-            self.update_interest(id)?;
         }
         Ok(work)
     }
+}
 
-    fn flush_connection(&mut self, id: u64) {
-        let Some(connection) = self.connections.get_mut(&id) else {
-            return;
-        };
-        if connection.flush() {
-            self.connections.remove(&id);
-        }
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn update_interest(&mut self, id: u64) -> io::Result<()> {
-        let Self {
-            poll, connections, ..
-        } = self;
-        let Some(connection) = connections.get_mut(&id) else {
-            return Ok(());
-        };
-        let desired = connection.desired_interest();
-        if desired != connection.interest {
-            let token = Token(usize::try_from(id).unwrap_or(usize::MAX));
-            poll.registry()
-                .reregister(&mut connection.stream, token, desired)?;
-            connection.interest = desired;
-        }
-        Ok(())
-    }
-
-    /// The journal directory of a session.
-    #[must_use]
-    pub fn session_directory(&self) -> PathBuf {
-        self.config.session_dir.join(self.key.directory_name())
+    #[test]
+    fn a_default_config_uses_epoll() {
+        let config = GatewayConfig::new(
+            "127.0.0.1:0".parse().expect("address"),
+            "sessions",
+            "DEEPBOOK",
+            "CLIENT",
+        );
+        assert_eq!(BackendKind::Epoll, config.backend);
+        assert_eq!(SyncPolicy::Each, config.journal_sync);
     }
 }

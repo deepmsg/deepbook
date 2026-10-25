@@ -56,10 +56,8 @@ const MARK_FILE_WAIT: Duration = Duration::from_secs(11);
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 const FIX_TIMEOUT: Duration = Duration::from_secs(25);
 
-#[test]
-#[ignore = "starts a media driver, a cluster node and a service container"]
-fn a_recovered_engine_continues_the_book() {
-    let Some(mut harness) = Harness::start() else {
+fn recovered_book(backend: &str, default_base: u16) {
+    let Some(mut harness) = Harness::start(backend, default_base) else {
         eprintln!("SKIPPED: the deepmsg or engine-container binaries are not built");
         return;
     };
@@ -215,10 +213,11 @@ struct Harness {
     gateway: Option<Child>,
     gateway_addr: SocketAddr,
     generation: u32,
+    backend: String,
 }
 
 impl Harness {
-    fn start() -> Option<Self> {
+    fn start(backend: &str, default_base: u16) -> Option<Self> {
         let deepmsg = deepmsg_dir();
         let profile = std::env::var("DEEPMSG_PROFILE").unwrap_or_else(|_| "release".to_owned());
         let binary = |name: &str| deepmsg.join("target").join(&profile).join(name);
@@ -237,14 +236,14 @@ impl Harness {
         let base: u16 = std::env::var("E2E_BASE_PORT")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(25_900);
+            .unwrap_or(default_base);
         let root = std::env::var("E2E_RUN_DIR").map_or_else(
             |_| {
                 let nonce = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |duration| duration.as_nanos());
                 std::env::temp_dir().join(format!(
-                    "deepbook-engine-e2e-{}-{nonce}",
+                    "deepbook-engine-e2e-{}-{base}-{nonce}",
                     std::process::id()
                 ))
             },
@@ -290,6 +289,7 @@ impl Harness {
             gateway: None,
             gateway_addr: "127.0.0.1:0".parse().expect("address"),
             generation: 0,
+            backend: backend.to_owned(),
             root,
         };
         harness.start_node().expect("cluster node");
@@ -382,6 +382,8 @@ impl Harness {
             "AAPL".to_owned(),
             "--symbol-id".to_owned(),
             "1".to_owned(),
+            "--backend".to_owned(),
+            self.backend.clone(),
             "--new-leader-timeout-ms".to_owned(),
             "4000".to_owned(),
         ];
@@ -927,4 +929,16 @@ fn execution_report(message: ApplicationMessage) -> deepbook_fix::ExecutionRepor
         ApplicationMessage::ExecutionReport(report) => report,
         other => panic!("expected an ExecutionReport, got {other:?}"),
     }
+}
+
+#[test]
+#[ignore = "starts a media driver, a cluster node and a service container"]
+fn a_recovered_engine_continues_the_book() {
+    recovered_book("epoll", 25_900);
+}
+
+#[test]
+#[ignore = "starts a media driver, a cluster node and a service container"]
+fn a_recovered_engine_continues_the_book_over_uring() {
+    recovered_book("uring", 26_100);
 }

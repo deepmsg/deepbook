@@ -6,6 +6,7 @@
 #   deploy/bench.sh [--rate N] [--samples N] [--warmup N] [--json]
 #                   [--base-port N] [--tick-us N]
 #                   [--journal-sync each|batch] [--journal-batch N]
+#                   [--backend epoll|uring] [--compare]
 #                   [--admin] [--serve] [--admin-host IP] [--no-seed]
 #                   [--keep] [--no-build]
 #
@@ -30,6 +31,8 @@ WARMUP=5000
 TICK_US=200
 JOURNAL_BATCH=64
 JOURNAL_SYNC=batch
+BACKEND=epoll
+COMPARE=0
 KEEP=0
 JSON=0
 BUILD=1
@@ -55,6 +58,8 @@ while [ $# -gt 0 ]; do
         --tick-us) TICK_US=$2; shift 2 ;;
         --journal-batch) JOURNAL_BATCH=$2; shift 2 ;;
         --journal-sync) JOURNAL_SYNC=$2; shift 2 ;;
+        --backend) BACKEND=$2; shift 2 ;;
+        --compare) COMPARE=1; shift ;;
         --json) JSON=1; shift ;;
         --admin) ADMIN=1; shift ;;
         --serve) ADMIN=1; SERVE=1; shift ;;
@@ -241,29 +246,6 @@ start "$LOGS/container.log" "$(deepbook_bin engine-container)" "${CLUSTER_ARGS[@
     -Ddeepbook.engine.recent-window=1000000
 wait_for_line "$LOGS/container.log" "STARTED service=deepbook-engine" 20
 
-GATEWAY_PID=""
-for attempt in $(seq 1 20); do
-    start "$LOGS/gateway-$attempt.log" "$(deepbook_bin fix-gateway)" \
-        --bind "127.0.0.1:$FIX_PORT" \
-        --session-dir "$SESSIONS" \
-        --cluster --aeron-dir "$AERON" \
-        --tick-us "$TICK_US" \
-        --journal-sync "$JOURNAL_SYNC" --journal-batch "$JOURNAL_BATCH" \
-        --symbol AAPL --symbol-id 1 \
-        --new-leader-timeout-ms 4000
-    GATEWAY_PID=$LAST_PID
-    if wait_for_line "$LOGS/gateway-$attempt.log" "listening on" 5; then
-        break
-    fi
-    kill -9 "$GATEWAY_PID" 2>/dev/null || true
-    sleep 0.2
-done
-if ! grep -q "listening on" "$LOGS/gateway-$attempt.log" 2>/dev/null; then
-    echo "bench: the gateway did not start" >&2
-    tail -40 "$LOGS/gateway-$attempt.log" >&2 || true
-    exit 1
-fi
-
 if [ "$ADMIN" -eq 1 ]; then
     start "$LOGS/admin.log" "$(deepbook_bin deepbook-admin)" \
         --listen "$ADMIN_HOST:$ADMIN_PORT" \
@@ -275,27 +257,143 @@ if [ "$ADMIN" -eq 1 ]; then
     echo "== admin: http://$ADMIN_HOST:$ADMIN_PORT =="
 fi
 
+
+GATEWAY_PID=""
+
+stop_gateway() {
+    if [ -n "${GATEWAY_PID:-}" ]; then
+        kill -9 "$GATEWAY_PID" 2>/dev/null || true
+        wait "$GATEWAY_PID" 2>/dev/null || true
+        GATEWAY_PID=""
+    fi
+}
+
+start_gateway() {
+    local backend=$1 label=$2 session_dir=$3 port=$4
+    local log="$LOGS/gateway-$label.log"
+    for attempt in $(seq 1 20); do
+        start "$log" "$(deepbook_bin fix-gateway)" \
+            --bind "127.0.0.1:$port" \
+            --session-dir "$session_dir" \
+            --cluster --aeron-dir "$AERON" \
+            --tick-us "$TICK_US" \
+            --backend "$backend" \
+            --journal-sync "$JOURNAL_SYNC" --journal-batch "$JOURNAL_BATCH" \
+            --symbol AAPL --symbol-id 1 \
+            --new-leader-timeout-ms 4000
+        GATEWAY_PID=$LAST_PID
+        if wait_for_line "$log" "listening on" 5; then
+            echo "== gateway: backend=$backend port=$port session=$label =="
+            return 0
+        fi
+        kill -9 "$GATEWAY_PID" 2>/dev/null || true
+        GATEWAY_PID=""
+        sleep 0.2
+    done
+    echo "bench: the $backend gateway did not start" >&2
+    tail -40 "$log" >&2 || true
+    exit 1
+}
+
 # The cluster module becomes ACTIVE only after the service acks; the gateway's
 # connect is the last readiness check.
-echo "== bench: rate=$RATE/s samples=$SAMPLES warmup=$WARMUP tick=${TICK_US}us journal-sync=${JOURNAL_SYNC} journal-batch=${JOURNAL_BATCH} =="
-BENCH_ARGS=(
-    --connect "127.0.0.1:$FIX_PORT"
-    --rate "$RATE"
-    --samples "$SAMPLES"
-    --warmup "$WARMUP"
-    --account 1
-    --price 1.00
-    --qty 1
-    --timeout-ms 120000
-    --prometheus "$BENCH_METRICS"
-)
-if [ "$JSON" -eq 1 ]; then
-    BENCH_ARGS+=(--json)
+run_bench() {
+    local account=$1 seed=$2 out=$3 port=$4
+    local args=(
+        --connect "127.0.0.1:$port"
+        --rate "$RATE"
+        --samples "$SAMPLES"
+        --warmup "$WARMUP"
+        --account "$account"
+        --price 1.00
+        --qty 1
+        --timeout-ms 120000
+        --prometheus "$BENCH_METRICS"
+    )
+    if [ "$JSON" -eq 1 ] || [ "$COMPARE" -eq 1 ]; then
+        args+=(--json)
+    fi
+    if [ "$seed" -eq 1 ]; then
+        args+=(--seed-book)
+    fi
+    echo "== bench: rate=$RATE/s samples=$SAMPLES warmup=$WARMUP tick=${TICK_US}us \
+journal-sync=${JOURNAL_SYNC}/${JOURNAL_BATCH} account=$account =="
+    "$(deepbook_bin fix-bench)" "${args[@]}" | tee "$out"
+}
+
+if [ "$COMPARE" -eq 1 ]; then
+    OUT="$RUN_DIR/compare"
+    mkdir -p "$OUT"
+    # ABBA: epoll, uring, uring, epoll. Each arm gets a fresh FIX session
+    # directory and its own account, so repeated ClOrdIDs do not hit the
+    # engine's idempotency window. The book is seeded once, before arm 1.
+    arms=(epoll uring uring epoll)
+    index=0
+    for backend in "${arms[@]}"; do
+        index=$((index + 1))
+        # Each arm keeps its own gateway process: killing and rebinding the
+        # same port leaves a stale cluster session in the consensus module and
+        # distorts the next arm. The gateways are idle between arms.
+        port=$((FIX_PORT + index))
+        start_gateway "$backend" "compare-$index" "$SESSIONS/arm-$index" "$port"
+        seed=0
+        [ "$index" -eq 1 ] && seed=$SEED
+        run_bench "$index" "$seed" "$OUT/arm-$index.json" "$port"
+        stop_gateway
+        sleep 11
+    done
+    python3 - "$OUT" <<'PY'
+import json
+import pathlib
+import statistics
+import sys
+
+out = pathlib.Path(sys.argv[1])
+arms = ["epoll", "uring", "uring", "epoll"]
+rows = []
+for index, backend in enumerate(arms, 1):
+    data = json.loads((out / f"arm-{index}.json").read_text())
+    rtt = data["rtt_ns"]
+    rows.append(
+        {
+            "backend": backend,
+            "arm": index,
+            "rate": data["rate_per_s"],
+            "p50": rtt["p50"] / 1000,
+            "p90": rtt["p90"] / 1000,
+            "p99": rtt["p99"] / 1000,
+            "p999": rtt["p999"] / 1000,
+            "completed": data["completed"],
+        }
+    )
+
+print()
+print(f"{'backend':8} {'arm':>3} {'completed':>10} {'rate/s':>10} {'p50 us':>10} "
+      f"{'p90 us':>10} {'p99 us':>10} {'p99.9 us':>10}")
+for row in rows:
+    print(
+        f"{row['backend']:8} {row['arm']:>3} {row['completed']:>10} "
+        f"{row['rate']:>10.0f} {row['p50']:>10.1f} {row['p90']:>10.1f} "
+        f"{row['p99']:>10.1f} {row['p999']:>10.1f}"
+    )
+
+for backend in ("epoll", "uring"):
+    selected = [row for row in rows if row["backend"] == backend]
+    p50 = statistics.median(row["p50"] for row in selected)
+    p99 = statistics.median(row["p99"] for row in selected)
+    print(f"median {backend:6} p50={p50:.1f}us p99={p99:.1f}us")
+epoll_p50 = statistics.median(row["p50"] for row in rows if row["backend"] == "epoll")
+uring_p50 = statistics.median(row["p50"] for row in rows if row["backend"] == "uring")
+if epoll_p50 > 0:
+    print(f"p50 delta (uring - epoll) = {uring_p50 - epoll_p50:+.1f}us "
+          f"({(uring_p50 - epoll_p50) / epoll_p50 * 100:+.1f}%)")
+print()
+print("Test-machine numbers. The bare-metal benchmark run is the acceptance number.")
+PY
+else
+    start_gateway "$BACKEND" "main" "$SESSIONS" "$FIX_PORT"
+    run_bench 1 "$SEED" "$LOGS/bench.out" "$FIX_PORT"
 fi
-if [ "$SEED" -eq 1 ]; then
-    BENCH_ARGS+=(--seed-book)
-fi
-"$(deepbook_bin fix-bench)" "${BENCH_ARGS[@]}"
 
 if [ "$SERVE" -eq 1 ]; then
     echo

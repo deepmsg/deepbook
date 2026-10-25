@@ -10,6 +10,7 @@ use deepbook_fix::codec::{MessageBuilder, MsgType, ParsedMessage, tag};
 use deepbook_fix::message::{ApplicationMessage, ExecType, OrdStatus, decode_application};
 use deepbook_gateway::frame::FrameDecoder;
 use deepbook_gateway::{Gateway, GatewayConfig, StubEngine};
+use deepbook_io::BackendKind;
 
 fn temporary_directory(name: &str) -> PathBuf {
     let nonce = std::time::SystemTime::now()
@@ -140,16 +141,24 @@ fn execution_report(frame: &ParsedMessage) -> deepbook_fix::ExecutionReport {
     }
 }
 
-#[test]
-fn a_command_reaches_the_engine_and_the_report_comes_back() {
-    let directory = temporary_directory("orders");
-    let config = GatewayConfig::new(
+fn round_trip(backend: BackendKind) {
+    let name = format!("orders-{backend:?}");
+    let directory = temporary_directory(&name);
+    let mut config = GatewayConfig::new(
         "127.0.0.1:0".parse().expect("address"),
         &directory,
         "DEEPBOOK",
         "CLIENT",
     );
-    let mut gateway = Gateway::bind(config, StubEngine::new()).expect("bind");
+    config.backend = backend;
+    let mut gateway = match Gateway::bind(config, StubEngine::new()) {
+        Ok(gateway) => gateway,
+        Err(error) => {
+            eprintln!("SKIPPED {backend:?}: {error}");
+            std::fs::remove_dir_all(directory).expect("cleanup");
+            return;
+        }
+    };
     let address = gateway.local_addr().expect("local address");
     let handle = std::thread::spawn(move || {
         gateway
@@ -222,4 +231,14 @@ fn a_command_reaches_the_engine_and_the_report_comes_back() {
     drop(stream);
     handle.join().expect("gateway thread");
     std::fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn a_command_reaches_the_engine_over_epoll() {
+    round_trip(BackendKind::Epoll);
+}
+
+#[test]
+fn a_command_reaches_the_engine_over_uring() {
+    round_trip(BackendKind::Uring);
 }

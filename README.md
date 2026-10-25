@@ -16,10 +16,10 @@ that produces the same state twice.
 > `ClusteredService` adapter and `engine-container`, the gateway's
 > `ClusterEngine`, `fix-gateway --cluster`, and a process e2e that kills the
 > engine's host and continues the book from the recovered state (ADR 0005,
-> ADR 0006). M5's measurement foundation is in: the open-loop `fix-bench`
-> client, opt-in journal batching, `deploy/bench.sh` (ADR 0007), and the
-> market-data → admin → WebSocket/Grafana path (ADR 0008). The io_uring
-> backend is the remaining M5 slice.
+> ADR 0006). M5 is complete on this branch: the open-loop `fix-bench` client,
+> opt-in journal batching and the epoll/io_uring comparison (ADR 0007,
+> ADR 0009), plus the market-data → admin → WebSocket/Grafana path
+> (ADR 0008).
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -178,6 +178,26 @@ deploy/bench.sh --tick-us 50 ...          # poll ceiling; 100 ms default
 session journal and sequence-file syncs; a crash then loses at most 63
 outbound messages (ADR 0007). The default deployment keeps M1's
 `fdatasync`-per-message policy.
+
+The gateway runs on `epoll` by default and on `io_uring` with `--backend
+uring` (ADR 0009). The backend comparison is one command:
+
+```bash
+deploy/bench.sh --compare --rate 5000 --samples 20000 --warmup 2000
+```
+
+It runs `epoll, uring, uring, epoll` (ABBA), a separate gateway process and
+account per arm, and prints:
+
+| backend | p50 | p90 | p99 | p99.9 | completed |
+|---|---|---|---|---|---|
+| epoll | 390 µs | 478 µs | 662 µs | 1.96 ms | 20 000 / 20 000 |
+| io_uring | 173 µs | 257 µs | 383 µs | 1.85 ms | 20 000 / 20 000 |
+
+Both arms sustained 5 000 orders/s on WSL2 at a 5 k/s offered rate; the uring
+p50 is about 56% lower. The run takes about a minute because each arm waits
+out the consensus module's session timeout before the next. These are test
+numbers, not the bare-metal acceptance run.
 
 Measured on the WSL2 development machine (i7-10875H, 16 vCPU) with a 10k/s
 offered rate, 20k samples, `--tick-us 100`:

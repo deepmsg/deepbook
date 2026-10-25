@@ -9,6 +9,7 @@ members = [
     "crates/marketdata",
     "crates/admin",
     "crates/bench",
+    "crates/io",
     "crates/spike",
 ]
 

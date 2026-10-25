@@ -33,6 +33,10 @@ engine-e2e:
 bench *args:
     ./deploy/bench.sh {{args}}
 
+# M5 backend comparison: epoll, uring, uring, epoll (ABBA).
+compare:
+    ./deploy/bench.sh --compare --rate 5000 --samples 20000 --warmup 2000
+
 # M5 dashboard: stack + admin + WebSocket UI, then keep serving.
 demo:
     ./deploy/bench.sh --admin --serve --rate 2000 --samples 5000 --warmup 500

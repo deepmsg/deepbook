@@ -22,6 +22,7 @@ use deepbook_fix::journal::SyncPolicy;
 use deepbook_gateway::{
     ClusterEngine, ClusterEngineConfig, Engine, Gateway, GatewayConfig, SessionKey, StubEngine,
 };
+use deepbook_io::BackendKind;
 
 fn main() -> ExitCode {
     match run() {
@@ -44,6 +45,7 @@ fn run() -> Result<(), String> {
     config.heart_bt_int = options.heartbeat;
     config.journal_capacity = options.journal;
     config.tick = std::time::Duration::from_micros(options.tick_us);
+    config.backend = options.backend;
     config.journal_sync = if options.journal_sync_batch {
         SyncPolicy::Every(options.journal_batch)
     } else {
@@ -92,10 +94,11 @@ fn serve<E: Engine>(config: GatewayConfig, engine: E, options: &Options) -> Resu
         .local_addr()
         .map_err(|error| format!("cannot read the bound address: {error}"))?;
     println!(
-        "fix-gateway listening on {address} sessions={} sender={} target={}",
+        "fix-gateway listening on {address} sessions={} sender={} target={} backend={:?}",
         options.session_dir.display(),
         options.sender,
-        options.target
+        options.target,
+        options.backend
     );
     gateway.run().map_err(|error| error.to_string())
 }
@@ -108,6 +111,7 @@ struct Options {
     heartbeat: u32,
     journal: usize,
     tick_us: u64,
+    backend: BackendKind,
     journal_sync_batch: bool,
     journal_batch: u32,
     cluster: bool,
@@ -134,6 +138,7 @@ impl Options {
             heartbeat: 30,
             journal: 4096,
             tick_us: 100_000,
+            backend: BackendKind::Epoll,
             journal_sync_batch: false,
             journal_batch: 64,
             cluster: false,
@@ -183,6 +188,13 @@ impl Options {
                     options.tick_us = value("--tick-us")?
                         .parse()
                         .map_err(|_| "--tick-us must be a number".to_owned())?;
+                }
+                "--backend" => {
+                    options.backend = match value("--backend")?.as_str() {
+                        "epoll" => BackendKind::Epoll,
+                        "uring" => BackendKind::Uring,
+                        other => return Err(format!("--backend {other}: expected epoll|uring")),
+                    };
                 }
                 "--journal-sync" => {
                     options.journal_sync_batch = match value("--journal-sync")?.as_str() {
@@ -244,7 +256,7 @@ fn print_usage() {
         "usage: fix-gateway [--bind IP:PORT] [--session-dir PATH]\n\
          \x20                  [--sender COMPID] [--target COMPID]\n\
          \x20                  [--heartbeat SECONDS] [--journal ENTRIES]\n\
-         \x20                  [--tick-us MICROSECONDS]\n\
+         \x20                  [--tick-us MICROSECONDS] [--backend epoll|uring]\n\
          \x20                  [--journal-sync each|batch] [--journal-batch N]\n\
          \x20                  [--cluster --aeron-dir PATH]\n\
          \x20                  [--ingress-channel URI] [--ingress-stream-id N]\n\

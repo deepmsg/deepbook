@@ -1,0 +1,16 @@
+[package]
+name = "deepbook-io"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: completion event loop — epoll and io_uring backends"
+
+[lints]
+workspace = true
+
+[dependencies]
+mio = { version = "1", features = ["net", "os-poll"] }
+io-uring = "0.7"
+libc = "0.2"

@@ -356,6 +356,10 @@ fn logon(
     )
     .body(tag::ENCRYPT_METHOD, b"0".to_vec())
     .body_int(tag::HEART_BT_INT, 30_u32)
+    // A reset Logon: the bench always starts at sequence 1, and a repeated
+    // arm against the same gateway directory must not inherit the last one's
+    // sequence numbers.
+    .body(tag::RESET_SEQ_NUM_FLAG, b"Y".to_vec())
     .build();
     *sequence += 1;
     stream.write_all(&message)?;

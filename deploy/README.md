@@ -43,6 +43,8 @@ deploy/bench.sh --rate 10000 --samples 20000 --warmup 2000
 deploy/bench.sh --journal-sync each ...    # M1's one-sync-per-message policy
 deploy/bench.sh --tick-us 50 ...           # epoll poll ceiling (default 100 ms)
 deploy/bench.sh --json ...                 # the client's JSON object
+deploy/bench.sh --backend uring ...        # io_uring gateway (default epoll)
+deploy/bench.sh --compare ...              # epoll, uring, uring, epoll (ABBA)
 deploy/bench.sh --keep ...                 # keep the run directory and logs
 ```
 
@@ -90,4 +92,5 @@ quantity, trades, and the cluster's commit position/snapshot count/role.
   composed.
 - A three-node profile for the failover demo, no CPU pinning.
 - Bind-core and huge-page scripts for the benchmark machine.
-- The io_uring backend selector and the epoll-vs-uring ABBA run in `bench.sh`.
+- io_uring multishot accept/recv, registered buffers and optional SQPOLL;
+  today the backend uses plain completion operations (ADR 0009).

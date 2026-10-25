@@ -1,6 +1,6 @@
 # ADR 0001: cluster or CommandLog?
 
-- Status: **Proposed** — decided at the M0 spike
+- Status: **Accepted** — 2026-10-25, on the M0 spike evidence
 - Date: 2026-10-24
 - Deciders: project owner
 
@@ -16,30 +16,33 @@ The M0 spike exists to make this decision on evidence, not prose.
 
 ## Decision
 
-Deferred to the M0 spike. The gate is four measurements; **passing three of
-four adopts the cluster**, otherwise the `CommandLog` publication path is used
-and the cluster integration moves behind the same seam for a later milestone.
+**Adopt the deepmsg cluster.** The gate was four measurements; passing three of
+four adopts the cluster, otherwise the `CommandLog` publication path is used and
+the cluster integration moves behind the same seam for a later milestone. Three
+gates pass (1, 3 and 4); gate 2 is borderline on WSL2 and is carried as a
+bench-machine follow-up, not a reason to fall back.
 
-| # | Gate | Instrument |
-|---|---|---|
-| 1 | Rust consensus + Rust container + Rust client, single node, `echo` round trip | deepmsg `cluster_harness` or the three binaries |
-| 2 | `offer → egress` p99 < 200 µs, local | HDR histogram, same machine |
-| 3 | snapshot, kill -9, restart, state hashes equal | `basic-auction` + `ClusterTool` |
-| 4 | three-node leader kill, client recovers < 5 s, no duplicate fills | optional/stretch; LC-2 already exercises the mechanism |
+| # | Gate | Instrument | Verdict |
+|---|---|---|---|
+| 1 | Rust consensus + Rust container + Rust client, single node, `echo` round trip | `cluster-spike smoke` | pass |
+| 2 | `offer → egress` p99 < 200 µs, local | HDR histogram, same machine | borderline on WSL2; bench follow-up |
+| 3 | snapshot, kill -9, restart, state hashes equal | `basic-auction` + `ClusterTool` | pass |
+| 4 | three-node leader kill, client recovers < 5 s, no duplicate fills | `cluster-spike gate4` | pass on the test configuration |
 
-Gate 4 is a stretch for M0. It is the M6 story; the decision should not wait on
-it if gates 1–3 are green.
+The measurements and their caveats are in "Spike results" below.
 
 ## Consequences
 
-- **Adopt cluster:** `engine-cluster` depends on `deepmsg-cluster-service`; the
-  gateway depends on `deepmsg-cluster-client`; snapshot format is versioned;
-  the M0 pin of deepmsg becomes load-bearing.
-- **Fall back:** `CommandLog` is a publication + a replay cursor; ordering is
-  single-node only; snapshots and failover are deferred. The `engine-core`
-  crate is unaffected either way because it depends only on `types`.
+- **Adopt cluster (the decision):** `engine-cluster` depends on
+  `deepmsg-cluster-service`; the gateway depends on `deepmsg-cluster-client`;
+  snapshot format is versioned; the M0 pin of deepmsg becomes load-bearing.
+  The gateway also owns the session-failover loop described below.
+- **Fall back (not taken, kept for the record):** `CommandLog` is a publication
+  + a replay cursor; ordering is single-node only; snapshots and failover are
+  deferred. The `engine-core` crate is unaffected either way because it depends
+  only on `types`.
 
-## Spike results (2026-10-24)
+## Spike results (2026-10-24 – 2026-10-25)
 
 Environment: WSL2 on an Intel i7-10875H (16 logical CPUs), kernel
 6.6.87.2-microsoft-standard-WSL2, **release** profile, deepmsg `8c70972`.
@@ -97,12 +100,12 @@ pass has been removed; its numbers (p50 81–91 µs, p99 177–349 µs) are
 superseded by the process-based run above. deepmsg stays clean; deepbook owns
 the spike.
 
-Preliminary: gates 1, 3 and 4 pass; gate 2 is borderline on WSL2 (p50 ≈ 5 µs,
-p99 mostly under 200 µs, one run at 203 µs). The design's "3 of 4" rule is
-therefore met, and the evidence favours the cluster. Gate 2 still needs the
-bench machine for a stable latency verdict, and the owner should decide whether
-the client's lost-`NewLeaderEvent` behaviour (above) is acceptable at this
-rev before flipping this ADR to Accepted.
+Accepted 2026-10-25: gates 1, 3 and 4 pass; gate 2 is borderline on WSL2
+(p50 ≈ 5 µs, p99 mostly under 200 µs, one run at 203 µs) and is a bench-machine
+follow-up. The design's "3 of 4" rule is met, so the cluster is adopted. The
+client's lost-`NewLeaderEvent` behaviour above is accepted at this rev because
+the new leader serves immediately and the gateway fallback recovers the session;
+the gateway note below is part of the decision, not an open question.
 
 ### Implementation note for the gateway
 

@@ -6,12 +6,14 @@
 #   deploy/bench.sh [--rate N] [--samples N] [--warmup N] [--json]
 #                   [--base-port N] [--tick-us N]
 #                   [--journal-sync each|batch] [--journal-batch N]
+#                   [--admin] [--serve] [--admin-host IP] [--no-seed]
 #                   [--keep] [--no-build]
 #
 # Environment:
 #   DEEPBOOK_DEEPMSG_DIR  deepmsg checkout (default: <repo>/../deepmsg)
 #   DEEPMSG_PROFILE       release|debug (default: release)
 #   BENCH_RUN_DIR         run directory (default: /dev/shm/deepbook-bench-<pid>)
+#   BENCH_METRICS         Prometheus text file (default: target/bench/last.prom)
 #
 # The run directory is on /dev/shm by default so the outbound journal's
 # fdatasync is a tmpfs operation; a physical-disk run is a different
@@ -31,6 +33,12 @@ JOURNAL_SYNC=batch
 KEEP=0
 JSON=0
 BUILD=1
+ADMIN=0
+SERVE=0
+SEED=1
+ADMIN_PORT=""
+ADMIN_HOST=127.0.0.1
+BENCH_METRICS=${BENCH_METRICS:-$ROOT/target/bench/last.prom}
 RUN_DIR=${BENCH_RUN_DIR:-/dev/shm/deepbook-bench-$$}
 
 usage() {
@@ -48,6 +56,12 @@ while [ $# -gt 0 ]; do
         --journal-batch) JOURNAL_BATCH=$2; shift 2 ;;
         --journal-sync) JOURNAL_SYNC=$2; shift 2 ;;
         --json) JSON=1; shift ;;
+        --admin) ADMIN=1; shift ;;
+        --serve) ADMIN=1; SERVE=1; shift ;;
+        --no-seed) SEED=0; shift ;;
+        --admin-port) ADMIN_PORT=$2; shift 2 ;;
+        --admin-host) ADMIN_HOST=$2; shift 2 ;;
+        --bench-metrics) BENCH_METRICS=$2; shift 2 ;;
         --keep) KEEP=1; shift ;;
         --no-build) BUILD=0; shift ;;
         --help|-h) usage ;;
@@ -87,7 +101,8 @@ if [ "$BUILD" -eq 1 ]; then
     ( cd "$ROOT" && cargo build "${PROFILE_FLAG[@]}" \
         -p deepbook-gateway --bin fix-gateway \
         -p deepbook-engine-cluster --bin engine-container \
-        -p deepbook-bench --bin fix-bench )
+        -p deepbook-bench --bin fix-bench \
+        -p deepbook-admin --bin deepbook-admin )
 fi
 
 AERON=$RUN_DIR/aeron
@@ -101,6 +116,10 @@ mkdir -p "$AERON" "$ARCHIVE" "$CLUSTER" "$LOGS" "$SESSIONS"
 MEMBERS="0,localhost:$BASE_PORT,localhost:$((BASE_PORT + 10)),localhost:$((BASE_PORT + 20)),localhost:0,localhost:$((BASE_PORT + 40))"
 FIX_PORT=$((BASE_PORT + 50))
 CLUSTER_ID=7
+if [ -z "$ADMIN_PORT" ]; then
+    ADMIN_PORT=$((BASE_PORT + 60))
+fi
+mkdir -p "$(dirname "$BENCH_METRICS")"
 
 PIDS=()
 cleanup() {
@@ -199,7 +218,7 @@ echo "commit: $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknow
 echo "io_uring_disabled: $(cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo unknown)"
 echo "binaries:"
 sha256sum "$(deepbook_bin fix-gateway)" "$(deepbook_bin engine-container)" \
-    "$(deepbook_bin fix-bench)" 2>/dev/null || true
+    "$(deepbook_bin fix-bench)" "$(deepbook_bin deepbook-admin)" 2>/dev/null || true
 echo
 
 echo "== start =="
@@ -245,6 +264,17 @@ if ! grep -q "listening on" "$LOGS/gateway-$attempt.log" 2>/dev/null; then
     exit 1
 fi
 
+if [ "$ADMIN" -eq 1 ]; then
+    start "$LOGS/admin.log" "$(deepbook_bin deepbook-admin)" \
+        --listen "$ADMIN_HOST:$ADMIN_PORT" \
+        --aeron-dir "$AERON" \
+        --ui-dir "$ROOT/crates/ui" \
+        --cluster-id "$CLUSTER_ID" \
+        --bench-metrics "$BENCH_METRICS"
+    wait_for_line "$LOGS/admin.log" "listening on" 10
+    echo "== admin: http://$ADMIN_HOST:$ADMIN_PORT =="
+fi
+
 # The cluster module becomes ACTIVE only after the service acks; the gateway's
 # connect is the last readiness check.
 echo "== bench: rate=$RATE/s samples=$SAMPLES warmup=$WARMUP tick=${TICK_US}us journal-sync=${JOURNAL_SYNC} journal-batch=${JOURNAL_BATCH} =="
@@ -257,8 +287,20 @@ BENCH_ARGS=(
     --price 1.00
     --qty 1
     --timeout-ms 120000
+    --prometheus "$BENCH_METRICS"
 )
 if [ "$JSON" -eq 1 ]; then
     BENCH_ARGS+=(--json)
 fi
+if [ "$SEED" -eq 1 ]; then
+    BENCH_ARGS+=(--seed-book)
+fi
 "$(deepbook_bin fix-bench)" "${BENCH_ARGS[@]}"
+
+if [ "$SERVE" -eq 1 ]; then
+    echo
+    echo "dashboard: http://$ADMIN_HOST:$ADMIN_PORT   metrics: http://$ADMIN_HOST:$ADMIN_PORT/metrics"
+    echo "press Ctrl-C to stop"
+    # The trap kills the children; wait keeps the stack alive.
+    while :; do sleep 1; done
+fi

@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 deepbook-types = { path = "../types" }
+deepbook-marketdata = { path = "../marketdata" }
+deepmsg-cnc = { workspace = true }
+deepmsg-cluster-common = { workspace = true }

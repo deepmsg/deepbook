@@ -10,14 +10,19 @@
 //! | `deepbook.engine.max-orders` | 65536 |
 //! | `deepbook.engine.recent-window` | 100000 |
 //!
+//! Market data is published on the same driver by default
+//! (`deepbook.marketdata.enabled=true`). The channels default to IPC and the
+//! stream ids to 2001/2002; the admin process subscribes to the same names.
+//!
 //! The media driver and the archive are separate processes in the same
 //! `aeron.dir`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use deepbook_engine_cluster::EngineService;
+use deepbook_engine_cluster::{EngineService, MarketDataConfig};
 use deepbook_engine_core::{EngineConfig, RiskConfig};
+use deepbook_marketdata::{DeepmsgConfig, DeepmsgRecoveryResponder};
 use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_service::{ClusteredServiceAgent, ServiceContainerConfig};
 use deepmsg_driver::idle::Strategy;
@@ -77,7 +82,46 @@ fn run() -> Result<(), String> {
         recent_order_window: property(&properties, "deepbook.engine.recent-window", 100_000),
         risk: RiskConfig::disabled(),
     };
-    let service = EngineService::new(engine_config);
+    let service = if property(&properties, "deepbook.marketdata.enabled", true) {
+        let deepmsg = market_data_config(&properties, &config.aeron_dir);
+        let market = MarketDataConfig {
+            deepmsg: deepmsg.clone(),
+            recent_capacity: property(&properties, "deepbook.marketdata.recent-capacity", 10_000),
+        };
+        let service = EngineService::with_market_data(engine_config, market)
+            .map_err(|error| error.to_string())?;
+        // Recovery requests must be answered even when no command is arriving,
+        // so a dashboard that starts on an idle cluster still gets a snapshot.
+        // The responder owns the recovery channels; the service's publisher
+        // only publishes incrementals.
+        if let Some(cell) = service.market_snapshot_handle() {
+            std::thread::Builder::new()
+                .name("deepbook-md-recovery".to_owned())
+                .spawn(move || {
+                    let mut responder = match DeepmsgRecoveryResponder::connect(&deepmsg) {
+                        Ok(responder) => responder,
+                        Err(error) => {
+                            eprintln!("engine: market data recovery: {error}");
+                            return;
+                        }
+                    };
+                    loop {
+                        let snapshot = match cell.lock() {
+                            Ok(snapshot) => snapshot.clone(),
+                            Err(_) => break,
+                        };
+                        if let Err(error) = responder.poll_snapshot(&snapshot) {
+                            eprintln!("engine: market data recovery: {error}");
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                })
+                .map_err(|error| format!("cannot start the market-data responder: {error}"))?;
+        }
+        service
+    } else {
+        EngineService::new(engine_config)
+    };
 
     sys::set_current_thread_name("deepbook-engine")
         .map_err(|error| format!("the thread cannot be named: {error}"))?;
@@ -118,4 +162,64 @@ fn property<T: std::str::FromStr>(properties: &Properties, name: &str, default: 
         .get(name)
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn property_string(properties: &Properties, name: &str, default: &str) -> String {
+    properties.get(name).unwrap_or(default).to_owned()
+}
+
+fn market_data_config(properties: &Properties, aeron_dir: &Path) -> DeepmsgConfig {
+    let incremental = property_string(
+        properties,
+        "deepbook.marketdata.incremental.channel",
+        "aeron:ipc",
+    );
+    let incremental_subscription = property_string(
+        properties,
+        "deepbook.marketdata.incremental.subscription.channel",
+        &incremental,
+    );
+    let request = property_string(
+        properties,
+        "deepbook.marketdata.recovery.request.channel",
+        "aeron:ipc",
+    );
+    let request_subscription = property_string(
+        properties,
+        "deepbook.marketdata.recovery.request.subscription.channel",
+        &request,
+    );
+    let response = property_string(
+        properties,
+        "deepbook.marketdata.recovery.response.channel",
+        "aeron:ipc",
+    );
+    let response_subscription = property_string(
+        properties,
+        "deepbook.marketdata.recovery.response.subscription.channel",
+        &response,
+    );
+    let aeron = properties
+        .get("deepbook.marketdata.aeron.dir")
+        .map_or_else(|| aeron_dir.to_path_buf(), PathBuf::from);
+    let mut config = DeepmsgConfig::new(
+        aeron,
+        incremental,
+        incremental_subscription,
+        request,
+        request_subscription,
+        response,
+        response_subscription,
+    );
+    config.incremental_stream_id = property(
+        properties,
+        "deepbook.marketdata.incremental.stream.id",
+        config.incremental_stream_id,
+    );
+    config.recovery_stream_id = property(
+        properties,
+        "deepbook.marketdata.recovery.stream.id",
+        config.recovery_stream_id,
+    );
+    config
 }

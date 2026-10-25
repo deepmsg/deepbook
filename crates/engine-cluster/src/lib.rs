@@ -10,5 +10,5 @@
 pub mod service;
 pub mod snapshot;
 
-pub use service::{EngineService, ServiceError};
+pub use service::{EngineService, MarketDataConfig, ServiceError};
 pub use snapshot::{CodecError, decode, encode};

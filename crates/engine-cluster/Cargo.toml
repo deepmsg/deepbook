@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 deepbook-types = { path = "../types" }
 deepbook-engine-core = { path = "../engine-core" }
+deepbook-marketdata = { path = "../marketdata" }
 deepmsg-cluster-common = { workspace = true }
 deepmsg-codec-cluster = { workspace = true }
 deepmsg-cluster-service = { workspace = true }

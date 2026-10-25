@@ -32,3 +32,11 @@ engine-e2e:
 # `just bench --rate 20000 --samples 50000` forwards the script's options.
 bench *args:
     ./deploy/bench.sh {{args}}
+
+# M5 dashboard: stack + admin + WebSocket UI, then keep serving.
+demo:
+    ./deploy/bench.sh --admin --serve --rate 2000 --samples 5000 --warmup 500
+
+# Grafana + Prometheus for the admin's /metrics (see deploy/docker-compose.monitoring.yml).
+monitoring:
+    docker compose -f deploy/docker-compose.monitoring.yml up -d

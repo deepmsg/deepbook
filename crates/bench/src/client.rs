@@ -61,6 +61,9 @@ pub struct BenchConfig {
     pub warmup: u64,
     /// The whole run's deadline.
     pub timeout: Duration,
+    /// Send a small resting/crossing book before the timed run, so the
+    /// dashboard has depth and a trade tape.
+    pub seed_book: bool,
 }
 
 impl Default for BenchConfig {
@@ -79,6 +82,7 @@ impl Default for BenchConfig {
             samples: 100_000,
             warmup: 5_000,
             timeout: Duration::from_secs(60),
+            seed_book: false,
         }
     }
 }
@@ -167,6 +171,9 @@ pub fn run(config: &BenchConfig) -> Result<Report, ClientError> {
         rejected: 0,
     };
     logon(&mut stream, config, &mut state.sequence, start_connect)?;
+    if config.seed_book {
+        seed_book(&mut stream, config, &mut state.sequence)?;
+    }
     stream.set_nonblocking(true)?;
 
     let interval = (config.rate_per_second > 0)
@@ -398,6 +405,27 @@ fn logon(
 }
 
 fn new_order(sequence: u64, cl_ord_id: &str, config: &BenchConfig) -> Vec<u8> {
+    order_message(
+        sequence,
+        cl_ord_id,
+        "1",
+        config.quantity,
+        &config.price,
+        // IOC: the engine cancels an unfilled remainder instead of resting it.
+        "3",
+        config,
+    )
+}
+
+fn order_message(
+    sequence: u64,
+    cl_ord_id: &str,
+    side: &str,
+    qty: i64,
+    price: &str,
+    time_in_force: &str,
+    config: &BenchConfig,
+) -> Vec<u8> {
     MessageBuilder::new(
         MsgType::NewOrderSingle,
         &config.sender,
@@ -408,14 +436,46 @@ fn new_order(sequence: u64, cl_ord_id: &str, config: &BenchConfig) -> Vec<u8> {
     .body_str(tag::CL_ORD_ID, cl_ord_id)
     .body_str(tag::ACCOUNT, &config.account)
     .body_str(tag::SYMBOL, &config.symbol)
-    .body(tag::SIDE, b"1".to_vec())
-    .body_int(tag::ORDER_QTY, config.quantity)
+    .body(tag::SIDE, side.as_bytes().to_vec())
+    .body_int(tag::ORDER_QTY, qty)
     .body(tag::ORD_TYPE, b"2".to_vec())
-    .body_str(tag::PRICE, &config.price)
-    // IOC: the engine cancels an unfilled remainder instead of resting it.
-    .body(tag::TIME_IN_FORCE, b"3".to_vec())
+    .body_str(tag::PRICE, price)
+    .body(tag::TIME_IN_FORCE, time_in_force.as_bytes().to_vec())
     .body_str(tag::TRANSACT_TIME, SENDING_TIME)
     .build()
+}
+
+/// Six orders: four resting levels and two trades, so the dashboard has
+/// something to draw. They are sent before the measured run and their reports
+/// are ignored (`S*` does not map to a sample).
+fn seed_book(
+    stream: &mut TcpStream,
+    config: &BenchConfig,
+    sequence: &mut u64,
+) -> Result<(), ClientError> {
+    let seeds = [
+        ("S1", "1", 100, "100.00", "0"),
+        ("S2", "1", 50, "99.50", "0"),
+        ("S3", "2", 80, "100.50", "0"),
+        ("S4", "2", 120, "101.00", "0"),
+        // A sell through the best bid and a buy through the best ask.
+        ("S5", "2", 40, "100.00", "3"),
+        ("S6", "1", 30, "100.50", "3"),
+    ];
+    for (cl_ord_id, side, qty, price, time_in_force) in seeds {
+        let message = order_message(
+            *sequence,
+            cl_ord_id,
+            side,
+            qty,
+            price,
+            time_in_force,
+            config,
+        );
+        *sequence += 1;
+        stream.write_all(&message)?;
+    }
+    Ok(())
 }
 
 fn heartbeat(sequence: u64, test_req_id: &str, config: &BenchConfig) -> Vec<u8> {

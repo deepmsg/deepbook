@@ -10,13 +10,14 @@
 //! It prints the client-side RTT table (`--json` for one JSON object). The
 //! numbers are send-queue to first-report; see `deepbook_bench::client`.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use deepbook_bench::{BenchConfig, run};
 
 fn main() -> ExitCode {
-    let (config, json) = match parse() {
+    let (config, json, prometheus) = match parse() {
         Ok(options) => options,
         Err(error) => {
             eprintln!("fix-bench: {error}");
@@ -29,6 +30,12 @@ fn main() -> ExitCode {
                 println!("{}", report.to_json());
             } else {
                 print!("{}", report.to_table());
+            }
+            if let Some(path) = &prometheus {
+                if let Err(error) = write_prometheus(path, &report) {
+                    eprintln!("fix-bench: {error}");
+                    return ExitCode::FAILURE;
+                }
             }
             if report.completed == 0 {
                 eprintln!("fix-bench: no report was received");
@@ -44,9 +51,21 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse() -> Result<(BenchConfig, bool), String> {
+fn write_prometheus(path: &PathBuf, report: &deepbook_bench::Report) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    std::fs::write(path, report.to_prometheus(timestamp))
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn parse() -> Result<(BenchConfig, bool, Option<PathBuf>), String> {
     let mut config = BenchConfig::default();
     let mut json = false;
+    let mut prometheus = None;
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
     while index < arguments.len() {
@@ -97,6 +116,8 @@ fn parse() -> Result<(BenchConfig, bool), String> {
                 config.timeout = Duration::from_millis(millis);
             }
             "--json" => json = true,
+            "--seed-book" => config.seed_book = true,
+            "--prometheus" => prometheus = Some(value("--prometheus")?.into()),
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -107,7 +128,7 @@ fn parse() -> Result<(BenchConfig, bool), String> {
     if config.samples == 0 {
         return Err("--samples must be positive".to_owned());
     }
-    Ok((config, json))
+    Ok((config, json, prometheus))
 }
 
 fn print_usage() {
@@ -116,8 +137,10 @@ fn print_usage() {
          \x20                [--warmup N] [--account ID] [--symbol S]\n\
          \x20                [--price FIX_DECIMAL] [--qty N]\n\
          \x20                [--sender COMPID] [--target COMPID]\n\
-         \x20                [--timeout-ms N] [--json]\n\
+         \x20                [--timeout-ms N] [--json] [--seed-book]\n\
+         \x20                [--prometheus PATH]\n\
          \n\
-         Orders are IOC buys at --price; only the first report is an RTT sample."
+         Orders are IOC buys at --price; only the first report is an RTT sample.\n\
+         --seed-book sends four resting levels and two trades before the run."
     );
 }

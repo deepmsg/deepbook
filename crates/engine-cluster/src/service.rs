@@ -7,10 +7,15 @@
 //! maximum payload needs; `on_start` concatenates them and restores.
 
 use std::fmt;
+use std::sync::{Arc, Mutex};
 
 use deepbook_engine_core::wire::{decode_command, encode_event};
-use deepbook_engine_core::{Engine, EngineConfig, Event};
-use deepbook_types::LogPos;
+use deepbook_engine_core::{Engine, EngineConfig, EngineSnapshot, Event};
+use deepbook_marketdata::{
+    DeepmsgConfig, DeepmsgIncrementalPublisher, MarketDataService,
+    ServiceConfig as MarketServiceConfig, Snapshot,
+};
+use deepbook_types::{LogPos, Seq};
 use deepmsg_cluster_service::service::{SnapshotReader, SnapshotWriter};
 use deepmsg_cluster_service::{
     Cluster, ClusteredService, ContainerError, LogHeader, Role, SessionId,
@@ -28,6 +33,8 @@ pub enum ServiceError {
     Codec(CodecError),
     /// The snapshot did not fit the configured engine.
     Snapshot(deepbook_engine_core::SnapshotError),
+    /// The market-data transport is unavailable.
+    MarketData(String),
 }
 
 impl fmt::Display for ServiceError {
@@ -36,16 +43,45 @@ impl fmt::Display for ServiceError {
             Self::Wire(error) => write!(formatter, "{error}"),
             Self::Codec(error) => write!(formatter, "{error}"),
             Self::Snapshot(error) => write!(formatter, "{error}"),
+            Self::MarketData(detail) => write!(formatter, "market data: {detail}"),
         }
     }
 }
 
 impl std::error::Error for ServiceError {}
 
+/// Where the engine publishes its market-data stream.
+#[derive(Clone, Debug)]
+pub struct MarketDataConfig {
+    /// The transport endpoints (aeron dir, channels, stream ids).
+    pub deepmsg: DeepmsgConfig,
+    /// Incrementals kept for recovery.
+    pub recent_capacity: usize,
+}
+
+/// The market-data half of the service, when it is enabled.
+struct MarketDataState {
+    service: MarketDataService,
+    publisher: DeepmsgIncrementalPublisher,
+    /// The latest snapshot, read by the recovery-responder thread.
+    snapshot: Arc<Mutex<Snapshot>>,
+    recent_capacity: usize,
+    incrementals: u64,
+}
+
+/// A market-data snapshot is broadcast after this many incrementals so a
+/// subscriber that missed the recovery request still gets a base.
+const SNAPSHOT_EVERY: u64 = 1_024;
+/// The container snapshot's market-data prefix: magic, version, `md_seq`.
+const MARKET_MAGIC: [u8; 4] = *b"MDS1";
+const MARKET_VERSION: u8 = 1;
+const MARKET_PREFIX: usize = 4 + 1 + 8;
+
 /// The engine service.
 pub struct EngineService {
     config: EngineConfig,
     engine: Engine,
+    market_data: Option<MarketDataState>,
 }
 
 impl EngineService {
@@ -55,7 +91,37 @@ impl EngineService {
         Self {
             config,
             engine: Engine::new(config),
+            market_data: None,
         }
+    }
+
+    /// A fresh engine that also publishes market data on `config.deepmsg`.
+    ///
+    /// # Errors
+    ///
+    /// The media driver or one of the publications is unavailable.
+    pub fn with_market_data(
+        config: EngineConfig,
+        market: MarketDataConfig,
+    ) -> Result<Self, ServiceError> {
+        let publisher = DeepmsgIncrementalPublisher::connect(&market.deepmsg)
+            .map_err(|error| ServiceError::MarketData(error.to_string()))?;
+        let service = MarketDataService::new(MarketServiceConfig {
+            symbol: config.symbol,
+            recent_capacity: market.recent_capacity,
+        });
+        let snapshot = Arc::new(Mutex::new(service.snapshot()));
+        Ok(Self {
+            config,
+            engine: Engine::new(config),
+            market_data: Some(MarketDataState {
+                service,
+                publisher,
+                snapshot,
+                recent_capacity: market.recent_capacity,
+                incrementals: 0,
+            }),
+        })
     }
 
     /// Restore from a `DBS1` snapshot record.
@@ -64,9 +130,24 @@ impl EngineService {
     ///
     /// The record is corrupt or does not fit the configuration.
     pub fn from_snapshot(config: EngineConfig, bytes: &[u8]) -> Result<Self, ServiceError> {
-        let snapshot = decode(bytes).map_err(ServiceError::Codec)?;
+        let (snapshot, _) = decode_service_snapshot(bytes)?;
         let engine = Engine::restore(config, &snapshot).map_err(ServiceError::Snapshot)?;
-        Ok(Self { config, engine })
+        Ok(Self {
+            config,
+            engine,
+            market_data: None,
+        })
+    }
+
+    /// The live market-data snapshot, when market data is enabled.
+    ///
+    /// The container's recovery-responder thread reads this; it is not on the
+    /// engine's command path.
+    #[must_use]
+    pub fn market_snapshot_handle(&self) -> Option<Arc<Mutex<Snapshot>>> {
+        self.market_data
+            .as_ref()
+            .map(|market| Arc::clone(&market.snapshot))
     }
 
     /// The engine, for a test or an operator.
@@ -84,7 +165,13 @@ impl EngineService {
     /// The snapshot record.
     #[must_use]
     pub fn snapshot_bytes(&self) -> Vec<u8> {
-        encode(&self.engine.snapshot())
+        let body = encode(&self.engine.snapshot());
+        encode_service_snapshot(
+            body,
+            self.market_data
+                .as_ref()
+                .map(|market| market.service.last_md_seq()),
+        )
     }
 
     /// Decode and apply one command at `log_pos`.
@@ -98,6 +185,56 @@ impl EngineService {
         self.engine.on_command(&command, log_pos, &mut events);
         Ok(events)
     }
+
+    /// Feed the engine's trades and book updates into the market-data stream
+    /// and answer any pending recovery request.
+    ///
+    /// The offers are best effort: a slow or absent subscriber must not
+    /// backpressure the cluster service. A dropped incremental leaves a gap
+    /// that the subscriber repairs through the recovery channel.
+    fn publish_market_data(&mut self, events: &[Event]) {
+        let Some(market) = self.market_data.as_mut() else {
+            return;
+        };
+        let MarketDataState {
+            service,
+            publisher,
+            snapshot,
+            incrementals,
+            ..
+        } = market;
+        for event in events {
+            let seq = service.last_md_seq() + 1;
+            let incremental = match event {
+                Event::BookUpdate(update) => {
+                    service.on_book_update(seq, update.side, update.price, update.qty)
+                }
+                Event::Trade(trade) => {
+                    service.on_trade(seq, trade.price, trade.qty, trade.aggressor_side)
+                }
+                _ => continue,
+            };
+            match incremental {
+                Ok(incremental) => {
+                    *incrementals = incrementals.saturating_add(1);
+                    if let Err(error) = publisher.try_publish_incremental(incremental) {
+                        eprintln!("engine: market data publish: {error}");
+                    }
+                }
+                Err(error) => eprintln!("engine: market data: {error}"),
+            }
+        }
+        let latest = service.snapshot();
+        if let Ok(mut cell) = snapshot.lock() {
+            *cell = latest.clone();
+        }
+        if *incrementals >= SNAPSHOT_EVERY {
+            *incrementals = 0;
+            if let Err(error) = publisher.try_publish_snapshot(&latest) {
+                eprintln!("engine: market data snapshot: {error}");
+            }
+        }
+    }
 }
 
 impl ClusteredService for EngineService {
@@ -108,8 +245,34 @@ impl ClusteredService for EngineService {
     ) -> Result<(), ContainerError> {
         if let Some(reader) = snapshot {
             let bytes = read_snapshot(cluster, reader)?;
-            let decoded = decode(&bytes).map_err(container)?;
+            let (decoded, market_seq) = decode_service_snapshot(&bytes).map_err(container)?;
             self.engine = Engine::restore(self.config, &decoded).map_err(container)?;
+            if let Some(market) = self.market_data.as_mut() {
+                if let Some(seq) = market_seq {
+                    market.service = MarketDataService::with_sequence(
+                        MarketServiceConfig {
+                            symbol: self.config.symbol,
+                            recent_capacity: market.recent_capacity,
+                        },
+                        seq,
+                    );
+                }
+                let snapshot = market.service.snapshot();
+                if let Ok(mut cell) = market.snapshot.lock() {
+                    *cell = snapshot.clone();
+                }
+                if let Err(error) = market.publisher.try_publish_snapshot(&snapshot) {
+                    eprintln!("engine: market data snapshot: {error}");
+                }
+            }
+        } else if let Some(market) = self.market_data.as_mut() {
+            let snapshot = market.service.snapshot();
+            if let Ok(mut cell) = market.snapshot.lock() {
+                *cell = snapshot.clone();
+            }
+            if let Err(error) = market.publisher.try_publish_snapshot(&snapshot) {
+                eprintln!("engine: market data snapshot: {error}");
+            }
         }
         Ok(())
     }
@@ -142,6 +305,7 @@ impl ClusteredService for EngineService {
         header: &LogHeader,
     ) -> Result<(), ContainerError> {
         let events = self.apply(payload, header.position).map_err(container)?;
+        self.publish_market_data(&events);
         if let Some(session) = session {
             for event in &events {
                 let bytes = encode_event(event);
@@ -171,6 +335,15 @@ impl ClusteredService for EngineService {
                 writer.idle();
             }
         }
+        if let Some(market) = self.market_data.as_mut() {
+            let snapshot = market.service.snapshot();
+            if let Ok(mut cell) = market.snapshot.lock() {
+                *cell = snapshot.clone();
+            }
+            if let Err(error) = market.publisher.try_publish_snapshot(&snapshot) {
+                eprintln!("engine: market data snapshot: {error}");
+            }
+        }
         Ok(())
     }
 
@@ -181,6 +354,39 @@ impl ClusteredService for EngineService {
     fn on_terminate(&mut self, _cluster: &mut Cluster<'_>) -> Result<(), ContainerError> {
         Ok(())
     }
+}
+
+/// Prepend the market-data sequence to an encoded engine snapshot.
+///
+/// The M4 record is unchanged after the 13-byte prefix, and a record without
+/// the prefix (a snapshot written before market data was enabled) still
+/// decodes: the prefix is additive.
+fn encode_service_snapshot(body: Vec<u8>, market_seq: Option<Seq>) -> Vec<u8> {
+    let Some(market_seq) = market_seq else {
+        return body;
+    };
+    let mut out = Vec::with_capacity(MARKET_PREFIX + body.len());
+    out.extend_from_slice(&MARKET_MAGIC);
+    out.push(MARKET_VERSION);
+    out.extend_from_slice(&market_seq.to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn decode_service_snapshot(bytes: &[u8]) -> Result<(EngineSnapshot, Option<Seq>), ServiceError> {
+    if !bytes.starts_with(&MARKET_MAGIC) {
+        return Ok((decode(bytes).map_err(ServiceError::Codec)?, None));
+    }
+    if bytes.len() < MARKET_PREFIX {
+        return Err(ServiceError::Codec(CodecError::Truncated));
+    }
+    if bytes[4] != MARKET_VERSION {
+        return Err(ServiceError::Codec(CodecError::BadVersion(bytes[4])));
+    }
+    let mut seq = [0_u8; 8];
+    seq.copy_from_slice(&bytes[5..MARKET_PREFIX]);
+    let snapshot = decode(&bytes[MARKET_PREFIX..]).map_err(ServiceError::Codec)?;
+    Ok((snapshot, Some(Seq::from_le_bytes(seq))))
 }
 
 fn read_snapshot(
@@ -307,5 +513,31 @@ mod tests {
             assert_eq!(first, second);
         }
         assert_eq!(service.book_hash(), restored.book_hash());
+    }
+
+    #[test]
+    fn the_market_sequence_round_trips_in_the_container_snapshot() {
+        let mut service = EngineService::new(config());
+        let commands = [
+            limit(1, "S1", Side::Sell, 100, 10),
+            limit(2, "B1", Side::Buy, 100, 4),
+        ];
+        for (index, command) in commands.iter().enumerate() {
+            service
+                .apply(&encode_command(command), index as LogPos + 1)
+                .expect("apply");
+        }
+
+        let body = encode(&service.engine.snapshot());
+        let wrapped = encode_service_snapshot(body, Some(42));
+        let (decoded, market_seq) = decode_service_snapshot(&wrapped).expect("decode");
+        assert_eq!(Some(42), market_seq);
+        let restored = Engine::restore(config(), &decoded).expect("restore");
+        assert_eq!(service.book_hash(), restored.book_hash());
+
+        // A record written before market data was enabled has no prefix.
+        let bare = service.snapshot_bytes();
+        let (_, no_market_seq) = decode_service_snapshot(&bare).expect("bare");
+        assert_eq!(None, no_market_seq);
     }
 }

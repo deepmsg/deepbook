@@ -121,6 +121,38 @@ impl Report {
         out
     }
 
+    /// Prometheus gauges for the admin's `/metrics` page and Grafana.
+    ///
+    /// `timestamp_seconds` is the run's wall clock; the app writes it to a
+    /// text file that the admin exports unchanged.
+    #[must_use]
+    pub fn to_prometheus(&self, timestamp_seconds: u64) -> String {
+        let summary = self.summary();
+        let micros = |nanos: u64| nanos as f64 / 1_000.0;
+        let mut out = String::new();
+        for (name, value) in [
+            ("deepbook_bench_sent", self.sent),
+            ("deepbook_bench_completed", self.completed),
+            ("deepbook_bench_rejected", self.rejected),
+            ("deepbook_bench_unanswered", self.unanswered),
+            ("deepbook_bench_timestamp_seconds", timestamp_seconds),
+        ] {
+            out.push_str(&format!("{name} {value}\n"));
+        }
+        for (name, value) in [
+            ("deepbook_bench_rate_per_s", self.rate_per_second()),
+            ("deepbook_bench_rtt_min_us", micros(summary.min_ns)),
+            ("deepbook_bench_rtt_p50_us", micros(summary.p50_ns)),
+            ("deepbook_bench_rtt_p90_us", micros(summary.p90_ns)),
+            ("deepbook_bench_rtt_p99_us", micros(summary.p99_ns)),
+            ("deepbook_bench_rtt_p999_us", micros(summary.p999_ns)),
+            ("deepbook_bench_rtt_max_us", micros(summary.max_ns)),
+        ] {
+            out.push_str(&format!("{name} {value:.3}\n"));
+        }
+        out
+    }
+
     /// One JSON object, so `deploy/bench.sh` can build a comparison table
     /// without parsing the table text.
     #[must_use]
@@ -192,6 +224,14 @@ mod tests {
         let summary = report(&[]).summary();
         assert_eq!(0, summary.count);
         assert_eq!(0.0, report(&[]).rate_per_second());
+    }
+
+    #[test]
+    fn prometheus_names_every_gauge() {
+        let text = report(&[1_000, 2_000, 3_000]).to_prometheus(1_790_000_000);
+        assert!(text.contains("deepbook_bench_rtt_p50_us 2.000"));
+        assert!(text.contains("deepbook_bench_rtt_p99_us 3.000"));
+        assert!(text.contains("deepbook_bench_timestamp_seconds 1790000000"));
     }
 
     #[test]

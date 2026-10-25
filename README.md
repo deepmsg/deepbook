@@ -17,8 +17,9 @@ that produces the same state twice.
 > `ClusterEngine`, `fix-gateway --cluster`, and a process e2e that kills the
 > engine's host and continues the book from the recovered state (ADR 0005,
 > ADR 0006). M5's measurement foundation is in: the open-loop `fix-bench`
-> client, opt-in journal batching, and `deploy/bench.sh` (ADR 0007). The
-> io_uring backend, admin/UI and Grafana are the remaining M5 slices.
+> client, opt-in journal batching, `deploy/bench.sh` (ADR 0007), and the
+> market-data → admin → WebSocket/Grafana path (ADR 0008). The io_uring
+> backend is the remaining M5 slice.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -190,6 +191,35 @@ These are a smoke check on WSL2, **not** the design's acceptance numbers;
 `deploy/bench.sh` on the bare-metal bench machine is the reproducible
 measurement. The 50k/s offered run saturates below that rate and is reported
 as a backlog, not as a throughput.
+
+### Dashboard and Grafana
+
+The engine publishes its `BookUpdate`/`Trade` stream on the same deepmsg
+driver. `deepbook-admin` subscribes, mirrors the book and trade tape, and
+serves a build-free dashboard plus Prometheus metrics:
+
+```bash
+deploy/bench.sh --admin --serve --rate 2000 --samples 5000
+# dashboard: http://127.0.0.1:26060
+# metrics:   http://127.0.0.1:26060/metrics
+```
+
+The page shows order-book depth, recent trades and the last benchmark's
+p50/p90/p99; `/ws` pushes the conflated view at 10 Hz. The recovery channel is
+served by a dedicated thread in `engine-container`, so a dashboard that
+connects while the cluster is idle still gets a snapshot.
+
+Grafana and Prometheus are provisioned from `deploy/`:
+
+```bash
+deploy/bench.sh --admin --serve --admin-host 0.0.0.0
+docker compose -f deploy/docker-compose.monitoring.yml up -d
+# Grafana http://127.0.0.1:3000, Prometheus http://127.0.0.1:9090
+```
+
+The dashboard panels cover benchmark RTT/throughput, market-data rate, book
+levels and quantity, trades, and the cluster's commit position, snapshot count
+and role. ADR 0008 records the market-data wiring and the admin design.
 
 ## FIX conformance
 

@@ -14,3 +14,6 @@ test:
     cargo test --workspace
 
 check: fmt-check clippy test
+
+fix-conformance:
+    ./tests/fix_conformance/run.sh

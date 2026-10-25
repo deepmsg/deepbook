@@ -13,3 +13,4 @@ workspace = true
 [dependencies]
 deepbook-types = { path = "../types" }
 deepbook-fix = { path = "../fix" }
+mio = { version = "1", features = ["net", "os-poll"] }

@@ -17,6 +17,7 @@ workspace = true
 
 [dependencies]
 deepmsg-client = { workspace = true }
+deepmsg-codec = { workspace = true }
 deepmsg-core = { workspace = true }
 deepmsg-cnc = { workspace = true }
 deepmsg-cluster-client = { workspace = true }

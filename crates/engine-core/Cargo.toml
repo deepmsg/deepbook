@@ -12,3 +12,6 @@ workspace = true
 
 [dependencies]
 deepbook-types = { path = "../types" }
+
+[dev-dependencies]
+proptest = "1"

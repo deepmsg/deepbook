@@ -152,6 +152,9 @@ name = "deepbook-marketdata"
 version = "0.1.0"
 dependencies = [
  "deepbook-types",
+ "deepmsg-client",
+ "deepmsg-core",
+ "proptest",
 ]
 
 [[package]]

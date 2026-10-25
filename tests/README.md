@@ -13,8 +13,12 @@ that need more than one component:
   allocator report is `crates/engine-core/tests/allocation.rs`.
 - `replay` — the same log twice; compare book hash, trade hash, and `md_seq`.
 - `recovery` — snapshot, kill -9, restart, compare state.
-- `marketdata` — forced gaps via the driver's loss generator; recovery must
-  fill them and `md_seq` must not go backwards.
+- `marketdata` — **exists (M3)** at `crates/marketdata/tests/deepmsg_loss.rs`:
+  the production media driver with its send-side loss generator, a
+  `reliable=false` incremental subscription, and recovery through the
+  request/response channel. The pure recovery path is
+  `crates/marketdata/tests/recovery.rs`.
 
-`fix_conformance` and the engine's differential/allocation tests exist today;
-the rest are fixed layout for later milestones.
+`fix_conformance`, the engine's differential/allocation tests and the market
+data recovery tests exist today; the rest are fixed layout for later
+milestones.

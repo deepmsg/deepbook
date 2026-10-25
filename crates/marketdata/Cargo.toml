@@ -12,3 +12,8 @@ workspace = true
 
 [dependencies]
 deepbook-types = { path = "../types" }
+deepmsg-client = { workspace = true }
+deepmsg-core = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

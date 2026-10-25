@@ -10,11 +10,11 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0 complete; M1 complete.** The FIX 4.4 codec, session state
-> machine, outbound journal, epoll acceptor, the `CommandSink` engine seam and
-> the QuickFIX/J conformance harness are in place. The M1 engine is a stub that
-> acknowledges orders; the matching engine (M2), market data (M3) and cluster
-> wiring (M4) are still to come.
+> Status: **M0 and M1 complete; M2 implemented on this branch.** The FIX 4.4
+> session, epoll acceptor, engine seam and QuickFIX/J conformance are in place.
+> `engine-core` now has the deterministic slab book, price-time matching,
+> DAY/GTC/IOC/FOK, cancel/replace, post-only, self-trade prevention and the
+> pre-trade limits. Market data (M3) and cluster wiring (M4) are next.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -114,6 +114,30 @@ logon, order/report, an in-window resend with `43`/`122` and an admin gap fill,
 and an over-window `Logout`. The script fetches the QuickFIX/J jars into
 `target/quickfixj/` on first use; see
 [`tests/fix_conformance/README.md`](tests/fix_conformance/README.md).
+
+## Matching engine (M2)
+
+```bash
+cargo test -p deepbook-engine-core
+```
+
+`engine-core` is a pure state machine: the only ordering input is the log
+position, and every output is an event. It implements price-time matching with
+a slab and FIFO price levels, limit and market orders, DAY/GTC/IOC/FOK,
+cancel/replace (a same-price size reduction keeps queue priority), post-only,
+self-trade prevention (off, cancel resting, or reject taker), the common
+pre-trade limits and a bounded duplicate-`ClOrdID` window.
+
+The acceptance tests are in the crate:
+
+- `tests/differential.rs` runs proptest command streams through the slab engine
+  and a naive `Vec` oracle, comparing trades and the final book view.
+- `tests/allocation.rs` installs a counting allocator and asserts that
+  matching at an existing level and canceling after warmup allocate **zero**.
+- Unit tests cover partial fills, price-time priority, market sweeps, TIF,
+  post-only, self-trade, replace priority, risk and replay determinism.
+
+Snapshot serialization and the cluster adapter are M4; market data is M3.
 
 ## Dependency on deepmsg
 

@@ -10,10 +10,11 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0 complete; M1 in progress.** The FIX 4.4 codec, session state
-> machine, outbound journal, epoll acceptor and the `CommandSink` engine seam
-> are in place. The M1 engine is a stub that acknowledges orders; matching,
-> market data and the cluster wiring are still to come.
+> Status: **M0 complete; M1 complete.** The FIX 4.4 codec, session state
+> machine, outbound journal, epoll acceptor, the `CommandSink` engine seam and
+> the QuickFIX/J conformance harness are in place. The M1 engine is a stub that
+> acknowledges orders; the matching engine (M2), market data (M3) and cluster
+> wiring (M4) are still to come.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -101,6 +102,18 @@ It accepts the configured `SenderCompID`/`TargetCompID` pair (default
 `DEEPBOOK`/`CLIENT`) and journals each session under `--session-dir`. The M1
 engine acknowledges NewOrderSingle, cancel, replace and status with
 ExecutionReports; it does not match yet (M2). `--help` lists the options.
+
+## FIX conformance
+
+```bash
+./tests/fix_conformance/run.sh
+```
+
+Starts the real gateway and drives it with QuickFIX/J and a byte-level probe:
+logon, order/report, an in-window resend with `43`/`122` and an admin gap fill,
+and an over-window `Logout`. The script fetches the QuickFIX/J jars into
+`target/quickfixj/` on first use; see
+[`tests/fix_conformance/README.md`](tests/fix_conformance/README.md).
 
 ## Dependency on deepmsg
 

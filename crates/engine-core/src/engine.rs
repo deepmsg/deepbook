@@ -859,6 +859,7 @@ impl Engine {
             account: request.account,
             state,
             reason,
+            is_replace: false,
         }));
     }
 
@@ -879,6 +880,7 @@ impl Engine {
             account: request.account,
             state,
             reason,
+            is_replace: true,
         }));
     }
 

@@ -177,6 +177,7 @@ pub fn encode_event(event: &Event) -> Vec<u8> {
             out.extend_from_slice(&reject.account.to_le_bytes());
             out.push(state_byte(reject.state));
             out.push(reason_byte(Some(reject.reason)));
+            out.push(u8::from(reject.is_replace));
         }
         Event::Trade(trade) => {
             out.push(12);
@@ -258,6 +259,7 @@ pub fn decode_event(bytes: &[u8]) -> Result<Event, WireError> {
                 account: reader.u32()?,
                 state: state_from(reader.u8()?)?,
                 reason: reason_from(reader.u8()?)?.ok_or(WireError::BadEnum(0))?,
+                is_replace: reader.u8()? != 0,
             }))
         }
         12 => Ok(Event::Trade(TradeEvent {
@@ -621,6 +623,7 @@ mod tests {
                 account: 2,
                 state: OrderState::Filled,
                 reason: RejectReason::OrderNotOpen,
+                is_replace: false,
             }),
             Event::Trade(TradeEvent {
                 header,

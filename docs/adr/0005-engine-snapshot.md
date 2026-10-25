@@ -1,6 +1,6 @@
 # ADR 0005: Engine snapshot state and record
 
-- Status: **Accepted** — 2026-10-25, implemented by M4a/M4b (the gateway cluster client and e2e are M4c)
+- Status: **Accepted** — 2026-10-25, implemented by M4a/M4b; M4c adds the gateway client (ADR 0006)
 - Date: 2026-10-25
 - Deciders: project owner
 
@@ -53,4 +53,4 @@ silently changed by a snapshot.
 - `engine-cluster`'s `ClusteredService` adapter (`service.rs`) calls
   `Engine::snapshot` in `on_take_snapshot` and `Engine::restore` in `on_start`;
   the `engine-container` binary hosts it.
-- The gateway's cluster client and the single-node process e2e are M4c.
+- The gateway's cluster client and the single-node process e2e are M4c (ADR 0006).

@@ -146,8 +146,14 @@ dependencies = [
 name = "deepbook-gateway"
 version = "0.1.0"
 dependencies = [
+ "deepbook-engine-core",
  "deepbook-fix",
  "deepbook-types",
+ "deepmsg-client",
+ "deepmsg-cluster-client",
+ "deepmsg-cluster-common",
+ "deepmsg-cnc",
+ "deepmsg-core",
  "mio",
 ]
 

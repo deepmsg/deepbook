@@ -10,11 +10,12 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0–M3 merged; M4 in progress on this branch.** The FIX session,
+> Status: **M0–M3 merged; M4 complete on this branch.** The FIX session,
 > epoll acceptor, engine seam, matching engine and market-data channels are in
-> place. The engine now has snapshot/restore and a versioned snapshot record;
-> the `ClusteredService` adapter, gateway cluster client and the single-node
-> process e2e are still to come.
+> place. M4 adds engine snapshot/restore, the `ClusteredService` adapter and
+> `engine-container`, the gateway's `ClusterEngine`, `fix-gateway --cluster`,
+> and a process e2e that kills the engine's host and continues the book from
+> the recovered state (ADR 0005, ADR 0006).
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -99,9 +100,53 @@ cargo run -p deepbook-gateway --bin fix-gateway -- \
 ```
 
 It accepts the configured `SenderCompID`/`TargetCompID` pair (default
-`DEEPBOOK`/`CLIENT`) and journals each session under `--session-dir`. The M1
-engine acknowledges NewOrderSingle, cancel, replace and status with
-ExecutionReports; it does not match yet (M2). `--help` lists the options.
+`DEEPBOOK`/`CLIENT`) and journals each session under `--session-dir`. Without
+`--cluster` the M1 stub answers; with it the matching engine runs in the
+cluster (below). `--help` lists the options.
+
+## Cluster mode (M4)
+
+The engine is a deepmsg `ClusteredService` hosted by `engine-container`; the
+gateway is a FIX acceptor in front of a deepmsg cluster session:
+
+```text
+FIX client ──TCP──▶ fix-gateway --cluster ──▶ cluster ingress ──▶ engine-container
+                         ▲                          │
+                         └──── cluster egress ◀─────┘
+```
+
+With the deepmsg binaries built (see
+[`crates/spike/README.md`](crates/spike/README.md)) and a driver + single-node
+cluster already running in `-Daeron.dir`:
+
+```bash
+cargo run -p deepbook-engine-cluster --bin engine-container -- \
+  -Daeron.dir=/dev/shm/aeron -Daeron.cluster.dir=/dev/shm/cluster \
+  -Daeron.cluster.members=0,localhost:25000,localhost:25010,localhost:25020,localhost:0,localhost:25040 \
+  -Daeron.cluster.member.id=0 -Daeron.cluster.service.count=1 \
+  -Daeron.cluster.ingress.channel=aeron:ipc -Daeron.cluster.egress.channel=aeron:ipc
+
+cargo run -p deepbook-gateway --bin fix-gateway -- \
+  --bind 127.0.0.1:9876 --session-dir target/fix-sessions \
+  --cluster --aeron-dir /dev/shm/aeron
+```
+
+FIX `Account` is the engine's numeric account id (a missing account is `0`);
+`--symbol`/`--symbol-id` name the one engine symbol. See ADR 0006 for the
+mapping and its limits.
+
+The process e2e covers the whole path — order, crossing, cancel, a cluster
+snapshot, `SIGKILL` of the container and module, restart, an identical
+`Snapshot` book hash and a continuation fill through the same FIX session:
+
+```bash
+cargo build -p deepbook-engine-cluster --bin engine-container
+cargo test -p deepbook-gateway --test cluster_e2e -- --ignored --nocapture
+```
+
+(`just engine-e2e`). It is opt-in (`#[ignore]`) because it starts a media
+driver, a consensus module, a service container and the gateway, and it skips
+rather than fails when the deepmsg binaries are not built.
 
 ## FIX conformance
 

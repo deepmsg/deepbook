@@ -3,8 +3,8 @@
 //! The adapter is the only crate that knows about deepmsg's service
 //! container. It translates log messages into `engine-core` commands, offers
 //! execution reports to the gateway's cluster session, and writes/reads the
-//! engine snapshot. The deepmsg dependency is added at M4; until then the
-//! gateway uses the `CommandLog` seam.
+//! engine snapshot. The gateway's side of the same session is
+//! `deepbook-gateway`'s `ClusterEngine` (ADR 0006).
 #![forbid(unsafe_code)]
 
 pub mod service;

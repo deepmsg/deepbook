@@ -17,7 +17,7 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-8c70972
+d8eb6cf
 ```
 
 The cluster checks in `crates/spike` consume those crates and run deepmsg's
@@ -28,9 +28,12 @@ binaries must not leak it into the driver process.
 
 It contains the single-node cluster (consensus module, service container,
 client, `echo` / `basic-auction` businesses), which is all the spike needs.
-The known gaps (`Cluster.aeron()`, `Cluster.context()`, vectored offer, and an
-all-in-one `ClusteredMediaDriver` binary) are not on the spike path; they
-matter once the engine is hosted in the cluster. See ADR 0001.
+The service API now has `Cluster::client()`, `Cluster::context()`,
+`SnapshotWriter::client()` (read-only, for the snapshot callback) and the
+vectored/claim offers. Two gaps remain: `on_role_change` is handed no `Cluster`
+and so cannot publish from the business's own publication, and there is no
+all-in-one `ClusteredMediaDriver` launcher — `deepmsg-cluster-node` attaches to
+a driver and archive somebody else runs. See ADR 0001.
 
 ## Cargo.toml shape
 

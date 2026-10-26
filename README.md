@@ -10,11 +10,11 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0 and M1 complete; M2 implemented on this branch.** The FIX 4.4
-> session, epoll acceptor, engine seam and QuickFIX/J conformance are in place.
-> `engine-core` now has the deterministic slab book, price-time matching,
-> DAY/GTC/IOC/FOK, cancel/replace, post-only, self-trade prevention and the
-> pre-trade limits. Market data (M3) and cluster wiring (M4) are next.
+> Status: **M0–M2 merged; M3 implemented on this branch.** The FIX 4.4 session,
+> epoll acceptor, engine seam, QuickFIX/J conformance and deterministic
+> matching engine are in place. `marketdata` now has incremental and snapshot
+> channels, gap recovery and a driver-loss test. Cluster wiring (M4) and the
+> bench/io_uring work (M5) are next.
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -138,6 +138,37 @@ The acceptance tests are in the crate:
   post-only, self-trade, replace priority, risk and replay determinism.
 
 Snapshot serialization and the cluster adapter are M4; market data is M3.
+
+## Market data (M3)
+
+```bash
+cargo test -p deepbook-marketdata
+
+# the driver loss-generator test (needs the deepmsg checkout and its binaries)
+DEEPBOOK_DEEPMSG_DIR=../deepmsg cargo test -p deepbook-marketdata \
+  --test deepmsg_loss -- --nocapture
+```
+
+`marketdata` has a producer-side `MarketDataService` and a consumer-side
+`Subscriber`:
+
+- one contiguous `md_seq` per symbol, assigned to every incremental (trade and
+  book update);
+- a bounded ring of recent incrementals and a level snapshot at the last
+  sequence;
+- a subscriber that ignores stale/duplicate messages, reports a hole, and
+  recovers through the request/response channel with either the missing
+  incrementals or a snapshot;
+- a versioned fixed wire frame (`marketdata::wire`), with a deepmsg transport
+  adapter (`marketdata::deepmsg`) and a `reliable=false` subscription for the
+  loss path.
+
+`tests/recovery.rs` drives a simulated lossy link (including a blackout longer
+than the ring), and `tests/deepmsg_loss.rs` starts the production media driver
+with `deepmsg.debug.send.data.loss.drop.every=4`, publishes 1024-byte frames,
+and proves the subscriber catches up with the same book. The driver test skips
+when the deepmsg checkout is absent, so the default workspace run needs no
+external build. ADR 0004 records the channel and recovery semantics.
 
 ## Dependency on deepmsg
 

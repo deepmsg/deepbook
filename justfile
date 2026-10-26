@@ -17,3 +17,6 @@ check: fmt-check clippy test
 
 fix-conformance:
     ./tests/fix_conformance/run.sh
+
+marketdata-loss:
+    DEEPBOOK_DEEPMSG_DIR=../deepmsg cargo test -p deepbook-marketdata --test deepmsg_loss -- --nocapture

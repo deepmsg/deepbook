@@ -173,7 +173,7 @@ version = "0.1.0"
 [[package]]
 name = "deepmsg-client"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 dependencies = [
  "deepmsg-cnc",
  "deepmsg-core",
@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "deepmsg-cluster-client"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 dependencies = [
  "deepmsg-client",
  "deepmsg-cluster-common",
@@ -194,7 +194,7 @@ dependencies = [
 [[package]]
 name = "deepmsg-cluster-common"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 dependencies = [
  "deepmsg-cnc",
  "deepmsg-codec-cluster-mark",
@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "deepmsg-cnc"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 dependencies = [
  "deepmsg-core",
 ]
@@ -212,7 +212,7 @@ dependencies = [
 [[package]]
 name = "deepmsg-codec"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 dependencies = [
  "deepmsg-codec-archive",
  "deepmsg-codec-archive-mark",
@@ -224,32 +224,32 @@ dependencies = [
 [[package]]
 name = "deepmsg-codec-archive"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 
 [[package]]
 name = "deepmsg-codec-archive-mark"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 
 [[package]]
 name = "deepmsg-codec-cluster"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 
 [[package]]
 name = "deepmsg-codec-cluster-mark"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 
 [[package]]
 name = "deepmsg-codec-cluster-node-state"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 
 [[package]]
 name = "deepmsg-core"
 version = "0.1.0"
-source = "git+https://github.com/deepmsg/deepmsg?rev=8c70972#8c70972463dab0210bd396446b57a3dd454a4bcf"
+source = "git+https://github.com/deepmsg/deepmsg?rev=d8eb6cf#d8eb6cff38b9878f854fa8afd22004348b451230"
 dependencies = [
  "libc",
 ]

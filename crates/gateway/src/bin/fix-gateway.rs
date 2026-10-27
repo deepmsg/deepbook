@@ -1,19 +1,26 @@
-//! `fix-gateway`: the M1 acceptor with the in-process stub engine.
+//! `fix-gateway`: the M1 acceptor with the in-process stub engine, or the M4
+//! acceptor over the deepmsg cluster client.
 //!
 //! ```text
 //! fix-gateway [--bind 127.0.0.1:9876] [--session-dir fix-sessions]
 //!             [--sender DEEPBOOK] [--target CLIENT]
 //!             [--heartbeat 30] [--journal 4096]
+//!
+//! fix-gateway --cluster --aeron-dir /dev/shm/aeron ...
 //! ```
 //!
-//! It exists so a FIX initiator (M1d's QuickFIX/J harness) has a process to
-//! connect to. M4 swaps `StubEngine` for the cluster adapter; the command line
-//! and the session directories stay.
+//! Without `--cluster` the in-process [`StubEngine`] answers (M1). With it,
+//! [`ClusterEngine`] offers each command to the cluster and turns the
+//! cluster's events back into FIX reports (M4). The command line, the session
+//! directories and the FIX session behaviour are the same in both modes.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use deepbook_gateway::{Gateway, GatewayConfig, StubEngine};
+use deepbook_gateway::{
+    ClusterEngine, ClusterEngineConfig, Engine, Gateway, GatewayConfig, SessionKey, StubEngine,
+};
 
 fn main() -> ExitCode {
     match run() {
@@ -27,17 +34,52 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let options = Options::parse()?;
-    let config = GatewayConfig::new(
+    let mut config = GatewayConfig::new(
         options.bind,
         options.session_dir.clone(),
         options.sender.clone(),
         options.target.clone(),
     );
-    let mut config = config;
     config.heart_bt_int = options.heartbeat;
     config.journal_capacity = options.journal;
 
-    let mut gateway = Gateway::bind(config, StubEngine::new())
+    if options.cluster {
+        let aeron_dir = options
+            .aeron_dir
+            .clone()
+            .ok_or_else(|| "--cluster needs --aeron-dir".to_owned())?;
+        let mut cluster_config =
+            ClusterEngineConfig::new(aeron_dir, SessionKey::new(&options.sender, &options.target));
+        cluster_config.ingress_channel = options.ingress_channel.clone();
+        cluster_config.ingress_stream_id = options.ingress_stream_id;
+        cluster_config.egress_channel = options.egress_channel.clone();
+        cluster_config.egress_stream_id = options.egress_stream_id;
+        cluster_config.message_timeout_ns = options.message_timeout_ms.saturating_mul(1_000_000);
+        cluster_config.new_leader_timeout_ns = (options.new_leader_timeout_ms > 0)
+            .then(|| options.new_leader_timeout_ms.saturating_mul(1_000_000));
+        cluster_config.symbol = options.symbol_id;
+        cluster_config.symbol_name = options.symbol.clone();
+
+        let engine = ClusterEngine::connect(cluster_config)
+            .map_err(|error| format!("cannot connect the cluster: {error}"))?;
+        println!(
+            "fix-gateway cluster session={} aeron={}",
+            engine
+                .cluster_session_id()
+                .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            options
+                .aeron_dir
+                .as_ref()
+                .map_or_else(String::new, |path| path.display().to_string())
+        );
+        serve(config, engine, &options)
+    } else {
+        serve(config, StubEngine::new(), &options)
+    }
+}
+
+fn serve<E: Engine>(config: GatewayConfig, engine: E, options: &Options) -> Result<(), String> {
+    let mut gateway = Gateway::bind(config, engine)
         .map_err(|error| format!("cannot bind {}: {error}", options.bind))?;
     let address = gateway
         .local_addr()
@@ -53,11 +95,21 @@ fn run() -> Result<(), String> {
 
 struct Options {
     bind: SocketAddr,
-    session_dir: std::path::PathBuf,
+    session_dir: PathBuf,
     sender: String,
     target: String,
     heartbeat: u32,
     journal: usize,
+    cluster: bool,
+    aeron_dir: Option<PathBuf>,
+    ingress_channel: String,
+    ingress_stream_id: i32,
+    egress_channel: String,
+    egress_stream_id: i32,
+    message_timeout_ms: i64,
+    new_leader_timeout_ms: i64,
+    symbol_id: u16,
+    symbol: String,
 }
 
 impl Options {
@@ -71,6 +123,16 @@ impl Options {
             target: "CLIENT".to_owned(),
             heartbeat: 30,
             journal: 4096,
+            cluster: false,
+            aeron_dir: None,
+            ingress_channel: "aeron:ipc".to_owned(),
+            ingress_stream_id: 101,
+            egress_channel: "aeron:ipc".to_owned(),
+            egress_stream_id: 102,
+            message_timeout_ms: 5_000,
+            new_leader_timeout_ms: 0,
+            symbol_id: 1,
+            symbol: "AAPL".to_owned(),
         };
 
         let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -104,6 +166,36 @@ impl Options {
                         .parse()
                         .map_err(|_| "--journal must be a number".to_owned())?;
                 }
+                "--cluster" => options.cluster = true,
+                "--aeron-dir" => options.aeron_dir = Some(value("--aeron-dir")?.into()),
+                "--ingress-channel" => options.ingress_channel = value("--ingress-channel")?,
+                "--ingress-stream-id" => {
+                    options.ingress_stream_id = value("--ingress-stream-id")?
+                        .parse()
+                        .map_err(|_| "--ingress-stream-id must be a number".to_owned())?;
+                }
+                "--egress-channel" => options.egress_channel = value("--egress-channel")?,
+                "--egress-stream-id" => {
+                    options.egress_stream_id = value("--egress-stream-id")?
+                        .parse()
+                        .map_err(|_| "--egress-stream-id must be a number".to_owned())?;
+                }
+                "--message-timeout-ms" => {
+                    options.message_timeout_ms = value("--message-timeout-ms")?
+                        .parse()
+                        .map_err(|_| "--message-timeout-ms must be a number".to_owned())?;
+                }
+                "--new-leader-timeout-ms" => {
+                    options.new_leader_timeout_ms = value("--new-leader-timeout-ms")?
+                        .parse()
+                        .map_err(|_| "--new-leader-timeout-ms must be a number".to_owned())?;
+                }
+                "--symbol-id" => {
+                    options.symbol_id = value("--symbol-id")?
+                        .parse()
+                        .map_err(|_| "--symbol-id must be a number".to_owned())?;
+                }
+                "--symbol" => options.symbol = value("--symbol")?,
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -119,6 +211,12 @@ fn print_usage() {
     println!(
         "usage: fix-gateway [--bind IP:PORT] [--session-dir PATH]\n\
          \x20                  [--sender COMPID] [--target COMPID]\n\
-         \x20                  [--heartbeat SECONDS] [--journal ENTRIES]"
+         \x20                  [--heartbeat SECONDS] [--journal ENTRIES]\n\
+         \x20                  [--cluster --aeron-dir PATH]\n\
+         \x20                  [--ingress-channel URI] [--ingress-stream-id N]\n\
+         \x20                  [--egress-channel URI] [--egress-stream-id N]\n\
+         \x20                  [--message-timeout-ms N]\n\
+         \x20                  [--new-leader-timeout-ms N]\n\
+         \x20                  [--symbol-id N] [--symbol S]"
     );
 }

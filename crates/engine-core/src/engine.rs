@@ -20,6 +20,7 @@ use crate::event::{
 };
 use crate::ids::{ClientOrderId, IdMap, MAX_SLOTS, Seen, SeenState};
 use crate::risk::{RiskConfig, SelfTradePrevention};
+use crate::snapshot::{EngineSnapshot, SnapshotError};
 
 /// Engine configuration.
 #[derive(Clone, Copy, Debug)]
@@ -98,6 +99,54 @@ impl Engine {
         self.last_log_pos
     }
 
+    /// The state a cluster snapshot stores.
+    #[must_use]
+    pub fn snapshot(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            symbol: self.config.symbol,
+            last_log_pos: self.last_log_pos,
+            book: self.book.snapshot(),
+            seen: self.ids.snapshot(),
+            open_orders: self
+                .open_orders
+                .iter()
+                .map(|(account, count)| (*account, *count))
+                .collect(),
+            kill_all: self.kill_all,
+            killed_accounts: self.killed_accounts.iter().copied().collect(),
+        }
+    }
+
+    /// Rebuild an engine from a snapshot and the deployment configuration.
+    ///
+    /// The configured `max_orders` must equal the snapshot's slab capacity;
+    /// the risk limits and the symbol come from `config`.
+    ///
+    /// # Errors
+    ///
+    /// A symbol/capacity mismatch or an inconsistent slab/window.
+    pub fn restore(config: EngineConfig, snapshot: &EngineSnapshot) -> Result<Self, SnapshotError> {
+        if snapshot.symbol != config.symbol {
+            return Err(SnapshotError::WrongSymbol {
+                expected: config.symbol,
+                actual: snapshot.symbol,
+            });
+        }
+        let capacity = config.max_orders.clamp(1, MAX_SLOTS);
+        let book = Book::restore(&snapshot.book, capacity, config.symbol)?;
+        let ids = IdMap::restore(&snapshot.seen, config.recent_order_window)?;
+        Ok(Self {
+            config,
+            book,
+            ids,
+            open_orders: snapshot.open_orders.iter().copied().collect(),
+            kill_all: snapshot.kill_all,
+            killed_accounts: snapshot.killed_accounts.iter().copied().collect(),
+            last_log_pos: snapshot.last_log_pos,
+            event_seq: 0,
+        })
+    }
+
     /// Apply one command.
     pub fn on_command(&mut self, command: &Command, log_pos: LogPos, sink: &mut impl EventSink) {
         self.last_log_pos = log_pos;
@@ -112,7 +161,7 @@ impl Engine {
                 }
                 None => self.kill_all = true,
             },
-            Command::Snapshot => self.snapshot(sink),
+            Command::Snapshot => self.emit_snapshot(sink),
         }
     }
 
@@ -125,7 +174,7 @@ impl Engine {
         header
     }
 
-    fn snapshot(&mut self, sink: &mut impl EventSink) {
+    fn emit_snapshot(&mut self, sink: &mut impl EventSink) {
         let header = self.header();
         let event = SnapshotEvent {
             header,
@@ -810,6 +859,7 @@ impl Engine {
             account: request.account,
             state,
             reason,
+            is_replace: false,
         }));
     }
 
@@ -830,6 +880,7 @@ impl Engine {
             account: request.account,
             state,
             reason,
+            is_replace: true,
         }));
     }
 
@@ -1049,13 +1100,17 @@ mod tests {
         value.parse().expect("client order id")
     }
 
-    fn new_engine() -> Engine {
-        Engine::new(EngineConfig {
+    fn test_config() -> EngineConfig {
+        EngineConfig {
             symbol: 1,
             max_orders: 1_024,
             recent_order_window: 1_024,
             risk: RiskConfig::disabled(),
-        })
+        }
+    }
+
+    fn new_engine() -> Engine {
+        Engine::new(test_config())
     }
 
     fn limit(
@@ -1856,5 +1911,126 @@ mod tests {
         );
         let last = last_report(&events);
         assert_eq!(Some(RejectReason::MaxOpenOrders), last.reason);
+    }
+    #[test]
+    fn a_snapshot_restores_the_book_window_and_future_events() {
+        let mut engine = new_engine();
+        let before = [
+            limit(
+                1,
+                "S1",
+                Side::Sell,
+                100,
+                10,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            limit(
+                2,
+                "B1",
+                Side::Buy,
+                99,
+                5,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            limit(
+                3,
+                "S2",
+                Side::Sell,
+                101,
+                20,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            cancel(2, "C1", "B1"),
+            replace(1, "R1", "S1", 102, 8),
+            Command::KillSwitch { account: Some(1) },
+        ];
+        let mut events = Vec::new();
+        let mut log = 0;
+        for command in &before {
+            log += 1;
+            engine.on_command(command, log, &mut events);
+        }
+
+        let snapshot = engine.snapshot();
+        let mut restored = Engine::restore(test_config(), &snapshot).expect("restore");
+        assert_eq!(engine.book_hash(), restored.book_hash());
+        assert_eq!(engine.view(), restored.view());
+        assert_eq!(snapshot, restored.snapshot());
+        assert_eq!(engine.last_log_pos(), restored.last_log_pos());
+        assert_eq!(engine.md_seq(), restored.md_seq());
+
+        let continuation = [
+            limit(
+                3,
+                "B2",
+                Side::Buy,
+                100,
+                5,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            limit(
+                4,
+                "S3",
+                Side::Sell,
+                99,
+                7,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            cancel(2, "C2", "B2"),
+            replace(3, "R2", "B2", 103, 4),
+        ];
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        log = 0;
+        for command in &continuation {
+            log += 1;
+            engine.on_command(command, log, &mut first);
+            restored.on_command(command, log, &mut second);
+        }
+        assert_eq!(first, second);
+        assert_eq!(engine.book_hash(), restored.book_hash());
+        assert_eq!(engine.view(), restored.view());
+
+        // The idempotency window came back: a reused ClOrdID is a duplicate.
+        let mut duplicate = Vec::new();
+        restored.on_command(
+            &limit(
+                1,
+                "S1",
+                Side::Sell,
+                110,
+                1,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            99,
+            &mut duplicate,
+        );
+        assert_eq!(
+            Some(RejectReason::DuplicateClOrdId),
+            last_report(&duplicate).reason
+        );
+
+        // The per-account kill switch came back too.
+        let mut killed = Vec::new();
+        restored.on_command(
+            &limit(
+                1,
+                "S9",
+                Side::Sell,
+                110,
+                1,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            100,
+            &mut killed,
+        );
+        assert_eq!(Some(RejectReason::KillSwitch), last_report(&killed).reason);
     }
 }

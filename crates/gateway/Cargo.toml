@@ -13,4 +13,14 @@ workspace = true
 [dependencies]
 deepbook-types = { path = "../types" }
 deepbook-fix = { path = "../fix" }
+deepbook-engine-core = { path = "../engine-core" }
+deepmsg-client = { workspace = true }
+deepmsg-core = { workspace = true }
+deepmsg-cluster-client = { workspace = true }
 mio = { version = "1", features = ["net", "os-poll"] }
+
+[dev-dependencies]
+# The process e2e reads the cluster's snapshot counter; both are already in
+# the client's dependency graph.
+deepmsg-cnc = { workspace = true }
+deepmsg-cluster-common = { workspace = true }

@@ -15,15 +15,18 @@
 //! M1c is [`StubEngine`]: the gateway hands an accepted command to
 //! [`CommandSink`] and routes the reports the engine publishes through
 //! [`EventSource`] back to the same session. M2 replaces the stub with
-//! `engine-core`; the seam does not change.
+//! `engine-core`; M4's [`ClusterEngine`] carries the same seam over the
+//! deepmsg cluster client.
 #![forbid(unsafe_code)]
 
 pub mod acceptor;
+pub mod cluster;
 pub mod frame;
 pub mod sink;
 pub mod stub;
 
 pub use acceptor::{Gateway, GatewayConfig};
+pub use cluster::{ClusterEngine, ClusterEngineConfig, ClusterEngineError};
 pub use frame::{FrameDecoder, FrameError};
 pub use sink::{CommandSink, Engine, EventSource, SessionEvent, SessionKey};
 pub use stub::StubEngine;

@@ -15,6 +15,8 @@ use std::fmt;
 
 use deepbook_types::{AccountId, EMPTY_ORDER_ID, OrderId, Price, Qty, Side, SymbolId};
 
+use crate::snapshot::{SeenEntry, SnapshotError};
+
 /// Bits of the slab index in an [`OrderId`].
 pub const SLOT_BITS: u32 = 24;
 /// Mask of the slab index.
@@ -93,6 +95,12 @@ impl ClientOrderId {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; Self::LENGTH] {
         &self.0
+    }
+
+    /// Rebuild from the 20 padded bytes of a snapshot or wire record.
+    #[must_use]
+    pub const fn from_padded_bytes(bytes: [u8; Self::LENGTH]) -> Self {
+        Self(bytes)
     }
 
     /// The bytes before the NUL padding.
@@ -318,6 +326,40 @@ impl IdMap {
     /// Mark one key terminal with its final snapshot.
     pub fn mark(&mut self, account: AccountId, cl_ord_id: ClientOrderId, seen: Seen) -> bool {
         self.set(account, cl_ord_id, seen)
+    }
+
+    /// The live entries, in insertion order.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<SeenEntry> {
+        self.order
+            .iter()
+            .filter_map(|(account, cl_ord_id)| {
+                self.get(*account, *cl_ord_id).map(|seen| SeenEntry {
+                    account: *account,
+                    cl_ord_id: *cl_ord_id,
+                    seen,
+                })
+            })
+            .collect()
+    }
+
+    /// Rebuild a window from snapshot entries.
+    ///
+    /// # Errors
+    ///
+    /// More entries than the configured capacity.
+    pub fn restore(entries: &[SeenEntry], capacity: usize) -> Result<Self, SnapshotError> {
+        if entries.len() > capacity {
+            return Err(SnapshotError::WindowTooSmall {
+                entries: entries.len(),
+                capacity,
+            });
+        }
+        let mut map = Self::new(capacity);
+        for entry in entries {
+            map.insert(entry.account, entry.cl_ord_id, entry.seen);
+        }
+        Ok(map)
     }
 
     fn evict_oldest(&mut self) {

@@ -27,6 +27,8 @@ pub mod engine;
 pub mod event;
 pub mod ids;
 pub mod risk;
+pub mod snapshot;
+pub mod wire;
 
 pub use book::{BookView, LevelView, OrderView};
 pub use command::{
@@ -39,3 +41,7 @@ pub use event::{
 };
 pub use ids::{ClientOrderId, IdError, Seen, SeenState};
 pub use risk::{RiskConfig, SelfTradePrevention};
+pub use snapshot::{
+    BookSnapshot, EngineSnapshot, LevelSnapshot, OrderSlotSnapshot, SeenEntry, SnapshotError,
+};
+pub use wire::{WireError, decode_command, decode_event, encode_command, encode_event};

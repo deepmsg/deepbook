@@ -93,6 +93,8 @@ pub struct CancelRejectEvent {
     pub state: OrderState,
     /// Why it was refused.
     pub reason: RejectReason,
+    /// Whether the refused command was a replace (`true`) or a cancel.
+    pub is_replace: bool,
 }
 
 /// One fill.

@@ -44,3 +44,7 @@ demo:
 # Grafana + Prometheus for the admin's /metrics (see deploy/docker-compose.monitoring.yml).
 monitoring:
     docker compose -f deploy/docker-compose.monitoring.yml up -d
+
+# Regenerate the engine snapshot SBE codec (ADR 0005). Needs a JDK.
+gen-snapshot:
+    ./scripts/gen-snapshot-sbe.sh

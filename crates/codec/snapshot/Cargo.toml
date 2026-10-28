@@ -1,0 +1,14 @@
+# `src/` is generated from `schemas/deepbook-snapshot.xml` by
+# `just gen-snapshot` (ADR 0005) and is replaced wholesale when it runs.
+# This file is hand-written and is not.
+[package]
+name = "deepbook-codec-snapshot"
+description = "Generated SBE codec for the engine snapshot record"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true

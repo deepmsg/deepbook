@@ -35,10 +35,18 @@ silently changed by a snapshot.
    `OrderId` it would have received without the restart. The ClOrdID window is
    restored, so a client retry after recovery is rejected as a duplicate rather
    than becoming a second order.
-5. **Record format.** `engine-cluster` owns the `DBS1` version-1 little-endian
-   record: magic, version, counts, fixed fields. Counts are bounded; a short,
-   foreign or inconsistent record is refused. SBE may replace the record later
-   without changing `EngineSnapshot`.
+5. **Record format.** Two formats are readable.
+   `DBS1` is the original hand-written version-1 little-endian record.
+   `DBS2` is the SBE message from `schemas/deepbook-snapshot.xml` (schema id
+   200, version 1), generated into `crates/codec/snapshot` by
+   `just gen-snapshot` with the pinned sbe-tool 1.40.2. `decode` dispatches on
+   the four-byte magic. `encode` still writes `DBS1` in Phase 1; Phase 2 flips
+   it to SBE only after every node can read `DBS2`, so a rolling upgrade never
+   asks an old node to restore a format it does not know.
+   Counts are bounded, and the SBE decoder validates the whole framing before
+   wrapping the generated decoder, which indexes the buffer without bounds
+   checks. Schema evolution is append-only: new fields at the end of a block,
+   new enum values at the end, never reordering or retyping.
 6. **Restore is tested against the uninterrupted engine.** A snapshot taken
    mid-stream, encoded and decoded, then restored, must have the same
    `book_hash`, `view`, `md_seq` and `last_log_pos`; continuing the same
@@ -54,3 +62,11 @@ silently changed by a snapshot.
   `Engine::snapshot` in `on_take_snapshot` and `Engine::restore` in `on_start`;
   the `engine-container` binary hosts it.
 - The gateway's cluster client and the single-node process e2e are M4c (ADR 0006).
+- The SBE codec is generated code: `src/` is replaced wholesale by
+  `just gen-snapshot`, its `Cargo.toml` is hand-written, and the result is
+  committed. CI regenerates it with the pinned jars and fails if the tree
+  moves. Regeneration needs a JDK, but `cargo build` never does.
+- The `ClOrdID` field is fixed at 20 bytes in schema 200 to match
+  `ClientOrderId::LENGTH`. Widening it (FIX 4.4 itself imposes no 20-byte
+  limit) is a separate change that needs a new schema version and a wire
+  format decision; `schemas/README.md` records the constraint.

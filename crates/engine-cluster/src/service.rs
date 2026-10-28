@@ -3,8 +3,9 @@
 //! It decodes the command record the gateway offered, applies it to
 //! [`Engine`] with the log position from the callback header, and offers each
 //! engine event back to the originating cluster session. `on_take_snapshot`
-//! writes the `DBS1` record in as many records as the snapshot publication's
-//! maximum payload needs; `on_start` concatenates them and restores.
+//! writes the snapshot record (`DBS1` in Phase 1, SBE `DBS2` in Phase 2; see
+//! ADR 0005) in as many records as the snapshot publication's maximum payload
+//! needs; `on_start` concatenates them and restores.
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -124,7 +125,7 @@ impl EngineService {
         })
     }
 
-    /// Restore from a `DBS1` snapshot record.
+    /// Restore from a snapshot record (`DBS1` or SBE `DBS2`).
     ///
     /// # Errors
     ///

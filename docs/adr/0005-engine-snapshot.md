@@ -1,6 +1,6 @@
 # ADR 0005: Engine snapshot state and record
 
-- Status: **Accepted** — 2026-10-25, implemented by M4a/M4b; M4c adds the gateway client (ADR 0006)
+- Status: **Accepted** — 2026-10-25, implemented by M4a/M4b; M4c adds the gateway client (ADR 0006); the SBE record is 2026-10-28
 - Date: 2026-10-25
 - Deciders: project owner
 
@@ -35,14 +35,15 @@ silently changed by a snapshot.
    `OrderId` it would have received without the restart. The ClOrdID window is
    restored, so a client retry after recovery is rejected as a duplicate rather
    than becoming a second order.
-5. **Record format.** Two formats are readable.
-   `DBS1` is the original hand-written version-1 little-endian record.
-   `DBS2` is the SBE message from `schemas/deepbook-snapshot.xml` (schema id
-   200, version 1), generated into `crates/codec/snapshot` by
-   `just gen-snapshot` with the pinned sbe-tool 1.40.2. `decode` dispatches on
-   the four-byte magic. `encode` still writes `DBS1` in Phase 1; Phase 2 flips
-   it to SBE only after every node can read `DBS2`, so a rolling upgrade never
-   asks an old node to restore a format it does not know.
+5. **Record format.** `encode` writes `DBS2`: the SBE message from
+   `schemas/deepbook-snapshot.xml` (schema id 200, version 1), generated into
+   `crates/codec/snapshot` by `just gen-snapshot` with the pinned sbe-tool
+   1.40.2. `decode` dispatches on the four-byte magic and still accepts the
+   original hand-written `DBS1` record, so a snapshot taken by an older build
+   is recoverable.
+   The rollout order still matters: every node must run a build that can read
+   `DBS2` before any node writes it, so read support and the write flip are
+   kept as separate commits and can be split at merge or deploy time.
    Counts are bounded, and the SBE decoder validates the whole framing before
    wrapping the generated decoder, which indexes the buffer without bounds
    checks. Schema evolution is append-only: new fields at the end of a block,

@@ -56,6 +56,10 @@ impl fmt::Display for CodecError {
 impl std::error::Error for CodecError {}
 
 /// Encode an engine snapshot.
+///
+/// Production only reads `DBS1` now (the writer emits SBE `DBS2`); this stays
+/// for tests and for tooling that needs to produce a legacy fixture.
+#[allow(dead_code)]
 #[must_use]
 pub fn encode(snapshot: &EngineSnapshot) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);

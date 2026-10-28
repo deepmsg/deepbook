@@ -1,10 +1,10 @@
 //! The engine snapshot record.
 //!
-//! Two formats are readable: the legacy hand-written `DBS1` record and the SBE
-//! message from schema 200. During the migration's first phase (ADR 0005)
-//! [`encode`] still writes `DBS1`: every node must be able to read the SBE
-//! record before any node writes it. [`decode`] dispatches on the four-byte
-//! magic, so a cluster can recover from either format.
+//! [`encode`] writes the SBE message from schema 200, framed as `DBS2`.
+//! [`decode`] also reads the legacy hand-written `DBS1` record, so a cluster
+//! can recover from a snapshot taken before the writer was switched. The
+//! rollout order still matters: every node must run a build that can read
+//! `DBS2` before any node writes it (ADR 0005).
 
 mod dbs1;
 mod sbe;
@@ -13,21 +13,12 @@ pub use dbs1::CodecError;
 
 use deepbook_engine_core::EngineSnapshot;
 
-/// Encode in the format the deployment writes.
-///
-/// Phase 1 writes `DBS1`; flipping this to [`encode_sbe`] is Phase 2 and must
-/// happen only after every node can read `DBS2`.
-#[must_use]
-pub fn encode(snapshot: &EngineSnapshot) -> Vec<u8> {
-    dbs1::encode(snapshot)
-}
-
 /// Encode as `DBS2` + SBE schema 200.
 ///
 /// # Errors
 ///
 /// A count or an encoded length does not fit the format.
-pub fn encode_sbe(snapshot: &EngineSnapshot) -> Result<Vec<u8>, CodecError> {
+pub fn encode(snapshot: &EngineSnapshot) -> Result<Vec<u8>, CodecError> {
     sbe::encode(snapshot)
 }
 
@@ -117,17 +108,17 @@ mod tests {
     }
 
     #[test]
-    fn the_default_encoding_is_still_dbs1() {
+    fn the_default_encoding_is_sbe() {
         let snapshot = busy_engine().snapshot();
-        assert!(encode(&snapshot).starts_with(b"DBS1"));
+        assert!(encode(&snapshot).expect("encode").starts_with(b"DBS2"));
     }
 
     #[test]
     fn both_formats_decode_to_the_same_snapshot() {
         let engine = busy_engine();
         let snapshot = engine.snapshot();
-        let dbs1 = encode(&snapshot);
-        let sbe = encode_sbe(&snapshot).expect("sbe encode");
+        let dbs1 = dbs1::encode(&snapshot);
+        let sbe = encode(&snapshot).expect("sbe encode");
 
         assert!(sbe.starts_with(b"DBS2"));
         assert_eq!(decode(&dbs1).expect("dbs1 decode"), snapshot);
@@ -138,7 +129,7 @@ mod tests {
     fn an_sbe_snapshot_restores_the_same_engine() {
         let mut engine = busy_engine();
         let snapshot = engine.snapshot();
-        let decoded = decode(&encode_sbe(&snapshot).expect("sbe encode")).expect("sbe decode");
+        let decoded = decode(&encode(&snapshot).expect("sbe encode")).expect("sbe decode");
         let mut restored = Engine::restore(config(), &decoded).expect("restore");
 
         assert_eq!(engine.book_hash(), restored.book_hash());
@@ -161,7 +152,7 @@ mod tests {
     #[test]
     fn an_sbe_record_truncated_anywhere_is_refused() {
         let snapshot = busy_engine().snapshot();
-        let bytes = encode_sbe(&snapshot).expect("sbe encode");
+        let bytes = encode(&snapshot).expect("sbe encode");
         for length in 0..bytes.len() {
             assert!(decode(&bytes[..length]).is_err(), "length {length}");
         }
@@ -170,7 +161,7 @@ mod tests {
     #[test]
     fn a_foreign_schema_id_or_version_is_refused() {
         let snapshot = Engine::new(config()).snapshot();
-        let bytes = encode_sbe(&snapshot).expect("sbe encode");
+        let bytes = encode(&snapshot).expect("sbe encode");
 
         let mut foreign_schema = bytes.clone();
         foreign_schema[8..10].copy_from_slice(&999_u16.to_le_bytes());
@@ -184,7 +175,7 @@ mod tests {
     #[test]
     fn the_sbe_frame_has_the_expected_header_and_length() {
         let snapshot = Engine::new(config()).snapshot();
-        let bytes = encode_sbe(&snapshot).expect("sbe encode");
+        let bytes = encode(&snapshot).expect("sbe encode");
 
         assert_eq!(&bytes[..4], b"DBS2");
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 32); // block length
@@ -219,7 +210,7 @@ mod tests {
         let mut snapshot = Engine::new(config()).snapshot();
         snapshot.killed_accounts = (0..70_000).collect();
 
-        let bytes = encode_sbe(&snapshot).expect("sbe encode");
+        let bytes = encode(&snapshot).expect("sbe encode");
         assert_eq!(decode(&bytes).expect("sbe decode"), snapshot);
     }
 
@@ -227,7 +218,7 @@ mod tests {
     fn notional_extremes_round_trip() {
         for notional in [i128::MIN, -1, 0, 1, i128::MAX] {
             let snapshot = synthetic_snapshot(notional);
-            let bytes = encode_sbe(&snapshot).expect("sbe encode");
+            let bytes = encode(&snapshot).expect("sbe encode");
             assert_eq!(decode(&bytes).expect("sbe decode"), snapshot, "{notional}");
         }
     }

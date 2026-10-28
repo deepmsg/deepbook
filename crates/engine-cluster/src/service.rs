@@ -3,9 +3,9 @@
 //! It decodes the command record the gateway offered, applies it to
 //! [`Engine`] with the log position from the callback header, and offers each
 //! engine event back to the originating cluster session. `on_take_snapshot`
-//! writes the snapshot record (`DBS1` in Phase 1, SBE `DBS2` in Phase 2; see
-//! ADR 0005) in as many records as the snapshot publication's maximum payload
-//! needs; `on_start` concatenates them and restores.
+//! writes the SBE snapshot record (`DBS2`) in as many records as the snapshot
+//! publication's maximum payload needs; `on_start` concatenates them and
+//! restores whichever format the record carries (`DBS1` or `DBS2`; ADR 0005).
 
 use std::fmt;
 use std::sync::{Arc, Mutex};
@@ -164,15 +164,18 @@ impl EngineService {
     }
 
     /// The snapshot record.
-    #[must_use]
-    pub fn snapshot_bytes(&self) -> Vec<u8> {
-        let body = encode(&self.engine.snapshot());
-        encode_service_snapshot(
+    ///
+    /// # Errors
+    ///
+    /// A count or an encoded length does not fit the record.
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ServiceError> {
+        let body = encode(&self.engine.snapshot()).map_err(ServiceError::Codec)?;
+        Ok(encode_service_snapshot(
             body,
             self.market_data
                 .as_ref()
                 .map(|market| market.service.last_md_seq()),
-        )
+        ))
     }
 
     /// Decode and apply one command at `log_pos`.
@@ -326,7 +329,7 @@ impl ClusteredService for EngineService {
     }
 
     fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
-        let bytes = self.snapshot_bytes();
+        let bytes = self.snapshot_bytes().map_err(container)?;
         let chunk = writer.max_payload_length().max(1);
         for part in bytes.chunks(chunk) {
             loop {
@@ -497,7 +500,7 @@ mod tests {
                 .expect("apply");
         }
 
-        let snapshot = service.snapshot_bytes();
+        let snapshot = service.snapshot_bytes().expect("snapshot");
         let mut restored = EngineService::from_snapshot(config(), &snapshot).expect("restore");
         assert_eq!(service.book_hash(), restored.book_hash());
 
@@ -529,7 +532,7 @@ mod tests {
                 .expect("apply");
         }
 
-        let body = encode(&service.engine.snapshot());
+        let body = encode(&service.engine.snapshot()).expect("snapshot");
         let wrapped = encode_service_snapshot(body, Some(42));
         let (decoded, market_seq) = decode_service_snapshot(&wrapped).expect("decode");
         assert_eq!(Some(42), market_seq);
@@ -537,7 +540,7 @@ mod tests {
         assert_eq!(service.book_hash(), restored.book_hash());
 
         // A record written before market data was enabled has no prefix.
-        let bare = service.snapshot_bytes();
+        let bare = service.snapshot_bytes().expect("bare snapshot");
         let (_, no_market_seq) = decode_service_snapshot(&bare).expect("bare");
         assert_eq!(None, no_market_seq);
     }

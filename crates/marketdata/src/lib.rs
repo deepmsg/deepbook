@@ -20,7 +20,10 @@ pub mod service;
 pub mod subscriber;
 pub mod wire;
 
-pub use deepmsg::{DeepmsgConfig, DeepmsgError, DeepmsgPublisher, DeepmsgSubscriber};
+pub use deepmsg::{
+    DeepmsgConfig, DeepmsgError, DeepmsgIncrementalPublisher, DeepmsgPublisher,
+    DeepmsgRecoveryResponder, DeepmsgSubscriber,
+};
 pub use message::{BookAction, Incremental, Level, RecoveryRequest, RecoveryResponse, Snapshot};
 pub use mirror::MirrorBook;
 pub use service::{MarketDataError, MarketDataService, ServiceConfig};

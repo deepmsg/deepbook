@@ -190,6 +190,53 @@ impl DeepmsgPublisher {
         )
     }
 
+    /// One non-blocking offer of an incremental.
+    ///
+    /// `Ok(false)` means the publication had no room, no subscriber or was
+    /// mid-rotation. The engine hot path uses this: a slow or absent UI must
+    /// not stall the matching engine for an offer timeout.
+    ///
+    /// # Errors
+    ///
+    /// The publication is gone or the record cannot be encoded.
+    pub fn try_publish_incremental(
+        &mut self,
+        incremental: Incremental,
+    ) -> Result<bool, DeepmsgError> {
+        let bytes = encode(&WireMessage::Incremental(incremental));
+        self.try_publish_frame(&bytes)
+    }
+
+    /// One non-blocking snapshot offer; `Ok(false)` is the same as
+    /// [`Self::try_publish_incremental`].
+    ///
+    /// # Errors
+    ///
+    /// The publication is gone or the record cannot be encoded.
+    pub fn try_publish_snapshot(&mut self, snapshot: &Snapshot) -> Result<bool, DeepmsgError> {
+        let bytes = encode(&WireMessage::Snapshot(snapshot.clone()));
+        self.try_publish_frame(&bytes)
+    }
+
+    /// One non-blocking offer of raw frame bytes.
+    ///
+    /// # Errors
+    ///
+    /// The publication is gone, or the offer answered a terminal error.
+    pub fn try_publish_frame(&mut self, frame: &[u8]) -> Result<bool, DeepmsgError> {
+        match self.client.offer(self.incremental_publication, frame) {
+            Some(Appended::Ok { .. }) => Ok(true),
+            Some(
+                Appended::EndOfLog
+                | Appended::MidRotation
+                | Appended::BackPressured
+                | Appended::NotConnected,
+            ) => Ok(false),
+            Some(other) => Err(DeepmsgError::Offer(format!("{other:?}"))),
+            None => Err(DeepmsgError::Offer("no such publication".to_owned())),
+        }
+    }
+
     /// Answer every pending recovery request.
     ///
     /// # Errors
@@ -227,6 +274,167 @@ impl DeepmsgPublisher {
     #[must_use]
     pub const fn requests_served(&self) -> usize {
         self.requests_served
+    }
+}
+
+/// The publishing side without the recovery endpoints.
+///
+/// The engine's hot path uses this: it publishes incrementals and snapshots
+/// and never touches the recovery channel. A separate
+/// [`DeepmsgRecoveryResponder`] thread owns that channel, so a recovery
+/// request is answered even when the cluster is idle.
+pub struct DeepmsgIncrementalPublisher {
+    client: Client,
+    publication: i64,
+}
+
+impl DeepmsgIncrementalPublisher {
+    /// Connect to the driver and add the incremental publication.
+    ///
+    /// # Errors
+    ///
+    /// The client or the publication failed.
+    pub fn connect(config: &DeepmsgConfig) -> Result<Self, DeepmsgError> {
+        let mut client = Client::connect(&config.aeron_dir)
+            .map_err(|error| DeepmsgError::Connect(error.to_string()))?;
+        let publication = client
+            .add_publication(
+                &config.incremental_channel,
+                config.incremental_stream_id,
+                config.offer_timeout,
+            )
+            .map_err(|error| DeepmsgError::Command(error.to_string()))?;
+        Ok(Self {
+            client,
+            publication,
+        })
+    }
+
+    /// One non-blocking offer of an incremental.
+    ///
+    /// # Errors
+    ///
+    /// The publication is gone or the offer answered a terminal error.
+    pub fn try_publish_incremental(
+        &mut self,
+        incremental: Incremental,
+    ) -> Result<bool, DeepmsgError> {
+        let bytes = encode(&WireMessage::Incremental(incremental));
+        self.try_publish_frame(&bytes)
+    }
+
+    /// One non-blocking snapshot offer.
+    ///
+    /// # Errors
+    ///
+    /// The publication is gone or the offer answered a terminal error.
+    pub fn try_publish_snapshot(&mut self, snapshot: &Snapshot) -> Result<bool, DeepmsgError> {
+        let bytes = encode(&WireMessage::Snapshot(snapshot.clone()));
+        self.try_publish_frame(&bytes)
+    }
+
+    /// One non-blocking offer of raw frame bytes.
+    ///
+    /// # Errors
+    ///
+    /// The publication is gone or the offer answered a terminal error.
+    pub fn try_publish_frame(&mut self, frame: &[u8]) -> Result<bool, DeepmsgError> {
+        match self.client.offer(self.publication, frame) {
+            Some(Appended::Ok { .. }) => Ok(true),
+            Some(
+                Appended::EndOfLog
+                | Appended::MidRotation
+                | Appended::BackPressured
+                | Appended::NotConnected,
+            ) => Ok(false),
+            Some(other) => Err(DeepmsgError::Offer(format!("{other:?}"))),
+            None => Err(DeepmsgError::Offer("no such publication".to_owned())),
+        }
+    }
+}
+
+/// The recovery side, on its own driver client.
+///
+/// A background thread owns this and answers every request with the latest
+/// snapshot it was given. It is the only subscriber to the recovery request
+/// stream, so requests are not split between it and the publisher.
+pub struct DeepmsgRecoveryResponder {
+    client: Client,
+    request_subscription: i64,
+    response_publication: i64,
+    offer_timeout: Duration,
+    fragment_limit: usize,
+    answered: usize,
+}
+
+impl DeepmsgRecoveryResponder {
+    /// Connect to the driver and add the request subscription and response
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// The client or a command failed.
+    pub fn connect(config: &DeepmsgConfig) -> Result<Self, DeepmsgError> {
+        let mut client = Client::connect(&config.aeron_dir)
+            .map_err(|error| DeepmsgError::Connect(error.to_string()))?;
+        let request_subscription = client
+            .add_subscription(
+                &config.recovery_request_subscription_channel,
+                config.recovery_stream_id,
+                config.offer_timeout,
+            )
+            .map_err(|error| DeepmsgError::Command(error.to_string()))?;
+        let response_publication = client
+            .add_publication(
+                &config.recovery_response_channel,
+                config.recovery_stream_id,
+                config.offer_timeout,
+            )
+            .map_err(|error| DeepmsgError::Command(error.to_string()))?;
+        Ok(Self {
+            client,
+            request_subscription,
+            response_publication,
+            offer_timeout: config.offer_timeout,
+            fragment_limit: config.fragment_limit,
+            answered: 0,
+        })
+    }
+
+    /// Answer every pending request with `snapshot`.
+    ///
+    /// # Errors
+    ///
+    /// A response offer did not complete.
+    pub fn poll_snapshot(&mut self, snapshot: &Snapshot) -> Result<usize, DeepmsgError> {
+        let _ = self.client.poll();
+        let mut requests = 0;
+        self.client
+            .poll_subscription(self.request_subscription, self.fragment_limit, |message| {
+                if matches!(decode(message.payload), Ok(WireMessage::RecoveryRequest(_))) {
+                    requests += 1;
+                }
+            });
+        for _ in 0..requests {
+            let bytes = encode(&WireMessage::RecoveryResponse(RecoveryResponse::Snapshot(
+                snapshot.clone(),
+            )));
+            offer(
+                &mut self.client,
+                self.response_publication,
+                &bytes,
+                self.offer_timeout,
+            )?;
+        }
+        self.answered += requests;
+        let _ = self.client.poll();
+        Ok(requests)
+    }
+
+    /// How many requests this responder has answered.
+    #[must_use]
+    pub const fn answered(&self) -> usize {
+        self.answered
     }
 }
 
@@ -295,6 +503,24 @@ impl DeepmsgSubscriber {
     ///
     /// A recovery request could not be offered.
     pub fn poll(&mut self, subscriber: &mut Subscriber) -> Result<usize, DeepmsgError> {
+        self.poll_with(subscriber, |_| {})
+    }
+
+    /// [`Self::poll`] with an observer for every incremental and snapshot the
+    /// transport delivered. The admin uses it to build the trade tape without
+    /// a second subscription.
+    ///
+    /// # Errors
+    ///
+    /// A recovery request could not be offered.
+    pub fn poll_with<F>(
+        &mut self,
+        subscriber: &mut Subscriber,
+        mut observe: F,
+    ) -> Result<usize, DeepmsgError>
+    where
+        F: FnMut(&WireMessage),
+    {
         let _ = self.client.poll();
         let mut work = 0;
 
@@ -309,6 +535,7 @@ impl DeepmsgSubscriber {
             },
         );
         for message in messages {
+            observe(&message);
             match message {
                 WireMessage::Incremental(incremental) => {
                     self.received += 1;

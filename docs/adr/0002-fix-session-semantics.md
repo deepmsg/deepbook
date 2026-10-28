@@ -60,8 +60,8 @@ interoperability oracle (M1d).
 - The 4096-entry window is a hard limit: a peer that falls further behind is
   logged out, not served from disk.
 - One `fdatasync` per journal append and one atomic state write per message are
-  the M1 correctness policy. Batching them is an M5 measurement; the session
-  API does not change when that happens.
+  the M1 correctness policy and remain the default. M5 adds opt-in batching
+  (`SyncPolicy`, ADR 0007); the session API does not change.
 - A `CommandSink` failure is not a FIX session failure: M1c decides whether a
   refused command becomes a `Reject` or an `ExecutionReport` with
   `OrdStatus=Rejected`.

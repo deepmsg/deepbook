@@ -14,6 +14,7 @@ workspace = true
 deepbook-types = { path = "../types" }
 deepbook-fix = { path = "../fix" }
 deepbook-engine-core = { path = "../engine-core" }
+deepbook-io = { path = "../io" }
 deepmsg-client = { workspace = true }
 deepmsg-core = { workspace = true }
 deepmsg-cluster-client = { workspace = true }

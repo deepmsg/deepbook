@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # The admin listens on the host. With Docker Desktop / a Linux host-gateway,
+  # host.docker.internal names it from inside the compose network. Start the
+  # dashboard with `deploy/bench.sh --admin --serve --admin-host 0.0.0.0`.
+  - job_name: deepbook
+    static_configs:
+      - targets: ["host.docker.internal:26060"]

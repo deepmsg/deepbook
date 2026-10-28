@@ -21,12 +21,12 @@
 
 pub mod acceptor;
 pub mod cluster;
-pub mod frame;
 pub mod sink;
 pub mod stub;
 
 pub use acceptor::{Gateway, GatewayConfig};
 pub use cluster::{ClusterEngine, ClusterEngineConfig, ClusterEngineError};
-pub use frame::{FrameDecoder, FrameError};
+pub use deepbook_fix::frame;
+pub use deepbook_fix::frame::{FrameDecoder, FrameError};
 pub use sink::{CommandSink, Engine, EventSource, SessionEvent, SessionKey};
 pub use stub::StubEngine;

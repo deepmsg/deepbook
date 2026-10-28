@@ -1,0 +1,12 @@
+apiVersion: 1
+
+providers:
+  - name: deepbook
+    orgId: 1
+    folder: deepbook
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 5
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards

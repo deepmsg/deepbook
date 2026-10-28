@@ -10,12 +10,16 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0–M3 merged; M4 complete on this branch.** The FIX session,
-> epoll acceptor, engine seam, matching engine and market-data channels are in
-> place. M4 adds engine snapshot/restore, the `ClusteredService` adapter and
-> `engine-container`, the gateway's `ClusterEngine`, `fix-gateway --cluster`,
-> and a process e2e that kills the engine's host and continues the book from
-> the recovered state (ADR 0005, ADR 0006).
+> Status: **M0–M3 merged; M4 complete; M5 in progress on this branch.** The FIX
+> session, epoll acceptor, engine seam, matching engine and market-data
+> channels are in place. M4 adds engine snapshot/restore, the
+> `ClusteredService` adapter and `engine-container`, the gateway's
+> `ClusterEngine`, `fix-gateway --cluster`, and a process e2e that kills the
+> engine's host and continues the book from the recovered state (ADR 0005,
+> ADR 0006). M5 is complete on this branch: the open-loop `fix-bench` client,
+> opt-in journal batching and the epoll/io_uring comparison (ADR 0007,
+> ADR 0009), plus the market-data → admin → WebSocket/Grafana path
+> (ADR 0008).
 
 ## What deepmsg provides, and what deepbook brings
 
@@ -147,6 +151,95 @@ cargo test -p deepbook-gateway --test cluster_e2e -- --ignored --nocapture
 (`just engine-e2e`). It is opt-in (`#[ignore]`) because it starts a media
 driver, a consensus module, a service container and the gateway, and it skips
 rather than fails when the deepmsg binaries are not built.
+
+## Benchmark (M5)
+
+`fix-bench` is an open-loop FIX client. It queues IOC buys at absolute send
+deadlines, takes `t0` when the order is queued and `t1` when the first report
+for its `ClOrdID` is decoded, and prints nearest-rank percentiles:
+
+```bash
+cargo run --release -p deepbook-bench --bin fix-bench -- \
+  --connect 127.0.0.1:9876 --rate 10000 --samples 100000 --warmup 5000
+# or one JSON object for a script:
+cargo run --release -p deepbook-bench --bin fix-bench -- --json ...
+```
+
+The one-click stack (driver + module + `engine-container` + `fix-gateway
+--cluster`) prints the machine fingerprint and the result table:
+
+```bash
+deploy/bench.sh --rate 10000 --samples 20000 --warmup 2000
+deploy/bench.sh --journal-sync each ...   # the M1 durability policy
+deploy/bench.sh --tick-us 50 ...          # poll ceiling; 100 ms default
+```
+
+`--journal-sync batch --journal-batch 64` (the script's default) batches the
+session journal and sequence-file syncs; a crash then loses at most 63
+outbound messages (ADR 0007). The default deployment keeps M1's
+`fdatasync`-per-message policy.
+
+The gateway runs on `epoll` by default and on `io_uring` with `--backend
+uring` (ADR 0009). The backend comparison is one command:
+
+```bash
+deploy/bench.sh --compare --rate 5000 --samples 20000 --warmup 2000
+```
+
+It runs `epoll, uring, uring, epoll` (ABBA), a separate gateway process and
+account per arm, and prints:
+
+| backend | p50 | p90 | p99 | p99.9 | completed |
+|---|---|---|---|---|---|
+| epoll | 390 µs | 478 µs | 662 µs | 1.96 ms | 20 000 / 20 000 |
+| io_uring | 173 µs | 257 µs | 383 µs | 1.85 ms | 20 000 / 20 000 |
+
+Both arms sustained 5 000 orders/s on WSL2 at a 5 k/s offered rate; the uring
+p50 is about 56% lower. The run takes about a minute because each arm waits
+out the consensus module's session timeout before the next. These are test
+numbers, not the bare-metal acceptance run.
+
+Measured on the WSL2 development machine (i7-10875H, 16 vCPU) with a 10k/s
+offered rate, 20k samples, `--tick-us 100`:
+
+| journal policy | achieved | p50 | p99 | p99.9 |
+|---|---|---|---|---|
+| `each` (M1) | 5.5k orders/s | 1.07 ms | 1.76 ms | 1.77 ms |
+| `batch 64` | 9.8k orders/s | 0.54 ms | 1.04 ms | 8.04 ms |
+
+These are a smoke check on WSL2, **not** the design's acceptance numbers;
+`deploy/bench.sh` on the bare-metal bench machine is the reproducible
+measurement. The 50k/s offered run saturates below that rate and is reported
+as a backlog, not as a throughput.
+
+### Dashboard and Grafana
+
+The engine publishes its `BookUpdate`/`Trade` stream on the same deepmsg
+driver. `deepbook-admin` subscribes, mirrors the book and trade tape, and
+serves a build-free dashboard plus Prometheus metrics:
+
+```bash
+deploy/bench.sh --admin --serve --rate 2000 --samples 5000
+# dashboard: http://127.0.0.1:26060
+# metrics:   http://127.0.0.1:26060/metrics
+```
+
+The page shows order-book depth, recent trades and the last benchmark's
+p50/p90/p99; `/ws` pushes the conflated view at 10 Hz. The recovery channel is
+served by a dedicated thread in `engine-container`, so a dashboard that
+connects while the cluster is idle still gets a snapshot.
+
+Grafana and Prometheus are provisioned from `deploy/`:
+
+```bash
+deploy/bench.sh --admin --serve --admin-host 0.0.0.0
+docker compose -f deploy/docker-compose.monitoring.yml up -d
+# Grafana http://127.0.0.1:3000, Prometheus http://127.0.0.1:9090
+```
+
+The dashboard panels cover benchmark RTT/throughput, market-data rate, book
+levels and quantity, trades, and the cluster's commit position, snapshot count
+and role. ADR 0008 records the market-data wiring and the admin design.
 
 ## FIX conformance
 

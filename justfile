@@ -27,3 +27,20 @@ marketdata-loss:
 engine-e2e:
     cargo build -p deepbook-engine-cluster --bin engine-container
     cargo test -p deepbook-gateway --test cluster_e2e -- --ignored --nocapture
+
+# M5: one member + engine-container + fix-gateway, measured by fix-bench.
+# `just bench --rate 20000 --samples 50000` forwards the script's options.
+bench *args:
+    ./deploy/bench.sh {{args}}
+
+# M5 backend comparison: epoll, uring, uring, epoll (ABBA).
+compare:
+    ./deploy/bench.sh --compare --rate 5000 --samples 20000 --warmup 2000
+
+# M5 dashboard: stack + admin + WebSocket UI, then keep serving.
+demo:
+    ./deploy/bench.sh --admin --serve --rate 2000 --samples 5000 --warmup 500
+
+# Grafana + Prometheus for the admin's /metrics (see deploy/docker-compose.monitoring.yml).
+monitoring:
+    docker compose -f deploy/docker-compose.monitoring.yml up -d

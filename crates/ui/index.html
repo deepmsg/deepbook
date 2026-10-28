@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>deepbook · AAPL</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <div class="brand">deepbook<span class="sep">/</span><span class="symbol">AAPL</span></div>
+    <div class="pills">
+      <span id="md_seq" class="pill">md_seq —</span>
+      <span id="sync" class="pill bad">syncing</span>
+      <span id="best" class="pill">— / —</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel depth">
+      <h2>Order book <span class="muted">ticks × 100</span></h2>
+      <div class="ladder">
+        <div id="asks" class="side asks"></div>
+        <div class="spread"><span id="spread">—</span><span class="muted">spread</span></div>
+        <div id="bids" class="side bids"></div>
+      </div>
+    </section>
+
+    <section class="panel tape">
+      <h2>Recent trades <span id="trades_total" class="muted"></span></h2>
+      <div class="tape-head"><span>seq</span><span>price</span><span>qty</span><span>aggressor</span></div>
+      <ol id="trades" class="trades"></ol>
+    </section>
+
+    <section class="panel latency">
+      <h2>Benchmark RTT <span class="muted">client-side, first report</span></h2>
+      <div class="cards">
+        <div class="card"><label>p50</label><strong id="p50">—</strong></div>
+        <div class="card"><label>p90</label><strong id="p90">—</strong></div>
+        <div class="card"><label>p99</label><strong id="p99">—</strong></div>
+        <div class="card"><label>rate</label><strong id="rate">—</strong></div>
+        <div class="card"><label>orders</label><strong id="completed">—</strong></div>
+      </div>
+      <canvas id="chart" width="720" height="150"></canvas>
+      <p class="muted" id="latency-note">run deploy/bench.sh to fill this panel</p>
+    </section>
+  </main>
+
+  <footer>
+    <span id="connection" class="dot bad"></span>
+    <span id="connection-text">connecting</span>
+    <span class="muted">· market data over deepmsg IPC · view conflated at 10 Hz</span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

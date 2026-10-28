@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The engine snapshot record (ADR 0005). One message, written by
+  `engine-cluster`'s `on_take_snapshot` and read by `on_start`.
+
+  Layout rules:
+  - all fixed fields live in the message block; groups and var-data follow;
+  - `numInGroup` is uint32 because `max_orders` and the seen window may exceed
+    65535 (the default groupSizeEncoding is uint16);
+  - `notional` is split into hi/lo because SBE has no 128-bit integer;
+  - optional values carry an explicit presence byte rather than relying on
+    generator-specific `presence` semantics.
+-->
+<sbe:messageSchema xmlns:sbe="http://fixprotocol.io/2016/sbe"
+    package="deepbook.snapshot"
+    id="200"
+    version="1"
+    semanticVersion="1.0.0"
+    byteOrder="littleEndian">
+
+  <types>
+    <composite name="messageHeader" description="Message frame header">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="templateId" primitiveType="uint16"/>
+      <type name="schemaId" primitiveType="uint16"/>
+      <type name="version" primitiveType="uint16"/>
+    </composite>
+
+    <composite name="groupSizeEncoding" description="Repeating group dimensions">
+      <type name="blockLength" primitiveType="uint16"/>
+      <type name="numInGroup" primitiveType="uint32" maxValue="2147483647"/>
+    </composite>
+
+    <composite name="varDataEncoding" description="Variable-length data">
+      <type name="length" primitiveType="uint32" maxValue="2147483647"/>
+      <type name="varData" primitiveType="uint8" length="0" characterEncoding="null"/>
+    </composite>
+
+    <type name="clientOrderId" primitiveType="uint8" length="20" characterEncoding="null"/>
+
+    <enum name="Side" encodingType="uint8">
+      <validValue name="Buy">0</validValue>
+      <validValue name="Sell">1</validValue>
+    </enum>
+
+    <enum name="OrderState" encodingType="uint8">
+      <validValue name="New">0</validValue>
+      <validValue name="Partial">1</validValue>
+      <validValue name="Filled">2</validValue>
+      <validValue name="Canceled">3</validValue>
+      <validValue name="Rejected">4</validValue>
+    </enum>
+
+    <enum name="SeenState" encodingType="uint8">
+      <validValue name="Active">0</validValue>
+      <validValue name="Filled">1</validValue>
+      <validValue name="Canceled">2</validValue>
+      <validValue name="Rejected">3</validValue>
+    </enum>
+  </types>
+
+  <sbe:message name="EngineSnapshot" id="1" description="Deterministic engine state at a command boundary">
+    <field name="symbol" id="1" type="uint16"/>
+    <field name="lastLogPos" id="2" type="int64"/>
+    <field name="killAll" id="3" type="uint8"/>
+    <field name="freeHead" id="4" type="uint32"/>
+    <field name="mdSeq" id="5" type="uint64"/>
+    <field name="hasLastTrade" id="6" type="uint8"/>
+    <field name="lastTrade" id="7" type="int64"/>
+
+    <group name="killedAccounts" id="100" dimensionType="groupSizeEncoding">
+      <field name="account" id="101" type="uint32"/>
+    </group>
+
+    <group name="openOrders" id="110" dimensionType="groupSizeEncoding">
+      <field name="account" id="111" type="uint32"/>
+      <field name="openCount" id="112" type="uint32"/>
+    </group>
+
+    <group name="seen" id="120" dimensionType="groupSizeEncoding">
+      <field name="account" id="121" type="uint32"/>
+      <field name="clOrdId" id="122" type="clientOrderId"/>
+      <field name="orderId" id="123" type="uint32"/>
+      <field name="state" id="124" type="SeenState"/>
+      <field name="hasPrice" id="125" type="uint8"/>
+      <field name="price" id="126" type="int64"/>
+      <field name="qty" id="127" type="int64"/>
+      <field name="filled" id="128" type="int64"/>
+      <field name="notionalHi" id="129" type="int64"/>
+      <field name="notionalLo" id="130" type="uint64"/>
+      <field name="side" id="131" type="Side"/>
+      <field name="symbol" id="132" type="uint16"/>
+    </group>
+
+    <group name="free" id="150" dimensionType="groupSizeEncoding">
+      <field name="slot" id="151" type="uint32"/>
+    </group>
+
+    <group name="slots" id="160" dimensionType="groupSizeEncoding">
+      <field name="slot" id="161" type="uint32"/>
+      <field name="orderId" id="162" type="uint32"/>
+      <field name="price" id="163" type="int64"/>
+      <field name="qty" id="164" type="int64"/>
+      <field name="filled" id="165" type="int64"/>
+      <field name="notionalHi" id="166" type="int64"/>
+      <field name="notionalLo" id="167" type="uint64"/>
+      <field name="account" id="168" type="uint32"/>
+      <field name="prev" id="169" type="uint32"/>
+      <field name="next" id="170" type="uint32"/>
+      <field name="side" id="171" type="Side"/>
+      <field name="state" id="172" type="OrderState"/>
+      <field name="isMarket" id="173" type="uint8"/>
+      <field name="clOrdId" id="174" type="clientOrderId"/>
+    </group>
+
+    <group name="bids" id="180" dimensionType="groupSizeEncoding">
+      <field name="price" id="181" type="int64"/>
+      <field name="totalQty" id="182" type="int64"/>
+      <field name="head" id="183" type="uint32"/>
+      <field name="tail" id="184" type="uint32"/>
+    </group>
+
+    <group name="asks" id="190" dimensionType="groupSizeEncoding">
+      <field name="price" id="191" type="int64"/>
+      <field name="totalQty" id="192" type="int64"/>
+      <field name="head" id="193" type="uint32"/>
+      <field name="tail" id="194" type="uint32"/>
+    </group>
+
+    <data name="generations" id="140" type="varDataEncoding"/>
+  </sbe:message>
+</sbe:messageSchema>

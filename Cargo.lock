@@ -121,9 +121,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "deepbook-codec-snapshot"
+version = "0.1.0"
+
+[[package]]
 name = "deepbook-engine-cluster"
 version = "0.1.0"
 dependencies = [
+ "deepbook-codec-snapshot",
  "deepbook-engine-core",
  "deepbook-marketdata",
  "deepbook-types",

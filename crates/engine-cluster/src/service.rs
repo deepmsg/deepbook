@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use deepbook_engine_core::wire::{decode_command, encode_event};
 use deepbook_engine_core::{Engine, EngineConfig, EngineSnapshot, Event};
 use deepbook_marketdata::{
-    DeepmsgConfig, DeepmsgIncrementalPublisher, MarketDataService,
+    DeepmsgConfig, DeepmsgIncrementalPublisher, Level, MarketDataService,
     ServiceConfig as MarketServiceConfig, Snapshot,
 };
 use deepbook_types::{LogPos, Seq};
@@ -83,6 +83,14 @@ pub struct EngineService {
     config: EngineConfig,
     engine: Engine,
     market_data: Option<MarketDataState>,
+    /// The log position of the snapshot this service was restored from.
+    ///
+    /// The cluster replays the commands after that position into the service.
+    /// Events at or below it are already reflected in the mirror seeded from
+    /// the restored engine, so republishing them would duplicate data the
+    /// subscriber already has. Live events are always after it. `-1` means
+    /// "no snapshot, publish everything".
+    restored_log_pos: LogPos,
 }
 
 impl EngineService {
@@ -93,6 +101,7 @@ impl EngineService {
             config,
             engine: Engine::new(config),
             market_data: None,
+            restored_log_pos: -1,
         }
     }
 
@@ -122,6 +131,7 @@ impl EngineService {
                 recent_capacity: market.recent_capacity,
                 incrementals: 0,
             }),
+            restored_log_pos: -1,
         })
     }
 
@@ -137,6 +147,7 @@ impl EngineService {
             config,
             engine,
             market_data: None,
+            restored_log_pos: snapshot.last_log_pos,
         })
     }
 
@@ -208,6 +219,13 @@ impl EngineService {
             ..
         } = market;
         for event in events {
+            // Commands replayed after the snapshot were already reflected in
+            // the engine state that seeded the mirror; publishing them again
+            // would duplicate trades on the tape and advance `md_seq` for
+            // data the subscriber already has.
+            if event.header().log_pos <= self.restored_log_pos {
+                continue;
+            }
             let seq = service.last_md_seq() + 1;
             let incremental = match event {
                 Event::BookUpdate(update) => {
@@ -251,6 +269,9 @@ impl ClusteredService for EngineService {
             let bytes = read_snapshot(cluster, reader)?;
             let (decoded, market_seq) = decode_service_snapshot(&bytes).map_err(container)?;
             self.engine = Engine::restore(self.config, &decoded).map_err(container)?;
+            self.restored_log_pos = decoded.last_log_pos;
+            let restored_book =
+                market_snapshot_from_engine(&self.engine, market_seq.unwrap_or_default());
             if let Some(market) = self.market_data.as_mut() {
                 if let Some(seq) = market_seq {
                     market.service = MarketDataService::with_sequence(
@@ -260,6 +281,11 @@ impl ClusteredService for EngineService {
                         },
                         seq,
                     );
+                }
+                // The engine snapshot carries the book but not the market-data
+                // mirror; seed the mirror before the first snapshot is served.
+                if let Err(error) = market.service.install_snapshot(&restored_book) {
+                    eprintln!("engine: market data restore: {error}");
                 }
                 let snapshot = market.service.snapshot();
                 if let Ok(mut cell) = market.snapshot.lock() {
@@ -360,6 +386,31 @@ impl ClusteredService for EngineService {
     }
 }
 
+/// Build the market-data snapshot for a restored engine.
+///
+/// The engine's `BookView` is the same state market data mirrors from
+/// `BookUpdate` events, so it is the right base for a mirror that lost its
+/// levels in a restart. `md_seq` is the market-data stream's sequence, not the
+/// engine's; the caller passes the sequence the stream resumes at.
+fn market_snapshot_from_engine(engine: &Engine, md_seq: Seq) -> Snapshot {
+    let view = engine.view();
+    let levels = |levels: Vec<deepbook_engine_core::LevelView>| {
+        levels
+            .into_iter()
+            .map(|level| Level {
+                price: level.price,
+                qty: level.qty,
+            })
+            .collect()
+    };
+    Snapshot {
+        md_seq,
+        symbol: view.symbol,
+        bids: levels(view.bids),
+        asks: levels(view.asks),
+    }
+}
+
 /// Prepend the market-data sequence to an encoded engine snapshot.
 ///
 /// The M4 record is unchanged after the 13-byte prefix, and a record without
@@ -434,7 +485,6 @@ fn offer_to_session(
     }
     Ok(())
 }
-
 fn container(error: impl fmt::Display) -> ContainerError {
     ContainerError::Cluster(error.to_string())
 }
@@ -517,6 +567,38 @@ mod tests {
             assert_eq!(first, second);
         }
         assert_eq!(service.book_hash(), restored.book_hash());
+    }
+
+    #[test]
+    fn the_market_snapshot_comes_from_the_restored_book() {
+        let mut service = EngineService::new(config());
+        service
+            .apply(&encode_command(&limit(1, "S1", Side::Sell, 100, 10)), 1)
+            .expect("sell");
+        service
+            .apply(&encode_command(&limit(2, "B1", Side::Buy, 99, 4)), 2)
+            .expect("buy");
+
+        let restored = market_snapshot_from_engine(service.engine(), 7);
+        assert_eq!(7, restored.md_seq);
+        assert_eq!(1, restored.symbol);
+        assert_eq!(vec![Level { price: 99, qty: 4 }], restored.bids);
+        assert_eq!(
+            vec![Level {
+                price: 100,
+                qty: 10
+            }],
+            restored.asks
+        );
+
+        let mut market = MarketDataService::new(MarketServiceConfig {
+            symbol: 1,
+            recent_capacity: 8,
+        });
+        market.install_snapshot(&restored).expect("install");
+        assert_eq!(0, market.last_md_seq());
+        assert_eq!(restored.bids, market.snapshot().bids);
+        assert_eq!(restored.asks, market.snapshot().asks);
     }
 
     #[test]

@@ -204,8 +204,9 @@ filled; the leader's three processes are `SIGKILL`ed. The same FIX session
 then fills the next buy against the replicated resting order, and the run
 checks that the connection was never reopened, that each `ClOrdID` produced one
 trade, and that the resting order ends `Filled`. It prints the election and
-recovery times — about 4.2 s and a few milliseconds with the test topology's
-2 s heartbeat; the product default is 10 s. Market data is off in this
+recovery times — about 4.2–4.5 s to elect and tens of milliseconds to the
+first fill, with the test topology's 2 s heartbeat; the product default is
+10 s. Market data is off in this
 topology: every member applies the log, so every member would publish its own
 stream (ADR 0006).
 

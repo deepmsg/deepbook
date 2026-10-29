@@ -72,7 +72,7 @@ crates/
   engine-core/     pure state machine: order book, matching, risk
   engine-cluster/  ClusteredService adapter; snapshot serialization
   marketdata/      incremental/snapshot/recovery
-  admin/           HTTP/WS, kill switch, queries
+  admin/           HTTP/WS, kill switch, metrics and the UI host
   bench/           open-loop client, latency harness
   spike/           cluster checks: process control, latency, recovery
   ui/              static dashboard (not a workspace member)
@@ -227,6 +227,24 @@ The page shows order-book depth, recent trades and the last benchmark's
 p50/p90/p99; `/ws` pushes the conflated view at 10 Hz. The recovery channel is
 served by a dedicated thread in `engine-container`, so a dashboard that
 connects while the cluster is idle still gets a snapshot.
+
+The kill switch is a real write path: `POST /api/kill` offers
+`Command::KillSwitch` to the cluster log on the admin's own cluster session,
+and `GET /api/control` reports what was submitted. The body is `{}` (or empty)
+for the whole market and `{"account": N}` for one account:
+
+```bash
+curl -s -X POST localhost:26060/api/kill -d '{"account": 7}'
+# {"status":"queued","account":7}
+curl -s localhost:26060/api/control
+# {"connected":true,"pending":0,"kill_all":false,"killed_accounts":[7],...}
+```
+
+A kill has no engine acknowledgement, and no un-kill: the kill state is in the
+cluster snapshot, so resuming means restarting the cluster with a fresh log.
+Only a loopback client may kill unless `--control-token TOKEN` is set, in
+which case `Authorization: Bearer TOKEN` is required (the dashboard itself has
+no login). ADR 0008 records the design and its limits.
 
 Grafana and Prometheus are provisioned from `deploy/`:
 

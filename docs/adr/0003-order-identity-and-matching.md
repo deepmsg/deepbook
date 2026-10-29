@@ -28,7 +28,10 @@ could cancel a different order. M2 also has to settle the matching rules, the
 4. **TIF.** DAY and GTC limit remainders rest. IOC cancels the remainder.
    FOK checks the fillable quantity first and rejects the order completely if
    it cannot fill. A market order never rests: its remainder is canceled even
-   when its TIF is DAY/GTC.
+   when its TIF is DAY/GTC. DAY orders die when the cluster service offers
+   `Command::ExpireDayOrders` (a service message sequenced through the log at
+   the trading-day boundary); GTC orders are untouched. The DAY flag is part
+   of the order's snapshot state.
 5. **Post-only.** A post-only limit order that would cross is rejected; it
    never takes liquidity. Post-only with a market order is invalid.
 6. **Self-trade.** `None` allows the trade; `CancelResting` cancels the

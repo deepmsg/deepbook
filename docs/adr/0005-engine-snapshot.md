@@ -19,9 +19,10 @@ silently changed by a snapshot.
    commands, so the engine state is self-consistent. The snapshot records
    `last_log_pos`; replay starts after it.
 2. **State in the snapshot.**
-   - the order book: used slab slots (hot fields + ClOrdID), the generation
-     counter for **every** slot (free slots included), the free-list order and
-     head, the bid/ask levels, `last_trade` and `md_seq`;
+   - the order book: used slab slots (hot fields + ClOrdID, including the
+     DAY/GTC flag), the generation counter for **every** slot (free slots
+     included), the free-list order and head, the bid/ask levels, `last_trade`
+     and `md_seq`;
    - the `(account, ClOrdID)` window in insertion order, including terminal
      records;
    - per-account open-order counts and the global/per-account kill switches;
@@ -33,17 +34,19 @@ silently changed by a snapshot.
 4. **Identity is preserved.** Slot indices, generation counters and the free
    list order are restored, so a new order after recovery gets the same packed
    `OrderId` it would have received without the restart. The ClOrdID window is
-   restored, so a client retry after recovery is rejected as a duplicate rather
-   than becoming a second order.
+   restored, so a client retry after recovery replays the original
+   acknowledgement instead of becoming a second order.
 5. **Record format.** `encode` writes `DBS2`: the SBE message from
-   `schemas/deepbook-snapshot.xml` (schema id 200, version 1), generated into
+   `schemas/deepbook-snapshot.xml` (schema id 200, version 2), generated into
    `crates/codec/snapshot` by `just gen-snapshot` with the pinned sbe-tool
    1.40.2. `decode` dispatches on the four-byte magic and still accepts the
    original hand-written `DBS1` record, so a snapshot taken by an older build
-   is recoverable.
-   The rollout order still matters: every node must run a build that can read
-   `DBS2` before any node writes it, so read support and the write flip are
-   kept as separate commits and can be split at merge or deploy time.
+   is recoverable. Version 2 appends `isDay` to the slot block for DAY
+   expiry; a version-1 `DBS2` record still decodes (its orders restore as
+   GTC). The rollout order still matters: every node must run a build that can
+   read the new version before any node writes it, so read support and the
+   write flip are kept as separate commits and can be split at merge or deploy
+   time.
    Counts are bounded, and the SBE decoder validates the whole framing before
    wrapping the generated decoder, which indexes the buffer without bounds
    checks. Schema evolution is append-only: new fields at the end of a block,

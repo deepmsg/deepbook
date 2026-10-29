@@ -1,4 +1,4 @@
-//! The SBE snapshot codec (schema id 200, version 1).
+//! The SBE snapshot codec (schema id 200, version 2).
 //!
 //! The generated codec (`deepbook-codec-snapshot`) reads and writes one
 //! `EngineSnapshot` message. The generated decoders index the buffer without
@@ -46,7 +46,9 @@ const KILLED_ACCOUNTS_BLOCK: usize = 4;
 const OPEN_ORDERS_BLOCK: usize = 8;
 const SEEN_BLOCK: usize = 73;
 const FREE_BLOCK: usize = 4;
-const SLOTS_BLOCK: usize = 83;
+/// Version 2 appended `isDay` to the slot block (83 bytes in version 1).
+const SLOTS_BLOCK: usize = 84;
+const SLOTS_BLOCK_V1: usize = 83;
 const BIDS_BLOCK: usize = 24;
 const ASKS_BLOCK: usize = 24;
 
@@ -145,7 +147,8 @@ pub fn encode(snapshot: &EngineSnapshot) -> Result<Vec<u8>, CodecError> {
             .side(side_to_sbe(slot.side))
             .state(order_state_to_sbe(slot.state))
             .is_market(u8::from(slot.is_market))
-            .cl_ord_id(slot.cl_ord_id.as_bytes());
+            .cl_ord_id(slot.cl_ord_id.as_bytes())
+            .is_day(u8::from(slot.is_day));
     }
 
     let message = group.parent()?;
@@ -265,6 +268,9 @@ pub fn decode(payload: &[u8]) -> Result<EngineSnapshot, CodecError> {
             side: side_from_sbe(group.side())?,
             state: order_state_from_sbe(group.state())?,
             is_market: group.is_market() != 0,
+            // A version-1 record has no `isDay` field and the generated
+            // decoder answers 0xff for it; only an explicit 1 is DAY.
+            is_day: group.is_day() == 1,
             cl_ord_id: ClientOrderId::from_padded_bytes(group.cl_ord_id()),
         });
     }
@@ -330,7 +336,7 @@ fn validate(payload: &[u8]) -> Result<(), CodecError> {
     if template_id != SBE_TEMPLATE_ID || schema_id != SBE_SCHEMA_ID {
         return Err(CodecError::BadMagic);
     }
-    if version != SBE_SCHEMA_VERSION {
+    if version != 1 && version != SBE_SCHEMA_VERSION {
         return Err(CodecError::BadVersion(version.min(u16::from(u8::MAX)) as u8));
     }
     if block_length != MESSAGE_BLOCK {
@@ -338,12 +344,19 @@ fn validate(payload: &[u8]) -> Result<(), CodecError> {
     }
     cursor.skip(block_length)?;
 
+    // Version 1 predates the `isDay` field, so its slot block is one byte
+    // shorter. An old record stays readable; its DAY orders restore as GTC.
+    let slots_block = if version == 1 {
+        SLOTS_BLOCK_V1
+    } else {
+        SLOTS_BLOCK
+    };
     for expected in [
         KILLED_ACCOUNTS_BLOCK,
         OPEN_ORDERS_BLOCK,
         SEEN_BLOCK,
         FREE_BLOCK,
-        SLOTS_BLOCK,
+        slots_block,
         BIDS_BLOCK,
         ASKS_BLOCK,
     ] {

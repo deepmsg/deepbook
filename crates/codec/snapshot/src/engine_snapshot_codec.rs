@@ -969,7 +969,7 @@ pub mod encoder {
 
         #[inline]
         pub const fn block_length() -> u16 {
-            83
+            84
         }
 
         #[inline]
@@ -1248,6 +1248,22 @@ pub mod encoder {
                 .chain(std::iter::repeat(0_u8))
                 .take(20);
             self.cl_ord_id_from_iter(iter);
+            self
+        }
+
+        /// primitive field 'isDay'
+        /// - min value: 0
+        /// - max value: 254
+        /// - null value: 0xff_u8
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 83
+        /// - encodedLength: 1
+        /// - version: 2
+        #[inline]
+        pub fn is_day(&mut self, value: u8) -> &mut Self {
+            let offset = self.offset + 83;
+            self.get_buf_mut().put_u8_at(offset, value);
             self
         }
     }
@@ -2284,7 +2300,7 @@ pub mod decoder {
             self
         }
 
-        /// group token - Token{signal=BEGIN_GROUP, name='slots', referencedName='null', description='null', packageName='null', id=160, version=0, deprecated=0, encodedLength=83, offset=-1, componentTokenCount=57, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
+        /// group token - Token{signal=BEGIN_GROUP, name='slots', referencedName='null', description='null', packageName='null', id=160, version=0, deprecated=0, encodedLength=84, offset=-1, componentTokenCount=60, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
         #[inline]
         pub fn parent(&mut self) -> SbeResult<P> {
             self.parent.take().ok_or(SbeErr::ParentNotSet)
@@ -2398,6 +2414,16 @@ pub mod decoder {
         pub fn cl_ord_id(&self) -> [u8; 20] {
             let buf = self.get_buf();
             ReadBuf::get_bytes_at(buf.data, self.offset + 63)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn is_day(&self) -> u8 {
+            if self.acting_version() < 2 {
+                return 0xff_u8;
+            }
+
+            self.get_buf().get_u8_at(self.offset + 83)
         }
     }
 

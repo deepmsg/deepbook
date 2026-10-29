@@ -161,6 +161,7 @@ impl Engine {
                 }
                 None => self.kill_all = true,
             },
+            Command::ExpireDayOrders => self.expire_day_orders(sink),
             Command::Snapshot => self.emit_snapshot(sink),
         }
     }
@@ -255,6 +256,7 @@ impl Engine {
             order.qty,
             order.cl_ord_id,
             order.ord_type == OrdType::Market,
+            order.time_in_force == TimeInForce::Day,
         ) else {
             self.reject_unallocated(order, RejectReason::BookFull, sink);
             return;
@@ -662,6 +664,49 @@ impl Engine {
         }
     }
 
+    /// Cancel every resting DAY order, in slab order so replay is identical.
+    ///
+    /// The expiry is a logged command, not a wall-clock decision made inside
+    /// the callback: the cluster service offers it at the trading-day
+    /// boundary, the command is sequenced, and every replica applies the same
+    /// cancels at the same log position.
+    fn expire_day_orders(&mut self, sink: &mut impl EventSink) {
+        let slots: Vec<u32> = self
+            .book
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, order)| {
+                order.is_day
+                    && order.id != EMPTY_ORDER_ID
+                    && matches!(order.state, OrderState::New | OrderState::Partial)
+            })
+            .map(|(index, _)| u32::try_from(index).expect("slot <= 2^24"))
+            .collect();
+        for slot in slots {
+            let hot = self.book.orders[slot as usize];
+            let cold = self.book.cold[slot as usize];
+            self.book.unlink(slot);
+            self.book.free(slot);
+            self.decrement_open(hot.account);
+            let header = self.header();
+            let mut event = self.report_from_hot(
+                header,
+                &hot,
+                cold.cl_ord_id,
+                ExecType::Canceled,
+                0,
+                None,
+                None,
+            );
+            event.state = OrderState::Canceled;
+            event.leaves_qty = 0;
+            self.mark(hot.account, SeenState::Canceled, hot, cold);
+            self.emit_report(sink, event);
+            self.emit_book_update(hot.side, hot.price, sink);
+        }
+    }
+
     fn replace(&mut self, request: &ReplaceOrder, sink: &mut impl EventSink) {
         let Some(seen) = self.ids.get(request.account, request.orig_cl_ord_id) else {
             self.cancel_reject_replace(
@@ -791,6 +836,7 @@ impl Engine {
             {
                 let order = &mut self.book.orders[slot as usize];
                 order.qty = request.qty;
+                order.is_day = request.time_in_force == TimeInForce::Day;
             }
             self.reduce_level(hot.side, hot.price, old_leaves - new_leaves);
             let updated = self.book.orders[slot as usize];
@@ -816,6 +862,8 @@ impl Engine {
             let order = &mut self.book.orders[slot as usize];
             order.price = request.price.unwrap_or(0);
             order.qty = request.qty;
+            order.is_market = request.ord_type == OrdType::Market;
+            order.is_day = request.time_in_force == TimeInForce::Day;
             order.state = if order.filled > 0 {
                 OrderState::Partial
             } else {
@@ -1773,6 +1821,77 @@ mod tests {
                 .iter()
                 .any(|report| report.exec_type == ExecType::Canceled)
         );
+    }
+
+    #[test]
+    fn end_of_day_cancels_day_orders_only() {
+        let mut engine = new_engine();
+        let events = run(
+            &mut engine,
+            &[
+                limit(1, "D1", Side::Sell, 101, 5, TimeInForce::Day, false),
+                limit(
+                    2,
+                    "G1",
+                    Side::Sell,
+                    102,
+                    7,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(3, "D2", Side::Buy, 99, 4, TimeInForce::Day, false),
+                Command::ExpireDayOrders,
+            ],
+        );
+        let canceled: Vec<_> = reports(&events)
+            .into_iter()
+            .filter(|report| report.exec_type == ExecType::Canceled)
+            .collect();
+        assert_eq!(2, canceled.len());
+        assert!(canceled.iter().any(|report| report.cl_ord_id == cl("D1")));
+        assert!(canceled.iter().any(|report| report.cl_ord_id == cl("D2")));
+        assert!(!canceled.iter().any(|report| report.cl_ord_id == cl("G1")));
+
+        let view = engine.view();
+        assert!(view.bids.is_empty());
+        assert_eq!(1, view.asks.len());
+        assert_eq!(cl("G1"), view.asks[0].orders[0].cl_ord_id);
+
+        // A second expiry is a no-op.
+        let mut again = Vec::new();
+        engine.on_command(&Command::ExpireDayOrders, 5, &mut again);
+        assert!(reports(&again).is_empty());
+
+        // The DAY flag is part of the snapshot: a restored DAY order is still
+        // expired by the next end of day.
+        let mut before = new_engine();
+        run(
+            &mut before,
+            &[
+                limit(4, "D3", Side::Sell, 103, 2, TimeInForce::Day, false),
+                limit(
+                    5,
+                    "G2",
+                    Side::Sell,
+                    104,
+                    3,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+            ],
+        );
+        let snapshot = before.snapshot();
+        let mut restored = Engine::restore(test_config(), &snapshot).expect("restore");
+        let mut expired = Vec::new();
+        restored.on_command(&Command::ExpireDayOrders, 3, &mut expired);
+        let canceled: Vec<_> = reports(&expired)
+            .into_iter()
+            .filter(|report| report.exec_type == ExecType::Canceled)
+            .collect();
+        assert_eq!(1, canceled.len());
+        assert_eq!(cl("D3"), canceled[0].cl_ord_id);
+        assert_eq!(1, restored.view().asks.len());
+        assert_eq!(cl("G2"), restored.view().asks[0].orders[0].cl_ord_id);
     }
 
     #[test]

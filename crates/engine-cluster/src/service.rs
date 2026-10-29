@@ -11,8 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use deepbook_engine_core::wire::{decode_command, encode_event};
-use deepbook_engine_core::{Engine, EngineConfig, EngineSnapshot, Event};
+use deepbook_engine_core::wire::{decode_command, encode_command, encode_event};
+use deepbook_engine_core::{Command, Engine, EngineConfig, EngineSnapshot, Event};
 use deepbook_marketdata::{
     DeepmsgConfig, DeepmsgIncrementalPublisher, Level, MarketDataService,
     ServiceConfig as MarketServiceConfig, Snapshot,
@@ -101,6 +101,15 @@ pub struct EngineService {
     /// it (the engine log can replay the commands, and the gateway's FIX
     /// journal covers the reports it already received).
     pending_egress: HashMap<SessionId, VecDeque<Vec<u8>>>,
+    /// The cluster sessions currently open, in open order.
+    ///
+    /// A command that originates in the service itself (the day-expiry
+    /// command) has no originating session; its reports go to every open
+    /// session. With one FIX peer per gateway (ADR 0006) that is the one
+    /// gateway; multi-peer routing is a later slice.
+    sessions: Vec<SessionId>,
+    /// Whether a day-expiry timer is armed.
+    expiry_scheduled: bool,
 }
 
 /// The most events queued for one cluster session. A gateway that stays
@@ -109,6 +118,14 @@ pub struct EngineService {
 /// slab capacity, so one end-of-day expiry (one cancel report and one book
 /// update per order) fits.
 const MAX_PENDING_EGRESS: usize = 65_536;
+
+/// Timer correlation ids.
+const EXPIRY_TIMER: i64 = 1;
+const EXPIRY_RETRY_TIMER: i64 = 2;
+/// Nanoseconds in a day; the expiry deadline is the next UTC midnight.
+const DAY_NANOS: i64 = 86_400_000_000_000;
+/// How long to wait before retrying an expiry command the ingress refused.
+const EXPIRY_RETRY_NANOS: i64 = 1_000_000_000;
 
 impl EngineService {
     /// A fresh engine with the deployment configuration.
@@ -120,6 +137,8 @@ impl EngineService {
             market_data: None,
             restored_log_pos: -1,
             pending_egress: HashMap::new(),
+            sessions: Vec::new(),
+            expiry_scheduled: false,
         }
     }
 
@@ -151,6 +170,8 @@ impl EngineService {
             }),
             restored_log_pos: -1,
             pending_egress: HashMap::new(),
+            sessions: Vec::new(),
+            expiry_scheduled: false,
         })
     }
 
@@ -168,6 +189,8 @@ impl EngineService {
             market_data: None,
             restored_log_pos: snapshot.last_log_pos,
             pending_egress: HashMap::new(),
+            sessions: Vec::new(),
+            expiry_scheduled: false,
         })
     }
 
@@ -328,6 +351,25 @@ impl EngineService {
         }
         self.pending_egress.retain(|_, queue| !queue.is_empty());
     }
+
+    /// Offer the end-of-day command as a service message.
+    ///
+    /// The command goes through the log, so a replica that was not the leader
+    /// applies the same expiries at the same position. A refused offer is
+    /// retried on a short timer rather than forcing the expiry inline.
+    fn request_expiry(&mut self, cluster: &mut Cluster<'_>, timestamp: i64) {
+        let offered = matches!(
+            cluster.offer(&encode_command(&Command::ExpireDayOrders)),
+            Ok(position) if position > 0
+        );
+        if !offered {
+            eprintln!("engine: day expiry was not accepted; retrying");
+            let _ = cluster.schedule_timer(
+                EXPIRY_RETRY_TIMER,
+                timestamp.saturating_add(EXPIRY_RETRY_NANOS),
+            );
+        }
+    }
 }
 
 impl ClusteredService for EngineService {
@@ -381,9 +423,12 @@ impl ClusteredService for EngineService {
     fn on_session_open(
         &mut self,
         _cluster: &mut Cluster<'_>,
-        _session: SessionId,
+        session: SessionId,
         _timestamp: i64,
     ) -> Result<(), ContainerError> {
+        if !self.sessions.contains(&session) {
+            self.sessions.push(session);
+        }
         Ok(())
     }
 
@@ -396,6 +441,7 @@ impl ClusteredService for EngineService {
     ) -> Result<(), ContainerError> {
         // The cluster session is gone; nothing can deliver these reports.
         self.pending_egress.remove(&session);
+        self.sessions.retain(|open| *open != session);
         Ok(())
     }
 
@@ -403,14 +449,35 @@ impl ClusteredService for EngineService {
         &mut self,
         cluster: &mut Cluster<'_>,
         session: Option<SessionId>,
-        _timestamp: i64,
+        timestamp: i64,
         payload: &[u8],
         header: &LogHeader,
     ) -> Result<(), ContainerError> {
+        // The first command after a start (or a leader change) arms the
+        // day-expiry timer. `on_start` has no cluster time to compute a
+        // deadline, and a follower must not arm it.
+        if !self.expiry_scheduled
+            && timestamp > 0
+            && matches!(
+                cluster.schedule_timer(EXPIRY_TIMER, next_midnight(timestamp)),
+                Ok(true)
+            )
+        {
+            self.expiry_scheduled = true;
+        }
+
         let events = self.apply(payload, header.position).map_err(container)?;
         self.publish_market_data(&events);
-        if let Some(session) = session {
-            self.queue_egress(session, &events);
+        match session {
+            Some(session) => self.queue_egress(session, &events),
+            // A service-originated command (the day expiry) has no originating
+            // session; its reports go to every open session.
+            None => {
+                let targets = self.sessions.clone();
+                for target in targets {
+                    self.queue_egress(target, &events);
+                }
+            }
         }
         self.flush_egress(cluster);
         Ok(())
@@ -418,10 +485,23 @@ impl ClusteredService for EngineService {
 
     fn on_timer_event(
         &mut self,
-        _cluster: &mut Cluster<'_>,
-        _correlation_id: i64,
-        _timestamp: i64,
+        cluster: &mut Cluster<'_>,
+        correlation_id: i64,
+        timestamp: i64,
     ) -> Result<(), ContainerError> {
+        match correlation_id {
+            EXPIRY_TIMER => {
+                // Timers are one-shot: arm tomorrow's before doing any work.
+                self.expiry_scheduled = matches!(
+                    cluster.schedule_timer(EXPIRY_TIMER, next_midnight(timestamp)),
+                    Ok(true)
+                );
+                self.request_expiry(cluster, timestamp);
+            }
+            EXPIRY_RETRY_TIMER => self.request_expiry(cluster, timestamp),
+            _ => {}
+        }
+        self.flush_egress(cluster);
         Ok(())
     }
 
@@ -448,7 +528,13 @@ impl ClusteredService for EngineService {
         Ok(())
     }
 
-    fn on_role_change(&mut self, _new_role: Role) -> Result<(), ContainerError> {
+    fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError> {
+        if new_role == Role::Leader {
+            // Timers belong to the leader. The previous leader's timer is not
+            // ours; arm a new one on the next command (the callback has no
+            // cluster handle, so it cannot schedule here).
+            self.expiry_scheduled = false;
+        }
         Ok(())
     }
 
@@ -558,6 +644,18 @@ fn offer_once(cluster: &mut Cluster<'_>, session: SessionId, payload: &[u8]) -> 
         Ok(_) | Err(_) => OfferOutcome::BackPressured,
     }
 }
+
+/// The UTC midnight after `timestamp_ns`.
+///
+/// The timer timestamp is cluster time in epoch nanoseconds, so the expiry
+/// runs at the same boundary on every replica regardless of process uptime.
+fn next_midnight(timestamp_ns: i64) -> i64 {
+    if timestamp_ns <= 0 {
+        return DAY_NANOS;
+    }
+    (timestamp_ns / DAY_NANOS + 1).saturating_mul(DAY_NANOS)
+}
+
 fn container(error: impl fmt::Display) -> ContainerError {
     ContainerError::Cluster(error.to_string())
 }
@@ -640,6 +738,15 @@ mod tests {
             assert_eq!(first, second);
         }
         assert_eq!(service.book_hash(), restored.book_hash());
+    }
+
+    #[test]
+    fn the_expiry_deadline_is_the_next_midnight() {
+        assert_eq!(DAY_NANOS, next_midnight(0));
+        assert_eq!(DAY_NANOS, next_midnight(1));
+        assert_eq!(DAY_NANOS, next_midnight(DAY_NANOS - 1));
+        assert_eq!(2 * DAY_NANOS, next_midnight(DAY_NANOS));
+        assert_eq!(2 * DAY_NANOS, next_midnight(DAY_NANOS + 1));
     }
 
     #[test]

@@ -5,7 +5,7 @@ formats, not SBE:
 
 | Family | Carries |
 |---|---|
-| command | `NewOrder`, `CancelOrder`, `ReplaceOrder`, `KillSwitch`, `Snapshot` |
+| command | `NewOrder`, `CancelOrder`, `ReplaceOrder`, `KillSwitch`, `ExpireDayOrders`, `Snapshot` |
 | event | `OrderAccepted`, `OrderRejected`, `ExecutionReport`, `Trade`, `BookUpdate`, `Snapshot` |
 | market data | incremental `BookUpdate` / `Trade`, periodic `Snapshot` |
 
@@ -13,7 +13,7 @@ The engine snapshot is the one SBE contract:
 
 | Schema | id / version | Generated crate |
 |---|---|---|
-| `deepbook-snapshot.xml` | 200 / 1 | `crates/codec/snapshot` (`deepbook-codec-snapshot`) |
+| `deepbook-snapshot.xml` | 200 / 2 | `crates/codec/snapshot` (`deepbook-codec-snapshot`) |
 
 Generation:
 

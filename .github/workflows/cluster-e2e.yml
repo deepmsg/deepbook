@@ -3,8 +3,9 @@
 # continues the book (crates/gateway/tests/cluster_e2e.rs).
 #
 # It needs deepmsg binaries, which `ci.yml`'s `check` job does not build. This
-# workflow checks out the revision Cargo.toml pins, builds three deepmsg
-# binaries and the engine container, and runs the e2e against them.
+# workflow checks out the revision Cargo.toml pins and builds the binaries and
+# the engine container with `scripts/deepmsg-deps.sh`, the script `just deps`
+# runs locally, so the two cannot drift.
 #
 # The binaries are built in the debug profile: the test asserts correctness,
 # not throughput, and debug avoids deepmsg's `lto = "fat"` release build on a
@@ -39,15 +40,10 @@ jobs:
         id: pin
         run: |
           set -eu
-          # Every deepmsg dependency must name the same revision; two pins
-          # would mean this job tests a different deepmsg than the build does.
-          revs=$(sed -nE 's/^deepmsg-.*rev = "([0-9a-f]+)".*/\1/p' Cargo.toml | sort -u)
-          if [ "$(printf '%s\n' "$revs" | grep -c .)" -ne 1 ]; then
-            echo "::error::Cargo.toml does not pin every deepmsg dependency to one rev: [$revs]"
-            exit 1
-          fi
-          echo "deepmsg pin: $revs"
-          echo "rev=$revs" >> "$GITHUB_OUTPUT"
+          # `pin` prints the revision every deepmsg dependency names and
+          # refuses two different ones: this job would then test a different
+          # deepmsg than the build does.
+          echo "rev=$(./scripts/deepmsg-deps.sh pin)" >> "$GITHUB_OUTPUT"
 
       # A full clone (the repository is small) so the pinned commit, which may
       # be any ancestor of the default branch, is already in history.
@@ -75,24 +71,27 @@ jobs:
           # Both workspaces: the engine's dependencies and deepmsg's.
           workspaces: ". -> target, deepmsg -> target"
 
+      # The same script and package list the local runs use, so `just deps`
+      # and this job cannot drift. It also writes the stamp that `check` reads,
+      # which is why the test step can assert the binaries are the pinned ones.
       - name: Build the deepmsg binaries
-        working-directory: deepmsg
-        run: |
-          cargo build \
-            -p deepmsg-archive --bin deepmsg-archiving-media-driver \
-            -p deepmsg-cluster --bin deepmsg-cluster-node \
-            -p deepmsg-cluster-tool --bin deepmsg-cluster-tool
+        env:
+          DEEPBOOK_DEEPMSG_DIR: ${{ github.workspace }}/deepmsg
+          DEEPMSG_PROFILE: debug
+        run: ./scripts/deepmsg-deps.sh build
 
       - name: Build the engine container
         run: cargo build -p deepbook-engine-cluster --bin engine-container
 
       # DEEPBOOK_E2E_REQUIRED turns the harness's "no binaries, skip" path into
-      # a failure, so a green job cannot mean "ran nothing".
+      # a failure, so a green job cannot mean "ran nothing". `check` adds the
+      # provenance: the binaries must be the stamped pinned revision.
       - name: Run the cluster e2e
         env:
           DEEPBOOK_DEEPMSG_DIR: ${{ github.workspace }}/deepmsg
           DEEPMSG_PROFILE: debug
           DEEPBOOK_E2E_REQUIRED: "1"
         run: |
+          ./scripts/deepmsg-deps.sh check
           cargo test -p deepbook-gateway --test cluster_e2e -- \
             --ignored --exact a_recovered_engine_continues_the_book --nocapture

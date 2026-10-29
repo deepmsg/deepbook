@@ -138,6 +138,29 @@ FIX `Account` is the engine's numeric account id (a missing account is `0`);
 `--symbol`/`--symbol-id` name the one engine symbol. See ADR 0006 for the
 mapping and its limits.
 
+Pre-trade risk is off by default. Enable it on the container with the
+`deepbook.risk.*` properties:
+
+```bash
+engine-container ... \
+  -Ddeepbook.risk.max-order-qty=1000 \
+  -Ddeepbook.risk.max-notional=100000000 \
+  -Ddeepbook.risk.price-band-ticks=250 \
+  -Ddeepbook.risk.fat-finger-ticks=500 \
+  -Ddeepbook.risk.reference-price=10000 \
+  -Ddeepbook.risk.max-open-orders=100 \
+  -Ddeepbook.risk.self-trade=reject-taker
+```
+
+The container prints the effective limits before it joins the cluster
+(`risk max-qty=... self-trade=...`) and refuses to start on a malformed value
+or on a limit that would halt every order (a zero or negative quantity or
+notional limit, a negative band, a non-positive reference price). The price
+band and fat-finger checks use the book's last trade, or
+`deepbook.risk.reference-price` while the book has none. Risk limits are
+deployment configuration, not cluster state (ADR 0005): every node must start
+with the same values, and changing one restarts the cluster.
+
 The process e2e covers the whole path — order, crossing, cancel, a cluster
 snapshot, `SIGKILL` of the container and module, restart, an identical
 `Snapshot` book hash and a continuation fill through the same FIX session:

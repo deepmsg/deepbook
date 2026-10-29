@@ -17,6 +17,12 @@ Optional: `deepmsg-cluster-backup` (copy/recovery, not a voting member) and
 A single node is a real cluster: it elects itself, writes a leadership term to
 `recording.log`, takes snapshots, and recovers from them. It has no failover.
 
+The container's own properties are `deepbook.engine.*` (symbol, slab capacity,
+idempotency window) and `deepbook.risk.*` (the pre-trade limits; off by
+default). Every node must be started with the same values, and the container
+refuses a malformed or self-halting limit instead of quietly trading without
+one. See the cluster section of the top-level README.
+
 ## M0 spike
 
 The M0 spike uses deepmsg's own `echo` or `basic-auction` business, not the

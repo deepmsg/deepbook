@@ -12,10 +12,16 @@
 //! test crates; a single-node cluster is three child processes plus a client,
 //! and gate 4's cluster is three members with a driver each plus a client
 //! driver.
+//!
+//! `failover` moves the same three-member topology to deepbook's own stack:
+//! every member runs `engine-container`, the client is `fix-gateway`, and the
+//! check kills the leader and drives FIX orders through the recovered
+//! session.
 #![forbid(unsafe_code)]
 
 pub mod client;
 pub mod config;
+pub mod fix;
 pub mod nodes;
 pub mod process;
 pub mod report;

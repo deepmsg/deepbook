@@ -72,6 +72,17 @@ thread, which matches.
    services have acked. The test is `#[ignore]` because it needs the deepmsg
    binaries and real child processes; it skips rather than fails when they
    are absent.
+8. **A multi-member cluster is the same client with endpoints.** Three members
+   own three drivers, so the gateway cannot use an IPC ingress: it names the
+   multi-member ingress channel plus `--ingress-endpoints "0=host:port,…"`
+   (deepmsg's `<memberId>=<endpoint>` form) and an egress channel with an
+   endpoint on the gateway's own driver, so a killed member cannot take the
+   egress subscription with it. A new leader is reached through the client's
+   `NewLeaderEvent`; a session that closes instead is reconnected with the
+   egress **port moved by one per session**, because the cluster keeps a
+   closed session until its timeout and a second session on the same endpoint
+   cannot join the new leader's publication. `cluster-spike failover` stands
+   the topology up with `engine-container` in every member.
 
 ## Consequences
 
@@ -100,3 +111,12 @@ thread, which matches.
   README records it for a restarted member 0). A short
   `--new-leader-timeout-ms` makes the gateway close and reconnect instead of
   waiting for the full derived timeout; the FIX session is unaffected.
+- **The failover run measures the product, not the tutorial business.**
+  `cluster-spike failover` puts a resting order on the book and a FIX session
+  on the wire, then kills the leader's three processes. The next buy fills
+  against the replicated resting order milliseconds after the new leader is
+  active (≈4.2 s with the 2 s test heartbeat), the FIX connection is never
+  reopened, and each `ClOrdID` produces one trade. Market data is off in that
+  topology: every member applies the log, so every member would publish its
+  own stream; publishing only from the leader needs `on_role_change`, which
+  the pinned deepmsg does not hand a `Cluster`.

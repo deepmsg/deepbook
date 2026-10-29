@@ -24,6 +24,11 @@ channel is UDP on the member string's archive endpoint.
 `gate4` runs three members (one driver + archive, one module and one container
 each) plus a driver of the client's own; see [Gate 4](#gate-4-three-nodes-and-a-leader-kill).
 
+`failover` reuses that topology for deepbook itself: every member runs
+`engine-container` instead of the stock container, the client is the real
+`fix-gateway`, and the leader is killed while a FIX session is open; see
+[Failover](#failover-deepbook-on-three-nodes).
+
 **Child environment.** Children are started with every `DEEPMSG_*` and
 `AERON_*` variable removed. deepmsg's configuration lets `DEEPMSG_DIR` beat a
 `-D` argument, so a parent that sets it to locate the binaries would otherwise
@@ -65,6 +70,9 @@ cargo run -p deepbook-spike --bin cluster-spike -- gate3 --bids 1000
 # three nodes, kill the leader, measure the client's recovery and check the
 # egress accounting
 cargo run -p deepbook-spike --bin cluster-spike -- gate4 --bids 100
+
+# three nodes of deepbook's own stack, a FIX client, and a leader kill
+cargo run -p deepbook-spike --bin cluster-spike -- failover
 ```
 
 Use `--keep` to keep the run directory, and `--base-port` when another process
@@ -126,5 +134,43 @@ registry. It has observable state — best price and winning customer — writes
 that state to its snapshot, and reports it in every egress. Gate 3 therefore
 needs no custom service and no custom container binary.
 
-The spike is not part of CI: it needs the deepmsg checkout and real child
-processes. `cargo check` still compiles it.
+The spike needs the deepmsg checkout and real child processes, so `cargo
+check` only compiles it. The `cluster-e2e` workflow runs `failover` on every
+pull request alongside the single-node e2e; `smoke`, `p99`, `gate3` and `gate4`
+stay local.
+
+## Failover: deepbook on three nodes
+
+`failover` answers the product question gate 4 answers for the tutorial
+business: does a three-member cluster keep deepbook's engine and a FIX session
+alive when the leader's three processes are killed?
+
+```
+node-<id>/   deepmsg-archiving-media-driver + deepmsg-cluster-node
+             + engine-container (market data off)   one driver per member
+client/      a driver the gateway owns
+```
+
+The run places a resting sell, fills 4 of its 10 lots, `SIGKILL`s the leader's
+driver, module and container, waits for the remaining two members to elect, and
+resends one buy (same `ClOrdID`) until the new leader answers. That buy fills
+3 lots against the replicated resting order, a third buy fills the last 3, and
+the run checks one `Trade` report per `ClOrdID` and that the resting order ends
+`Filled`. Output:
+
+```
+failover: new_leader=0 elected=4420.7ms
+failover: post-kill fill at 4442.1ms, session held through the failover
+failover: ok old_leader=1 new_leader=0 elected=4420.7ms recovered=4442.1ms ...
+```
+
+The election time is the test configuration's 2 s heartbeat, not the product's
+10 s default; see the module documentation of `nodes`. The two extra binaries
+are looked up beside the running one, or named explicitly:
+
+| Variable | Default |
+|---|---|
+| `DEEPBOOK_ENGINE_CONTAINER` | `target/<profile>/engine-container` beside the spike |
+| `DEEPBOOK_FIX_GATEWAY` | `target/<profile>/fix-gateway` beside the spike |
+
+`just three-node` builds both and runs the check.

@@ -60,6 +60,7 @@ fn run() -> Result<(), String> {
         let mut cluster_config =
             ClusterEngineConfig::new(aeron_dir, SessionKey::new(&options.sender, &options.target));
         cluster_config.ingress_channel = options.ingress_channel.clone();
+        cluster_config.ingress_endpoints = options.ingress_endpoints.clone();
         cluster_config.ingress_stream_id = options.ingress_stream_id;
         cluster_config.egress_channel = options.egress_channel.clone();
         cluster_config.egress_stream_id = options.egress_stream_id;
@@ -117,6 +118,7 @@ struct Options {
     cluster: bool,
     aeron_dir: Option<PathBuf>,
     ingress_channel: String,
+    ingress_endpoints: Option<String>,
     ingress_stream_id: i32,
     egress_channel: String,
     egress_stream_id: i32,
@@ -144,6 +146,7 @@ impl Options {
             cluster: false,
             aeron_dir: None,
             ingress_channel: "aeron:ipc".to_owned(),
+            ingress_endpoints: None,
             ingress_stream_id: 101,
             egress_channel: "aeron:ipc".to_owned(),
             egress_stream_id: 102,
@@ -213,6 +216,9 @@ impl Options {
                 "--cluster" => options.cluster = true,
                 "--aeron-dir" => options.aeron_dir = Some(value("--aeron-dir")?.into()),
                 "--ingress-channel" => options.ingress_channel = value("--ingress-channel")?,
+                "--ingress-endpoints" => {
+                    options.ingress_endpoints = Some(value("--ingress-endpoints")?);
+                }
                 "--ingress-stream-id" => {
                     options.ingress_stream_id = value("--ingress-stream-id")?
                         .parse()
@@ -260,6 +266,7 @@ fn print_usage() {
          \x20                  [--journal-sync each|batch] [--journal-batch N]\n\
          \x20                  [--cluster --aeron-dir PATH]\n\
          \x20                  [--ingress-channel URI] [--ingress-stream-id N]\n\
+         \x20                  [--ingress-endpoints M=HOST:PORT,...]\n\
          \x20                  [--egress-channel URI] [--egress-stream-id N]\n\
          \x20                  [--message-timeout-ms N]\n\
          \x20                  [--new-leader-timeout-ms N]\n\

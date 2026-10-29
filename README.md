@@ -187,6 +187,28 @@ sets `DEEPBOOK_E2E_REQUIRED=1` so a missing binary fails the job instead of
 skipping it. The io_uring variant stays local because it depends on the
 runner's kernel and seccomp policy.
 
+### Three-node failover (M6)
+
+`fix-gateway` reaches a multi-member cluster through `--ingress-endpoints` and
+an egress channel on a driver of its own. `crates/spike`'s `failover` run
+stands that topology up with deepbook's own engine in every member:
+
+```bash
+just three-node
+# DEEPBOOK_DEEPMSG_DIR=~/data/trader/deepmsg-pin just three-node
+```
+
+Three members, each with its own media driver, consensus module and
+`engine-container`; one `fix-gateway`; a resting sell is placed and partly
+filled; the leader's three processes are `SIGKILL`ed. The same FIX session
+then fills the next buy against the replicated resting order, and the run
+checks that the connection was never reopened, that each `ClOrdID` produced one
+trade, and that the resting order ends `Filled`. It prints the election and
+recovery times — about 4.2 s and a few milliseconds with the test topology's
+2 s heartbeat; the product default is 10 s. Market data is off in this
+topology: every member applies the log, so every member would publish its own
+stream (ADR 0006).
+
 ## Benchmark (M5)
 
 `fix-bench` is an open-loop FIX client. It queues IOC buys at absolute send

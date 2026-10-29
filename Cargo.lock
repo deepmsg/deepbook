@@ -196,6 +196,7 @@ dependencies = [
 name = "deepbook-spike"
 version = "0.1.0"
 dependencies = [
+ "deepbook-fix",
  "deepmsg-client",
  "deepmsg-cluster-client",
  "deepmsg-cluster-common",

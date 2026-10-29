@@ -38,6 +38,13 @@ engine-e2e: deps-check
     cargo build -p deepbook-engine-cluster --bin engine-container
     cargo test -p deepbook-gateway --test cluster_e2e -- --ignored --nocapture
 
+# P1-3: three members, each running engine-container, with fix-gateway as the
+# client; the leader's three processes are killed mid-session and the check
+# drives FIX orders through the recovered session.
+three-node:
+    cargo build -p deepbook-engine-cluster --bin engine-container -p deepbook-gateway --bin fix-gateway
+    cargo run -p deepbook-spike --bin cluster-spike -- failover
+
 # M5: one member + engine-container + fix-gateway, measured by fix-bench.
 # `just bench --rate 20000 --samples 50000` forwards the script's options.
 bench *args:

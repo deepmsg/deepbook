@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::{self, Arrivals, BidEgress, Channels};
 use crate::config::Config;
-use crate::nodes::{ClusterNodes, LEADER_HEARTBEAT_TIMEOUT};
+use crate::nodes::{ClusterNodes, LEADER_HEARTBEAT_TIMEOUT, Service};
 use crate::process::connect_timeout;
 use crate::report::{self, millis};
 
@@ -77,7 +77,7 @@ pub fn run(config: Config, bids: usize) -> Result<(), String> {
         return Err("bids must be non-zero".to_owned());
     }
 
-    let mut cluster = ClusterNodes::start(config)?;
+    let mut cluster = ClusterNodes::start(config, Service::BasicAuction)?;
     let ports = cluster.ports();
     let members = cluster.members();
     let leader = cluster.wait_for_leader(Duration::from_secs(60))?;

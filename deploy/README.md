@@ -56,7 +56,9 @@ deploy/bench.sh --keep ...                 # keep the run directory and logs
 
 Environment: `DEEPBOOK_DEEPMSG_DIR` (default `../deepmsg`), `DEEPMSG_PROFILE`
 (default `release`), `BENCH_RUN_DIR`, `BENCH_BASE_PORT`. The deepmsg binaries
-must be built first (see `crates/spike/README.md`).
+must be built at the pinned revision first with `just deps`; the script refuses
+to start without them or without their build stamp
+(`DEEPBOOK_SKIP_DEPS_CHECK=1` overrides). See `docs/deps.md`.
 
 `--journal-sync batch --journal-batch N` is the default: the session journal
 and sequence file sync once per N appends (ADR 0007). The default deployment

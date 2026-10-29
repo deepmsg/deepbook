@@ -15,6 +15,8 @@
 #   DEEPMSG_PROFILE       release|debug (default: release)
 #   BENCH_RUN_DIR         run directory (default: /dev/shm/deepbook-bench-<pid>)
 #   BENCH_METRICS         Prometheus text file (default: target/bench/last.prom)
+#   DEEPBOOK_SKIP_DEPS_CHECK=1  measure without verifying that the deepmsg
+#                         binaries are the pinned revision
 #
 # The run directory is on /dev/shm by default so the outbound journal's
 # fdatasync is a tmpfs operation; a physical-disk run is a different
@@ -94,12 +96,17 @@ if [ "$missing" -ne 0 ]; then
     cat >&2 <<EOF
 Build the deepmsg binaries in $DEEPMSG_DIR:
 
-  cargo build --release \\
-    -p deepmsg-archive --bin deepmsg-archiving-media-driver \\
-    -p deepmsg-cluster --bin deepmsg-cluster-node \\
-    -p deepmsg-cluster-tool --bin deepmsg-cluster-tool
+  DEEPBOOK_DEEPMSG_DIR=$DEEPMSG_DIR DEEPMSG_PROFILE=$PROFILE just deps
 EOF
     exit 1
+fi
+
+# A number is only reproducible if these binaries are the revision Cargo.toml
+# pins, not whatever was last built in the checkout. `just deps` writes the
+# stamp this reads; DEEPBOOK_SKIP_DEPS_CHECK=1 measures an unpinned stack.
+if [ "${DEEPBOOK_SKIP_DEPS_CHECK:-0}" != "1" ]; then
+    DEEPBOOK_DEEPMSG_DIR=$DEEPMSG_DIR DEEPMSG_PROFILE=$PROFILE \
+        "$ROOT/scripts/deepmsg-deps.sh" check
 fi
 
 if [ "$BUILD" -eq 1 ]; then

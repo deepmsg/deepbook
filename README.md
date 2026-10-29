@@ -10,14 +10,13 @@ FIX client → gateway → replicated log → risk → matching → execution re
 market data → snapshot/recovery, with a client-side RTT number and a replay
 that produces the same state twice.
 
-> Status: **M0–M3 merged; M4 complete; M5 in progress on this branch.** The FIX
-> session, epoll acceptor, engine seam, matching engine and market-data
-> channels are in place. M4 adds engine snapshot/restore, the
-> `ClusteredService` adapter and `engine-container`, the gateway's
-> `ClusterEngine`, `fix-gateway --cluster`, and a process e2e that kills the
-> engine's host and continues the book from the recovered state (ADR 0005,
-> ADR 0006). M5 is complete on this branch: the open-loop `fix-bench` client,
-> opt-in journal batching and the epoll/io_uring comparison (ADR 0007,
+> Status: **M0–M5 merged.** The FIX session, epoll/io_uring acceptor, engine
+> seam, matching engine, market-data channels and dashboard are in place. M4
+> adds engine snapshot/restore, the `ClusteredService` adapter and
+> `engine-container`, the gateway's `ClusterEngine`, `fix-gateway --cluster`,
+> and a process e2e that kills the engine's host and continues the book from
+> the recovered state (ADR 0005, ADR 0006). M5 adds the open-loop `fix-bench`
+> client, opt-in journal batching and the epoll/io_uring comparison (ADR 0007,
 > ADR 0009), plus the market-data → admin → WebSocket/Grafana path
 > (ADR 0008).
 
@@ -264,7 +263,10 @@ position, and every output is an event. It implements price-time matching with
 a slab and FIFO price levels, limit and market orders, DAY/GTC/IOC/FOK,
 cancel/replace (a same-price size reduction keeps queue priority), post-only,
 self-trade prevention (off, cancel resting, or reject taker), the common
-pre-trade limits and a bounded duplicate-`ClOrdID` window.
+pre-trade limits, a bounded duplicate-`ClOrdID` window and end-of-day expiry
+of resting DAY orders (a logged `ExpireDayOrders` command offered by the
+cluster service at UTC midnight). A retry of an accepted order replays its
+original acknowledgement instead of rejecting it.
 
 The acceptance tests are in the crate:
 
@@ -308,19 +310,21 @@ and proves the subscriber catches up with the same book. The driver test skips w
 deepmsg checkout is absent, so the default workspace run needs no external
 build. ADR 0004 records the channel and recovery semantics.
 
-## Cluster integration (M4, in progress)
+## Cluster integration (M4)
 
-`engine-core` now has `Engine::snapshot()` / `Engine::restore()`:
+`engine-core` has `Engine::snapshot()` / `Engine::restore()`:
 the snapshot preserves the slab slots, every slot's generation, the free-list
-order, the levels, the idempotency window, the open-order counts and the kill
-switches. A restored engine has the same book hash and produces the same future
-order ids and events as the engine that wrote the snapshot.
+order, the levels, the idempotency window, the DAY/GTC flag, the open-order
+counts and the kill switches. A restored engine has the same book hash and
+produces the same future order ids and events as the engine that wrote the
+snapshot.
 
-`engine-cluster` has the versioned `DBS1` snapshot record, the `EngineService`
-`ClusteredService` adapter (command/event wire, per-session egress, chunked
-snapshot write and restore) and the `engine-container` binary. The gateway's
-cluster client and the process-based single-node kill/restart e2e are the
-remaining M4 slices; ADR 0005 records the snapshot decisions.
+`engine-cluster` has the SBE `DBS2` snapshot record, the `EngineService`
+`ClusteredService` adapter (command/event wire, per-session egress with a
+back-pressure queue, chunked snapshot write and restore) and the
+`engine-container` binary. The gateway's cluster client and the process-based
+single-node kill/restart e2e are covered above; ADR 0005 and ADR 0006 record
+the decisions.
 
 ## Dependency on deepmsg
 

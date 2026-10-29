@@ -1,0 +1,98 @@
+# The process e2e: FIX client -> fix-gateway -> deepmsg cluster ->
+# engine-container, a snapshot, SIGKILL of the container and a restart that
+# continues the book (crates/gateway/tests/cluster_e2e.rs).
+#
+# It needs deepmsg binaries, which `ci.yml`'s `check` job does not build. This
+# workflow checks out the revision Cargo.toml pins, builds three deepmsg
+# binaries and the engine container, and runs the e2e against them.
+#
+# The binaries are built in the debug profile: the test asserts correctness,
+# not throughput, and debug avoids deepmsg's `lto = "fat"` release build on a
+# two-core runner. `just engine-e2e` keeps the release profile for local runs.
+#
+# Only the epoll test runs here. The io_uring variant depends on the runner's
+# kernel and seccomp policy (io_uring can be disabled or filtered), so a local
+# `just engine-e2e` covers it.
+name: cluster-e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly, off the hour so it does not queue behind everyone else's cron.
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: cluster-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  cluster-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the deepmsg pin
+        id: pin
+        run: |
+          set -eu
+          # Every deepmsg dependency must name the same revision; two pins
+          # would mean this job tests a different deepmsg than the build does.
+          revs=$(sed -nE 's/^deepmsg-.*rev = "([0-9a-f]+)".*/\1/p' Cargo.toml | sort -u)
+          if [ "$(printf '%s\n' "$revs" | grep -c .)" -ne 1 ]; then
+            echo "::error::Cargo.toml does not pin every deepmsg dependency to one rev: [$revs]"
+            exit 1
+          fi
+          echo "deepmsg pin: $revs"
+          echo "rev=$revs" >> "$GITHUB_OUTPUT"
+
+      # A full clone (the repository is small) so the pinned commit, which may
+      # be any ancestor of the default branch, is already in history.
+      - uses: actions/checkout@v4
+        with:
+          repository: deepmsg/deepmsg
+          path: deepmsg
+          fetch-depth: 0
+
+      - name: Check out the pinned deepmsg revision
+        working-directory: deepmsg
+        env:
+          PIN: ${{ steps.pin.outputs.rev }}
+        run: |
+          set -eu
+          git checkout --detach "$PIN"
+          echo "deepmsg: $(git rev-parse --short HEAD) $(git log -1 --format=%s)"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Both workspaces: the engine's dependencies and deepmsg's.
+          workspaces: ". -> target, deepmsg -> target"
+
+      - name: Build the deepmsg binaries
+        working-directory: deepmsg
+        run: |
+          cargo build \
+            -p deepmsg-archive --bin deepmsg-archiving-media-driver \
+            -p deepmsg-cluster --bin deepmsg-cluster-node \
+            -p deepmsg-cluster-tool --bin deepmsg-cluster-tool
+
+      - name: Build the engine container
+        run: cargo build -p deepbook-engine-cluster --bin engine-container
+
+      # DEEPBOOK_E2E_REQUIRED turns the harness's "no binaries, skip" path into
+      # a failure, so a green job cannot mean "ran nothing".
+      - name: Run the cluster e2e
+        env:
+          DEEPBOOK_DEEPMSG_DIR: ${{ github.workspace }}/deepmsg
+          DEEPMSG_PROFILE: debug
+          DEEPBOOK_E2E_REQUIRED: "1"
+        run: |
+          cargo test -p deepbook-gateway --test cluster_e2e -- \
+            --ignored --exact a_recovered_engine_continues_the_book --nocapture

@@ -21,6 +21,10 @@ The design asks M5 to measure batching and to document how much a crash can
 lose. It also needs a client-side RTT table that is not distorted by
 coordinated omission.
 
+The bullet points above are the WSL2 development machine. On the Linux bench
+machine the M1 policy keeps up with the same offered rate and the difference
+shows in the tail instead; "Consequences" carries that measurement.
+
 ## Decision
 
 1. **`SyncPolicy` is explicit and default-preserving.** `deepbook_fix::journal`

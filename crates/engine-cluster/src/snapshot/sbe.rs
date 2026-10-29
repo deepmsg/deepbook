@@ -52,6 +52,29 @@ const SLOTS_BLOCK_V1: usize = 83;
 const BIDS_BLOCK: usize = 24;
 const ASKS_BLOCK: usize = 24;
 
+/// The group block lengths in wire order: killed accounts, open orders, the
+/// idempotency window, the free list, slots, bids and asks.
+const EXPECTED_BLOCKS_V1: [usize; 7] = [
+    KILLED_ACCOUNTS_BLOCK,
+    OPEN_ORDERS_BLOCK,
+    SEEN_BLOCK,
+    FREE_BLOCK,
+    SLOTS_BLOCK_V1,
+    BIDS_BLOCK,
+    ASKS_BLOCK,
+];
+
+/// The version-2 layout: `isDay` added one byte to the slot block.
+const EXPECTED_BLOCKS_V2: [usize; 7] = [
+    KILLED_ACCOUNTS_BLOCK,
+    OPEN_ORDERS_BLOCK,
+    SEEN_BLOCK,
+    FREE_BLOCK,
+    SLOTS_BLOCK,
+    BIDS_BLOCK,
+    ASKS_BLOCK,
+];
+
 /// Encode an engine snapshot as `DBS2` + SBE.
 ///
 /// # Errors
@@ -346,20 +369,12 @@ fn validate(payload: &[u8]) -> Result<(), CodecError> {
 
     // Version 1 predates the `isDay` field, so its slot block is one byte
     // shorter. An old record stays readable; its DAY orders restore as GTC.
-    let slots_block = if version == 1 {
-        SLOTS_BLOCK_V1
+    let expected_blocks = if version == 1 {
+        EXPECTED_BLOCKS_V1
     } else {
-        SLOTS_BLOCK
+        EXPECTED_BLOCKS_V2
     };
-    for expected in [
-        KILLED_ACCOUNTS_BLOCK,
-        OPEN_ORDERS_BLOCK,
-        SEEN_BLOCK,
-        FREE_BLOCK,
-        slots_block,
-        BIDS_BLOCK,
-        ASKS_BLOCK,
-    ] {
+    for expected in expected_blocks {
         let group_block = cursor.u16()? as usize;
         let count = cursor.u32()?;
         if group_block != expected {

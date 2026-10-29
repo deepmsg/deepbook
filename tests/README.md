@@ -18,7 +18,14 @@ that need more than one component:
   `reliable=false` incremental subscription, and recovery through the
   request/response channel. The pure recovery path is
   `crates/marketdata/tests/recovery.rs`.
+- `cluster_e2e` — **exists (M4c)** at `crates/gateway/tests/cluster_e2e.rs`:
+  a real media driver, consensus module, `engine-container` and
+  `fix-gateway --cluster`, a snapshot, `SIGKILL` of the container, a restart
+  and a continuation fill through the same FIX session (epoll and io_uring).
+  `just engine-e2e` runs it locally; the `cluster-e2e` workflow runs the epoll
+  variant on pull requests and nightly against the pinned deepmsg revision.
 
-`fix_conformance`, the engine's differential/allocation tests and the market
-data recovery tests exist today; the rest are fixed layout for later
-milestones.
+`fix_conformance`, the engine's differential/allocation tests, the market data
+recovery tests (`crates/marketdata/tests/recovery.rs`), the FIX session
+recovery test (`crates/fix/tests/session_recovery.rs`) and the cluster e2e
+exist today; the replay harness is still layout.

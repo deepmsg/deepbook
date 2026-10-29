@@ -226,10 +226,17 @@ impl Harness {
         let tool = binary("deepmsg-cluster-tool");
         let container = engine_container_binary();
         if !driver.is_file() || !node.is_file() || !tool.is_file() || container.is_none() {
-            eprintln!(
+            let message = format!(
                 "missing deepmsg binaries under {} (build them; see crates/spike/README.md)",
                 deepmsg.display()
             );
+            // A local run skips; CI sets this so a job cannot pass by not
+            // running anything at all.
+            assert!(
+                std::env::var_os("DEEPBOOK_E2E_REQUIRED").is_none(),
+                "{message}, and DEEPBOOK_E2E_REQUIRED is set"
+            );
+            eprintln!("{message}");
             return None;
         }
 

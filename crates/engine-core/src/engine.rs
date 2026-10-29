@@ -189,27 +189,57 @@ impl Engine {
     fn new_order(&mut self, order: &NewOrder, sink: &mut impl EventSink) {
         if let Some(seen) = self.ids.get(order.account, order.cl_ord_id) {
             let header = self.header();
-            self.emit_report(
-                sink,
-                ExecutionReportEvent {
-                    header,
-                    order_id: seen.order_id,
-                    cl_ord_id: order.cl_ord_id,
-                    account: order.account,
-                    symbol: self.config.symbol,
-                    side: order.side,
-                    exec_type: ExecType::Rejected,
-                    state: OrderState::Rejected,
-                    price: order.price,
-                    order_qty: order.qty,
-                    last_qty: 0,
-                    last_px: None,
-                    leaves_qty: 0,
-                    cum_qty: 0,
-                    avg_px: 0,
-                    reason: Some(RejectReason::DuplicateClOrdId),
-                },
-            );
+            if seen.state == SeenState::Rejected {
+                // A retry of an order that never entered the book is still a
+                // reject. The original reason is not in the window, so the
+                // duplicate reason is the honest answer.
+                self.emit_report(
+                    sink,
+                    ExecutionReportEvent {
+                        header,
+                        order_id: seen.order_id,
+                        cl_ord_id: order.cl_ord_id,
+                        account: order.account,
+                        symbol: self.config.symbol,
+                        side: order.side,
+                        exec_type: ExecType::Rejected,
+                        state: OrderState::Rejected,
+                        price: order.price,
+                        order_qty: order.qty,
+                        last_qty: 0,
+                        last_px: None,
+                        leaves_qty: 0,
+                        cum_qty: 0,
+                        avg_px: 0,
+                        reason: Some(RejectReason::DuplicateClOrdId),
+                    },
+                );
+            } else {
+                // Idempotent retry: the order was accepted, so replay the
+                // original acknowledgement. A gateway retry after a lost
+                // report must not turn a live order into a rejection.
+                self.emit_report(
+                    sink,
+                    ExecutionReportEvent {
+                        header,
+                        order_id: seen.order_id,
+                        cl_ord_id: order.cl_ord_id,
+                        account: order.account,
+                        symbol: seen.symbol,
+                        side: seen.side,
+                        exec_type: ExecType::New,
+                        state: OrderState::New,
+                        price: seen.price,
+                        order_qty: seen.qty,
+                        last_qty: 0,
+                        last_px: None,
+                        leaves_qty: seen.qty,
+                        cum_qty: 0,
+                        avg_px: 0,
+                        reason: None,
+                    },
+                );
+            }
             return;
         }
 
@@ -1644,7 +1674,7 @@ mod tests {
     }
 
     #[test]
-    fn risk_limits_and_idempotency_reject_orders() {
+    fn risk_limits_reject_orders_and_duplicates_replay_the_ack() {
         let mut config = EngineConfig {
             max_orders: 1_024,
             recent_order_window: 1_024,
@@ -1667,6 +1697,9 @@ mod tests {
         let last = last_report(&events);
         assert_eq!(Some(RejectReason::MaxOrderQty), last.reason);
 
+        // A retry of an accepted order replays the original acknowledgement
+        // instead of rejecting it (a gateway retry after a lost report must
+        // stay idempotent), and it must not add a second order to the book.
         let mut second = new_engine();
         let events = run(
             &mut second,
@@ -1691,8 +1724,15 @@ mod tests {
                 ),
             ],
         );
-        let last = last_report(&events);
-        assert_eq!(Some(RejectReason::DuplicateClOrdId), last.reason);
+        let reports = reports(&events);
+        assert_eq!(2, reports.len());
+        assert_eq!(ExecType::New, reports[0].exec_type);
+        assert_eq!(reports[0].order_id, reports[1].order_id);
+        assert_eq!(ExecType::New, reports[1].exec_type);
+        assert_eq!(OrderState::New, reports[1].state);
+        assert_eq!(5, reports[1].leaves_qty);
+        assert_eq!(None, reports[1].reason);
+        assert_eq!(1, second.view().bids[0].orders.len());
     }
 
     #[test]
@@ -1996,7 +2036,8 @@ mod tests {
         assert_eq!(engine.book_hash(), restored.book_hash());
         assert_eq!(engine.view(), restored.view());
 
-        // The idempotency window came back: a reused ClOrdID is a duplicate.
+        // The idempotency window came back: a retry of the accepted S1
+        // replays its acknowledgement instead of becoming a second order.
         let mut duplicate = Vec::new();
         restored.on_command(
             &limit(
@@ -2011,10 +2052,10 @@ mod tests {
             99,
             &mut duplicate,
         );
-        assert_eq!(
-            Some(RejectReason::DuplicateClOrdId),
-            last_report(&duplicate).reason
-        );
+        let replay = last_report(&duplicate);
+        assert_eq!(ExecType::New, replay.exec_type);
+        assert_eq!(OrderState::New, replay.state);
+        assert_eq!(None, replay.reason);
 
         // The per-account kill switch came back too.
         let mut killed = Vec::new();

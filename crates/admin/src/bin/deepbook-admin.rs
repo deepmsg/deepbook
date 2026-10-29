@@ -6,11 +6,18 @@
 //!                [--cluster-id 7] [--bench-metrics target/bench/last.prom]
 //!                [--incremental-channel URI] [--incremental-stream-id N]
 //!                [--recovery-channel URI] [--recovery-stream-id N]
+//!                [--ingress-channel URI] [--ingress-stream-id N]
+//!                [--egress-channel URI] [--egress-stream-id N]
+//!                [--control-token TOKEN]
 //! ```
 //!
 //! It connects to the same driver as the cluster and the `fix-gateway`. The
 //! channels default to the engine container's defaults (`aeron:ipc`, streams
-//! 2001/2002).
+//! 2001/2002 for market data and 101/102 for the cluster, as the gateway uses).
+//!
+//! `POST /api/kill` offers a `KillSwitch` command to the cluster log; see
+//! `deepbook_admin::control` for what the endpoint can and cannot confirm, and
+//! [`kill`] for the authorization rule.
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -19,7 +26,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use deepbook_admin::{Feed, View, http, metrics, shared_view, web, ws};
+use deepbook_admin::control::{ControlConfig, KillOutcome, KillRequest};
+use deepbook_admin::{Control, Feed, View, http, metrics, shared_view, web, ws};
 use deepbook_marketdata::DeepmsgConfig;
 use deepbook_types::SymbolId;
 
@@ -51,10 +59,16 @@ fn run() -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|error| error.to_string())?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
+    let control = Control::spawn(options.control).map_err(|error| format!("control: {error}"))?;
     println!(
-        "deepbook-admin listening on http://{address} ui={} aeron={}",
+        "deepbook-admin listening on http://{address} ui={} aeron={} control={}",
         options.ui_dir.display(),
-        options.aeron_dir.display()
+        options.aeron_dir.display(),
+        if options.control_token.is_some() {
+            "token"
+        } else {
+            "loopback-only"
+        }
     );
 
     let context = Arc::new(Context {
@@ -63,6 +77,8 @@ fn run() -> Result<(), String> {
         aeron_dir: options.aeron_dir,
         cluster_id: options.cluster_id,
         bench_metrics: options.bench_metrics,
+        control,
+        control_token: options.control_token,
     });
 
     let mut feed_error: Option<Instant> = None;
@@ -101,6 +117,8 @@ struct Context {
     aeron_dir: PathBuf,
     cluster_id: i32,
     bench_metrics: Option<PathBuf>,
+    control: Control,
+    control_token: Option<String>,
 }
 
 fn handle(mut stream: TcpStream, context: &Context) {
@@ -108,7 +126,11 @@ fn handle(mut stream: TcpStream, context: &Context) {
         return;
     };
     if request.method != "GET" {
-        let _ = http::bad_request(&mut stream);
+        if request.method == "POST" && request.path == "/api/kill" {
+            kill(&mut stream, &request, context);
+        } else {
+            let _ = http::method_not_allowed(&mut stream);
+        }
         return;
     }
     match request.path.as_str() {
@@ -149,6 +171,9 @@ fn handle(mut stream: TcpStream, context: &Context) {
             let bench = read_bench(context);
             let _ = http::json(&mut stream, &metrics::latency_json(bench.as_deref()));
         }
+        "/api/control" => {
+            let _ = http::json(&mut stream, &context.control.status().to_json());
+        }
         path => {
             if let Some(asset) = web::asset(&context.ui_dir, path) {
                 let _ = http::ok(&mut stream, asset.content_type, &asset.body);
@@ -157,6 +182,102 @@ fn handle(mut stream: TcpStream, context: &Context) {
             }
         }
     }
+}
+
+/// `POST /api/kill`: offer one `KillSwitch` to the cluster log.
+///
+/// The body is `{}`/empty for the whole market or `{"account": N}` for one
+/// account. Nothing the engine does is immediate — the command waits in the
+/// log like any other — and there is no acknowledgement event, so a `202`
+/// means "queued for the cluster", not "applied".
+///
+/// # Authorization
+///
+/// With `--control-token` the request must carry `Authorization: Bearer
+/// <token>`. Without one, only a loopback peer is accepted: a dashboard bound
+/// to `0.0.0.0` for the monitoring profile cannot be used to kill the market
+/// from another host by accident. The comparison is not constant-time; the
+/// token is a demo-grade guard for a trusted network, not an authentication
+/// system (the admin serves plain HTTP).
+fn kill(stream: &mut TcpStream, request: &http::Request, context: &Context) {
+    if !authorized(stream, request, context) {
+        let _ = http::respond_json(
+            stream,
+            403,
+            "Forbidden",
+            &json_error("the kill switch needs a loopback peer or the --control-token"),
+        );
+        return;
+    }
+    let Ok(body) = std::str::from_utf8(&request.body) else {
+        let _ = http::respond_json(
+            stream,
+            400,
+            "Bad Request",
+            &json_error("the body is not UTF-8"),
+        );
+        return;
+    };
+    let kill = match KillRequest::from_body(body) {
+        Ok(kill) => kill,
+        Err(error) => {
+            let _ = http::respond_json(stream, 400, "Bad Request", &json_error(&error));
+            return;
+        }
+    };
+    let (status, reason, body) = match context.control.kill(kill) {
+        KillOutcome::Queued => (
+            202,
+            "Accepted",
+            format!(
+                "{{\"status\":\"queued\",{}}}",
+                match kill {
+                    KillRequest::All => "\"scope\":\"all\"".to_owned(),
+                    KillRequest::Account(account) => format!("\"account\":{account}"),
+                }
+            ),
+        ),
+        KillOutcome::Full => (
+            503,
+            "Service Unavailable",
+            json_error("the control queue is full"),
+        ),
+        KillOutcome::Closed => (
+            503,
+            "Service Unavailable",
+            json_error("the control thread is gone"),
+        ),
+    };
+    let _ = http::respond_json(stream, status, reason, &body);
+}
+
+fn authorized(stream: &TcpStream, request: &http::Request, context: &Context) -> bool {
+    let loopback = stream.peer_addr().is_ok_and(|peer| peer.ip().is_loopback());
+    allowed(
+        loopback,
+        request.header("authorization"),
+        context.control_token.as_deref(),
+    )
+}
+
+/// Whether a kill request may proceed: the configured token when there is
+/// one, otherwise a loopback peer.
+fn allowed(loopback: bool, presented: Option<&str>, token: Option<&str>) -> bool {
+    match token {
+        Some(token) => presented
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|value| value == token),
+        None => loopback,
+    }
+}
+
+/// A JSON error object whose message is safe inside a string.
+fn json_error(message: &str) -> String {
+    let cleaned: String = message.chars().filter(|char| !char.is_control()).collect();
+    format!(
+        "{{\"error\":\"{}\"}}",
+        cleaned.replace('\\', "\\\\").replace('"', "\\\"")
+    )
 }
 
 fn read_bench(context: &Context) -> Option<String> {
@@ -225,6 +346,8 @@ struct Options {
     cluster_id: i32,
     bench_metrics: Option<PathBuf>,
     market_data: DeepmsgConfig,
+    control: ControlConfig,
+    control_token: Option<String>,
 }
 
 impl Options {
@@ -241,6 +364,11 @@ impl Options {
         let mut incremental_stream_id = 2001;
         let mut recovery = "aeron:ipc".to_owned();
         let mut recovery_stream_id = 2002;
+        let mut ingress_channel = "aeron:ipc".to_owned();
+        let mut ingress_stream_id = 101;
+        let mut egress_channel = "aeron:ipc".to_owned();
+        let mut egress_stream_id = 102;
+        let mut control_token: Option<String> = None;
 
         let arguments: Vec<String> = std::env::args().skip(1).collect();
         let mut index = 0;
@@ -285,6 +413,19 @@ impl Options {
                         .parse()
                         .map_err(|_| "--recovery-stream-id must be a number".to_owned())?;
                 }
+                "--ingress-channel" => ingress_channel = value("--ingress-channel")?,
+                "--ingress-stream-id" => {
+                    ingress_stream_id = value("--ingress-stream-id")?
+                        .parse()
+                        .map_err(|_| "--ingress-stream-id must be a number".to_owned())?;
+                }
+                "--egress-channel" => egress_channel = value("--egress-channel")?,
+                "--egress-stream-id" => {
+                    egress_stream_id = value("--egress-stream-id")?
+                        .parse()
+                        .map_err(|_| "--egress-stream-id must be a number".to_owned())?;
+                }
+                "--control-token" => control_token = Some(value("--control-token")?),
                 "--help" | "-h" => {
                     print_usage();
                     std::process::exit(0);
@@ -306,6 +447,14 @@ impl Options {
         );
         market_data.incremental_stream_id = incremental_stream_id;
         market_data.recovery_stream_id = recovery_stream_id;
+        let control = ControlConfig {
+            aeron_dir: aeron_dir.clone(),
+            ingress_channel,
+            ingress_stream_id,
+            egress_channel,
+            egress_stream_id,
+            ..ControlConfig::new(&aeron_dir)
+        };
         Ok(Self {
             listen,
             aeron_dir,
@@ -314,6 +463,8 @@ impl Options {
             cluster_id,
             bench_metrics,
             market_data,
+            control,
+            control_token,
         })
     }
 }
@@ -324,6 +475,41 @@ fn print_usage() {
          \x20                    [--symbol N] [--ui-dir PATH] [--cluster-id N]\n\
          \x20                    [--bench-metrics PATH]\n\
          \x20                    [--incremental-channel URI] [--incremental-stream-id N]\n\
-         \x20                    [--recovery-channel URI] [--recovery-stream-id N]"
+         \x20                    [--recovery-channel URI] [--recovery-stream-id N]\n\
+         \x20                    [--ingress-channel URI] [--ingress-stream-id N]\n\
+         \x20                    [--egress-channel URI] [--egress-stream-id N]\n\
+         \x20                    [--control-token TOKEN]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_loopback_peer_may_kill_without_a_token() {
+        assert!(allowed(true, None, None));
+        assert!(!allowed(false, None, None));
+    }
+
+    #[test]
+    fn a_configured_token_is_required_from_every_peer() {
+        assert!(allowed(false, Some("Bearer s3cret"), Some("s3cret")));
+        assert!(allowed(true, Some("Bearer s3cret"), Some("s3cret")));
+        assert!(!allowed(true, None, Some("s3cret")));
+        assert!(!allowed(true, Some("Bearer wrong"), Some("s3cret")));
+        assert!(!allowed(true, Some("s3cret"), Some("s3cret")));
+        assert!(!allowed(true, Some("Basic s3cret"), Some("s3cret")));
+    }
+
+    #[test]
+    fn an_error_message_is_a_json_string() {
+        assert_eq!(
+            "{\"error\":\"a \\\"quoted\\\" word\"}",
+            json_error("a \"quoted\" word")
+        );
+        // Control characters are dropped, not escaped.
+        assert_eq!("{\"error\":\"ab\"}", json_error("a\nb"));
+        assert_eq!("{\"error\":\"c:\\\\tmp\"}", json_error("c:\\tmp"));
+    }
 }

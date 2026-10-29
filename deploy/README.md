@@ -77,6 +77,13 @@ The dashboard serves a build-free `crates/ui` page (order book, trade tape,
 benchmark RTT) over HTTP and WebSocket. `--bench-metrics` names the Prometheus
 text file `fix-bench` writes (default `target/bench/last.prom`).
 
+The page also has the kill switch: `POST /api/kill` with `{}` or
+`{"account": N}` offers a `KillSwitch` to the cluster log through the admin's
+own cluster session. With `--admin-host 0.0.0.0` a non-loopback request is
+refused unless `deepbook-admin --control-token TOKEN` is set; the dashboard
+itself has no login, so put it behind a trusted network. The engine returns no
+acknowledgement and there is no un-kill (see ADR 0008).
+
 Grafana and Prometheus are provisioned from this directory:
 
 ```bash

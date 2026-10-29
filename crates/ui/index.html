@@ -44,6 +44,20 @@
       <canvas id="chart" width="720" height="150"></canvas>
       <p class="muted" id="latency-note">run deploy/bench.sh to fill this panel</p>
     </section>
+
+    <section class="panel control">
+      <h2>Kill switch <span class="muted">stops new orders · not reversible without a restart</span></h2>
+      <div class="controls">
+        <button id="kill-all" class="danger" type="button">Kill all accounts</button>
+        <label>
+          <span>account</span>
+          <input id="kill-account" type="number" min="0" step="1" placeholder="7">
+        </label>
+        <button id="kill-one" class="danger" type="button">Kill one account</button>
+      </div>
+      <p id="kill-status">no kill submitted</p>
+      <p class="muted">submitted means the command was offered to the cluster log; the engine sends no acknowledgement</p>
+    </section>
   </main>
 
   <footer>

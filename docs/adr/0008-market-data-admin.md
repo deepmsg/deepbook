@@ -61,6 +61,18 @@ API, and its hot path must not block on a slow or absent subscriber.
    resting levels and two crossing trades before the timed run, so the UI has
    depth and a tape; the measured IOC orders never rest. This is off by
    default in the library and on in the one-click script.
+7. **The kill switch is a cluster client on its own thread.** `POST
+   /api/kill` queues a `Command::KillSwitch` for a dedicated `deepbook-control`
+   thread that owns one deepmsg cluster session (the same ingress/egress
+   streams as the gateway). The command enters the log like an order, so every
+   replica applies it at the same position and replay reaches the same state;
+   the admin drains and discards the egress it receives, so the session never
+   back-pressures the service. `GET /api/control` reports what the admin
+   submitted. The command is retried until ingress accepts it, so delivery is
+   at least once and a duplicate kill is harmless. A request from a
+   non-loopback peer needs `--control-token` (`Authorization: Bearer`): a
+   dashboard published on `0.0.0.0` for the monitoring profile must not be
+   usable as a remote kill switch by accident.
 
 ## Consequences
 
@@ -75,8 +87,15 @@ API, and its hot path must not block on a slow or absent subscriber.
   (which keeps the highest `md_seq` it has) ignore them as stale. Events at or
   below the snapshot position are not republished at all. The `log_pos`
   dedupe is therefore no longer needed for the common restart path.
-- The dashboard is read-only. The kill switch and order queries still need an
-  admin→cluster command session (a later slice), and the crate description's
-  "control plane" is not claimed yet.
-- The admin uses one thread for the feed and one per connection; that is
-  adequate for a local demo and is not a hardened multi-tenant control plane.
+- The dashboard is read-only apart from the kill switch. Order queries, a
+  cancel-all and an un-kill still need a command vocabulary the engine does
+  not have (the kill state is in the snapshot and has no counterpart), so
+  those remain a later slice.
+- A kill switch has no acknowledgement event: the endpoint reports that a
+  command was offered to the cluster, not that the engine applied it. A real
+  operator console would want an engine event and a per-operator audit trail.
+- The admin uses one thread for the feed, one for the control session and one
+  per connection; that is adequate for a local demo and is not a hardened
+  multi-tenant control plane. The control token is compared without
+  constant-time care and the admin serves plain HTTP, so it is a guard for a
+  trusted network, not an authentication system.

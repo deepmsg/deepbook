@@ -119,6 +119,74 @@ function renderLatency(latency) {
   ]);
 }
 
+// Set when a kill was refused; a polled status must not hide the reason.
+let controlError = null;
+
+function describeControl(control) {
+  const parts = [];
+  if (!control.connected) {
+    parts.push("cluster not connected (a kill waits in the queue)");
+  }
+  if (control.kill_all) {
+    parts.push("killed: all accounts");
+  }
+  if (control.killed_accounts.length > 0) {
+    parts.push(`killed: account ${control.killed_accounts.join(", ")}`);
+  }
+  if (control.pending > 0) {
+    parts.push(`${control.pending} queued`);
+  }
+  return parts.length === 0 ? "connected · no kill submitted" : parts.join(" · ");
+}
+
+async function refreshControl() {
+  try {
+    const response = await fetch("/api/control", { cache: "no-store" });
+    if (!response.ok) {
+      return;
+    }
+    const control = await response.json();
+    $("kill-status").textContent =
+      controlError === null ? describeControl(control) : controlError;
+  } catch {
+    // The next interval tries again.
+  }
+}
+
+async function kill(account) {
+  try {
+    const response = await fetch("/api/kill", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(account === null ? {} : { account }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (response.ok) {
+      controlError = null;
+      $("kill-status").textContent =
+        account === null ? "queued: all accounts" : `queued: account ${account}`;
+      refreshControl();
+    } else {
+      controlError = result.error || `refused (HTTP ${response.status})`;
+      $("kill-status").textContent = controlError;
+    }
+  } catch (error) {
+    controlError = `the admin is unreachable: ${error.message}`;
+    $("kill-status").textContent = controlError;
+  }
+}
+
+$("kill-all").addEventListener("click", () => kill(null));
+$("kill-one").addEventListener("click", () => {
+  const value = $("kill-account").value.trim();
+  if (value === "") {
+    controlError = "enter an account id";
+    $("kill-status").textContent = controlError;
+    return;
+  }
+  kill(Number(value));
+});
+
 function drawChart(bars) {
   const canvas = $("chart");
   const context = canvas.getContext("2d");
@@ -157,4 +225,7 @@ function drawChart(bars) {
 
 connect();
 refreshLatency();
+refreshControl();
 setInterval(refreshLatency, 2000);
+setInterval(refreshControl, 2000);
+

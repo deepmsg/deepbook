@@ -7,6 +7,7 @@
 //! publication's maximum payload needs; `on_start` concatenates them and
 //! restores whichever format the record carries (`DBS1` or `DBS2`; ADR 0005).
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -91,7 +92,23 @@ pub struct EngineService {
     /// subscriber already has. Live events are always after it. `-1` means
     /// "no snapshot, publish everything".
     restored_log_pos: LogPos,
+    /// Encoded events that the cluster session could not accept yet.
+    ///
+    /// An egress publication is a bounded ring: when it is full, `offer`
+    /// returns back-pressure and the event would otherwise be lost. The
+    /// engine keeps the encoded events per session and retries them on the
+    /// next callback. This is a process-local queue: a service restart drops
+    /// it (the engine log can replay the commands, and the gateway's FIX
+    /// journal covers the reports it already received).
+    pending_egress: HashMap<SessionId, VecDeque<Vec<u8>>>,
 }
+
+/// The most events queued for one cluster session. A gateway that stays
+/// back-pressured for this long is not consuming; dropping the oldest keeps
+/// the service bounded and is logged. The bound is the container's default
+/// slab capacity, so one end-of-day expiry (one cancel report and one book
+/// update per order) fits.
+const MAX_PENDING_EGRESS: usize = 65_536;
 
 impl EngineService {
     /// A fresh engine with the deployment configuration.
@@ -102,6 +119,7 @@ impl EngineService {
             engine: Engine::new(config),
             market_data: None,
             restored_log_pos: -1,
+            pending_egress: HashMap::new(),
         }
     }
 
@@ -132,6 +150,7 @@ impl EngineService {
                 incrementals: 0,
             }),
             restored_log_pos: -1,
+            pending_egress: HashMap::new(),
         })
     }
 
@@ -148,6 +167,7 @@ impl EngineService {
             engine,
             market_data: None,
             restored_log_pos: snapshot.last_log_pos,
+            pending_egress: HashMap::new(),
         })
     }
 
@@ -257,6 +277,57 @@ impl EngineService {
             }
         }
     }
+
+    /// Encode and enqueue events for one cluster session.
+    ///
+    /// The cluster's egress publication is a bounded ring; an event that does
+    /// not fit must be retried, not dropped. The queue is FIFO so the reports
+    /// reach the FIX session in event order.
+    fn queue_egress(&mut self, session: SessionId, events: &[Event]) {
+        let queue = self.pending_egress.entry(session).or_default();
+        for event in events {
+            if queue.len() >= MAX_PENDING_EGRESS {
+                queue.pop_front();
+                eprintln!(
+                    "engine: egress queue for cluster session {} is full; dropping the oldest",
+                    session.0
+                );
+            }
+            queue.push_back(encode_event(event));
+        }
+    }
+
+    /// Offer every queued event that the egress publication accepts now.
+    ///
+    /// Back pressure leaves the event for the next callback; the queue is
+    /// discarded only when `on_session_close` says the session is gone. This
+    /// runs after every command (and on the day timer once it is scheduled),
+    /// which is enough: a gateway that is not reading is also not sending
+    /// commands.
+    fn flush_egress(&mut self, cluster: &mut Cluster<'_>) {
+        if self.pending_egress.is_empty() {
+            return;
+        }
+        let sessions: Vec<SessionId> = self.pending_egress.keys().copied().collect();
+        for session in sessions {
+            let Some(queue) = self.pending_egress.get_mut(&session) else {
+                continue;
+            };
+            while let Some(payload) = queue.front() {
+                match offer_once(cluster, session, payload) {
+                    OfferOutcome::Sent => {
+                        queue.pop_front();
+                    }
+                    // Back pressure, and a session that is not visible for a
+                    // moment (a leader change): keep the event and retry. The
+                    // queue is removed explicitly on `on_session_close`; this
+                    // path must never drop a report.
+                    OfferOutcome::BackPressured => break,
+                }
+            }
+        }
+        self.pending_egress.retain(|_, queue| !queue.is_empty());
+    }
 }
 
 impl ClusteredService for EngineService {
@@ -319,10 +390,12 @@ impl ClusteredService for EngineService {
     fn on_session_close(
         &mut self,
         _cluster: &mut Cluster<'_>,
-        _session: SessionId,
+        session: SessionId,
         _timestamp: i64,
         _reason: CloseReason,
     ) -> Result<(), ContainerError> {
+        // The cluster session is gone; nothing can deliver these reports.
+        self.pending_egress.remove(&session);
         Ok(())
     }
 
@@ -337,11 +410,9 @@ impl ClusteredService for EngineService {
         let events = self.apply(payload, header.position).map_err(container)?;
         self.publish_market_data(&events);
         if let Some(session) = session {
-            for event in &events {
-                let bytes = encode_event(event);
-                offer_to_session(cluster, session, &bytes)?;
-            }
+            self.queue_egress(session, &events);
         }
+        self.flush_egress(cluster);
         Ok(())
     }
 
@@ -466,24 +537,26 @@ fn read_snapshot(
     Ok(bytes)
 }
 
-fn offer_to_session(
-    cluster: &mut Cluster<'_>,
-    session: SessionId,
-    payload: &[u8],
-) -> Result<(), ContainerError> {
-    for _ in 0..3 {
-        let offered = {
-            let Some(mut view) = cluster.session(session) else {
-                return Ok(());
-            };
-            view.offer(payload)?
-        };
-        if offered > 0 {
-            return Ok(());
-        }
-        cluster.idle(1)?;
+/// What one attempt to offer an egress record achieved.
+enum OfferOutcome {
+    /// The publication took the record.
+    Sent,
+    /// The ring is full, the session is mid-rotation, or the session is not
+    /// visible for the moment; retry later.
+    BackPressured,
+}
+
+fn offer_once(cluster: &mut Cluster<'_>, session: SessionId, payload: &[u8]) -> OfferOutcome {
+    let Some(mut view) = cluster.session(session) else {
+        return OfferOutcome::BackPressured;
+    };
+    match view.offer(payload) {
+        // A positive position means the record was appended. A negative
+        // answer is the publication's back-pressure code, not a fatal error:
+        // the event stays queued and is retried on the next callback.
+        Ok(offered) if offered > 0 => OfferOutcome::Sent,
+        Ok(_) | Err(_) => OfferOutcome::BackPressured,
     }
-    Ok(())
 }
 fn container(error: impl fmt::Display) -> ContainerError {
     ContainerError::Cluster(error.to_string())

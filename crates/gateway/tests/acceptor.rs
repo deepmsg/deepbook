@@ -1,13 +1,14 @@
 //! The acceptor over a real loopback socket: logon, one order, logout.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use deepbook_fix::ApplicationMessage;
 use deepbook_fix::codec::{MessageBuilder, MsgType, ParsedMessage, tag};
+use deepbook_fix::{ApplicationMessage, ExecType, ExecutionReport, OrdStatus, decode_application};
 use deepbook_gateway::frame::FrameDecoder;
 use deepbook_gateway::{
     CommandSink, EventSource, Gateway, GatewayConfig, SessionEvent, SessionKey,
@@ -26,6 +27,21 @@ impl CommandSink for RecordingSink {
 impl EventSource for RecordingSink {
     fn poll_event(&mut self) -> Option<SessionEvent> {
         None
+    }
+}
+
+/// An engine whose reports come from a script the test fills in.
+struct ScriptedEngine {
+    events: Arc<Mutex<VecDeque<SessionEvent>>>,
+}
+
+impl CommandSink for ScriptedEngine {
+    fn deliver(&mut self, _session: &SessionKey, _message: ApplicationMessage) {}
+}
+
+impl EventSource for ScriptedEngine {
+    fn poll_event(&mut self) -> Option<SessionEvent> {
+        self.events.lock().expect("events").pop_front()
     }
 }
 
@@ -233,6 +249,119 @@ fn an_unlogged_connection_is_closed_at_the_logon_timeout() {
             Instant::now() < deadline,
             "the gateway did not close the idle connection"
         );
+    }
+
+    drop(stream);
+    handle.join().expect("gateway thread");
+    std::fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn a_report_for_a_disconnected_session_is_sent_after_reconnect() {
+    let directory = temporary_directory("pending-report");
+    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let key = SessionKey::new("DEEPBOOK", "CLIENT");
+    let mut config = GatewayConfig::new(
+        "127.0.0.1:0".parse().expect("address"),
+        &directory,
+        "DEEPBOOK",
+        "CLIENT",
+    );
+    config.tick = Duration::from_millis(10);
+    config.logon_timeout_millis = 1_000;
+    let mut gateway = Gateway::bind(
+        config,
+        ScriptedEngine {
+            events: Arc::clone(&events),
+        },
+    )
+    .expect("bind");
+    let address = gateway.local_addr().expect("local address");
+    let handle = std::thread::spawn(move || {
+        gateway
+            .run_until(Instant::now() + Duration::from_secs(3))
+            .expect("gateway");
+    });
+
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    stream.write_all(&logon(1)).expect("logon");
+    let reply = read_frame(&mut stream);
+    assert_eq!(MsgType::Logon, reply.msg_type().expect("type"));
+
+    // Let the acceptor notice the EOF and drop the session.
+    drop(stream);
+    std::thread::sleep(Duration::from_millis(200));
+
+    // The engine commits a report while the FIX session is away.
+    events.lock().expect("events").push_back(SessionEvent {
+        session: key,
+        message: ApplicationMessage::ExecutionReport(ExecutionReport {
+            exec_id: "1-0".to_owned(),
+            order_id: "1".to_owned(),
+            cl_ord_id: "C-1".to_owned(),
+            exec_type: ExecType::New,
+            ord_status: OrdStatus::New,
+            symbol: "AAPL".to_owned(),
+            side: deepbook_types::Side::Buy,
+            order_qty: 100,
+            last_qty: None,
+            last_px: None,
+            leaves_qty: 100,
+            cum_qty: 0,
+            avg_px: 0,
+            account: None,
+            transact_time: Some("20261025-12:34:56.001".to_owned()),
+            text: None,
+        }),
+    });
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Reconnect and resume the same FIX session (the client's next
+    // outbound sequence is 2). The queued report must follow the Logon.
+    let mut stream = TcpStream::connect(address).expect("reconnect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    stream.write_all(&logon(2)).expect("second logon");
+
+    let mut decoder = FrameDecoder::new();
+    let mut frames = Vec::new();
+    let mut buffer = [0_u8; 2048];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while frames.len() < 2 {
+        while let Some(frame) = decoder.next_frame() {
+            frames.push(frame.expect("a complete frame"));
+        }
+        if frames.len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gateway did not send the queued report"
+        );
+        match stream.read(&mut buffer) {
+            Ok(0) => panic!("the gateway closed before sending the report"),
+            Ok(count) => decoder.push(&buffer[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(error) => panic!("read: {error}"),
+        }
+    }
+    assert_eq!(MsgType::Logon, frames[0].msg_type().expect("logon type"));
+    assert_eq!(
+        MsgType::ExecutionReport,
+        frames[1].msg_type().expect("report type")
+    );
+    match decode_application(&frames[1]).expect("application message") {
+        ApplicationMessage::ExecutionReport(report) => {
+            assert_eq!("1-0", report.exec_id);
+            assert_eq!("C-1", report.cl_ord_id);
+        }
+        other => panic!("expected an ExecutionReport, got {other:?}"),
     }
 
     drop(stream);

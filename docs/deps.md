@@ -17,8 +17,13 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-4bddeef
+f5d66c4
 ```
+
+The bump from `4bddeef` takes two deepmsg commits — the four-arm
+single-member cluster benchmark and a documentation pass — and changes no
+crate source, so the linked API is unchanged and the four process binaries
+hash identically.
 
 The cluster checks in `crates/spike` consume those crates and run deepmsg's
 **production binaries** from `DEEPBOOK_DEEPMSG_DIR` (default `../deepmsg`). The
@@ -72,7 +77,7 @@ The checkout itself must be at the pin. When it is a branch of your own, build
 the pin in a worktree instead — the script prints the two commands:
 
 ```bash
-git -C ~/data/trader/deepmsg worktree add --detach ~/data/trader/deepmsg-pin 4bddeef
+git -C ~/data/trader/deepmsg worktree add --detach ~/data/trader/deepmsg-pin f5d66c4
 DEEPBOOK_DEEPMSG_DIR=~/data/trader/deepmsg-pin just deps
 ```
 

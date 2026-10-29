@@ -37,6 +37,7 @@
 //! reports; publishing only from the leader needs `on_role_change`, which the
 //! pinned deepmsg does not hand a `Cluster`.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -87,18 +88,18 @@ pub fn run(config: Config) -> Result<(), String> {
         ports,
         members,
     )?;
-    let mut fix = FixClient::connect(gateway.address)?;
+    let mut session = Session::connect(gateway.address)?;
     println!("failover: fix session up at {}", gateway.address);
 
     // ---- before: a resting sell and one fill against it --------------------
-    fix.new_order("S1", 1, true, REST_QTY, REST_PRICE)?;
-    let ack = wait_report(&mut fix, "S1", |report| report.exec_type == ExecType::New)?;
+    session.order("S1", 1, true, REST_QTY)?;
+    let ack = session.wait("S1", |report| report.exec_type == ExecType::New)?;
     if ack.leaves_qty != REST_QTY || ack.ord_status != OrdStatus::New {
         return Err(format!("the resting sell was not accepted: {ack:?}"));
     }
 
-    fix.new_order("B1", 2, false, 4, REST_PRICE)?;
-    let fill = wait_report(&mut fix, "B1", |report| report.exec_type == ExecType::Trade)?;
+    session.order("B1", 2, false, 4)?;
+    let fill = session.wait("B1", |report| report.exec_type == ExecType::Trade)?;
     if fill.last_qty != Some(4) || fill.cum_qty != 4 {
         return Err(format!("the first fill is not 4 lots: {fill:?}"));
     }
@@ -126,49 +127,45 @@ pub fn run(config: Config) -> Result<(), String> {
     );
 
     // ---- after: the same session fills against the replicated book ---------
-    // The order is resent under one ClOrdID until a report arrives. An offer
-    // into the old leader's publication can be accepted and lost, so one send
-    // is not enough; the engine's idempotency window makes the resend safe.
-    let mut b2_trades = 0;
+    // The order is resent under one ClOrdID until it trades. An offer into the
+    // old leader's publication can be accepted and lost, so one send is not
+    // enough; the engine's idempotency window makes the resend safe.
     let deadline = killed_at + RECOVERY_TIMEOUT;
     let mut next_send = Instant::now();
+    let mut recovered = false;
     while Instant::now() < deadline {
         if Instant::now() >= next_send {
-            fix.new_order("B2", 3, false, 3, REST_PRICE)?;
+            session.order("B2", 3, false, 3)?;
             next_send = Instant::now() + RESEND_INTERVAL;
         }
-        let Some(report) = fix.read_report(Duration::from_millis(50))? else {
+        let Some(report) = session.read(Duration::from_millis(50))? else {
             continue;
         };
         if report.cl_ord_id == "B2" && report.exec_type == ExecType::Trade {
-            b2_trades += 1;
+            recovered = true;
             break;
         }
     }
-    let recovered = killed_at.elapsed();
-    if b2_trades != 1 {
+    let recovered_at = killed_at.elapsed();
+    if !recovered {
         return Err(format!(
-            "the post-kill buy did not fill within {RECOVERY_TIMEOUT:?} \
-             (trades={b2_trades}); the committed book did not survive the failover"
+            "the post-kill buy did not fill within {RECOVERY_TIMEOUT:?}; \
+             the committed book did not survive the failover"
         ));
     }
     println!(
         "failover: post-kill fill at {:.1}ms, session held through the failover",
-        millis(recovered)
+        millis(recovered_at)
     );
 
     // ---- and the rest of the resting order fills normally ------------------
-    fix.new_order("B3", 4, false, 3, REST_PRICE)?;
-    let mut b3_trades = 0;
+    session.order("B3", 4, false, 3)?;
     let mut s1_filled = false;
     let deadline = Instant::now() + REPORT_TIMEOUT;
-    while Instant::now() < deadline && (!s1_filled || b3_trades == 0) {
-        let Some(report) = fix.read_report(Duration::from_millis(100))? else {
+    while Instant::now() < deadline && !s1_filled {
+        let Some(report) = session.read(Duration::from_millis(100))? else {
             continue;
         };
-        if report.cl_ord_id == "B3" && report.exec_type == ExecType::Trade {
-            b3_trades += 1;
-        }
         if report.cl_ord_id == "S1" && report.ord_status == OrdStatus::Filled {
             if report.cum_qty != REST_QTY {
                 return Err(format!("S1 filled at {} not {REST_QTY}", report.cum_qty));
@@ -176,41 +173,108 @@ pub fn run(config: Config) -> Result<(), String> {
             s1_filled = true;
         }
     }
-    if b3_trades != 1 {
-        return Err(format!(
-            "the third buy produced {b3_trades} trades, not one"
-        ));
-    }
     if !s1_filled {
         return Err("the resting sell never showed Filled after the third buy".to_owned());
     }
 
-    fix.logout();
+    // ---- a quiet window, so a late duplicate would be seen ----------------
+    session.drain(Duration::from_millis(750));
+    for (cl_ord_id, expected) in [("S1", 3), ("B1", 1), ("B2", 1), ("B3", 1)] {
+        let count = session.trades(cl_ord_id);
+        if count != expected {
+            return Err(format!(
+                "{cl_ord_id} produced {count} Trade reports, expected {expected}: {:?}",
+                session.counts()
+            ));
+        }
+    }
+    println!(
+        "failover: trades S1={} B1={} B2={} B3={}",
+        session.trades("S1"),
+        session.trades("B1"),
+        session.trades("B2"),
+        session.trades("B3")
+    );
+
+    session.fix.logout();
     println!(
         "failover: ok old_leader={leader} new_leader={new_leader} \
-         elected={:.1}ms recovered={:.1}ms trades=one-per-order s1_filled=true",
+         elected={:.1}ms recovered={:.1}ms s1_filled=true",
         millis(elected),
-        millis(recovered)
+        millis(recovered_at)
     );
     Ok(())
 }
 
-/// Read reports until one for `cl_ord_id` satisfies `wanted`.
-fn wait_report(
-    fix: &mut FixClient,
-    cl_ord_id: &str,
-    wanted: impl Fn(&ExecutionReport) -> bool,
-) -> Result<ExecutionReport, String> {
-    let deadline = Instant::now() + REPORT_TIMEOUT;
-    while Instant::now() < deadline {
-        let Some(report) = fix.read_report(Duration::from_millis(100))? else {
-            continue;
-        };
-        if report.cl_ord_id == cl_ord_id && wanted(&report) {
-            return Ok(report);
+/// A FIX session that counts the `Trade` reports each `ClOrdID` produced.
+///
+/// The count is the duplicate check: the engine answers a resent order from its
+/// idempotency window, so a second send must not add a second fill.
+struct Session {
+    fix: FixClient,
+    trades: BTreeMap<String, usize>,
+}
+
+impl Session {
+    fn connect(address: SocketAddr) -> Result<Self, String> {
+        Ok(Self {
+            fix: FixClient::connect(address)?,
+            trades: BTreeMap::new(),
+        })
+    }
+
+    /// Send one limit order at the resting price.
+    fn order(&mut self, cl_ord_id: &str, account: u32, sell: bool, qty: i64) -> Result<(), String> {
+        self.fix
+            .new_order(cl_ord_id, account, sell, qty, REST_PRICE)
+    }
+
+    /// The next report, recording its trade.
+    fn read(&mut self, timeout: Duration) -> Result<Option<ExecutionReport>, String> {
+        let report = self.fix.read_report(timeout)?;
+        if let Some(report) = &report {
+            if report.exec_type == ExecType::Trade {
+                *self.trades.entry(report.cl_ord_id.clone()).or_default() += 1;
+            }
+        }
+        Ok(report)
+    }
+
+    /// Read until one report for `cl_ord_id` satisfies `wanted`.
+    fn wait(
+        &mut self,
+        cl_ord_id: &str,
+        wanted: impl Fn(&ExecutionReport) -> bool,
+    ) -> Result<ExecutionReport, String> {
+        let deadline = Instant::now() + REPORT_TIMEOUT;
+        while Instant::now() < deadline {
+            let Some(report) = self.read(Duration::from_millis(100))? else {
+                continue;
+            };
+            if report.cl_ord_id == cl_ord_id && wanted(&report) {
+                return Ok(report);
+            }
+        }
+        Err(format!("no {cl_ord_id} report before {REPORT_TIMEOUT:?}"))
+    }
+
+    /// Keep reading for `window`, so a late report is recorded.
+    fn drain(&mut self, window: Duration) {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            if self.read(Duration::from_millis(50)).is_err() {
+                return;
+            }
         }
     }
-    Err(format!("no {cl_ord_id} report before {REPORT_TIMEOUT:?}"))
+
+    fn trades(&self, cl_ord_id: &str) -> usize {
+        self.trades.get(cl_ord_id).copied().unwrap_or(0)
+    }
+
+    fn counts(&self) -> &BTreeMap<String, usize> {
+        &self.trades
+    }
 }
 
 /// The gateway as a child process, with its own log.

@@ -47,7 +47,7 @@ in a `/dev/shm` run directory, runs `fix-bench`, and tears everything down.
 ```bash
 deploy/bench.sh --rate 10000 --samples 20000 --warmup 2000
 deploy/bench.sh --journal-sync each ...    # M1's one-sync-per-message policy
-deploy/bench.sh --tick-us 50 ...           # epoll poll ceiling (default 100 ms)
+deploy/bench.sh --tick-us 50 ...           # epoll poll ceiling (default 200 µs)
 deploy/bench.sh --json ...                 # the client's JSON object
 deploy/bench.sh --backend uring ...        # io_uring gateway (default epoll)
 deploy/bench.sh --compare ...              # epoll, uring, uring, epoll (ABBA)

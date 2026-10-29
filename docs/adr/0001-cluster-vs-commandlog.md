@@ -18,14 +18,14 @@ The M0 spike exists to make this decision on evidence, not prose.
 
 **Adopt the deepmsg cluster.** The gate was four measurements; passing three of
 four adopts the cluster, otherwise the `CommandLog` publication path is used and
-the cluster integration moves behind the same seam for a later milestone. Three
-gates pass (1, 3 and 4); gate 2 is borderline on WSL2 and is carried as a
-bench-machine follow-up, not a reason to fall back.
+the cluster integration moves behind the same seam for a later milestone. All
+four gates pass: gate 2 was borderline on WSL2 and was closed on the bench
+machine on 2026-10-29 (see "Bench-machine re-run" below).
 
 | # | Gate | Instrument | Verdict |
 |---|---|---|---|
 | 1 | Rust consensus + Rust container + Rust client, single node, `echo` round trip | `cluster-spike smoke` | pass |
-| 2 | `offer → egress` p99 < 200 µs, local | HDR histogram, same machine | borderline on WSL2; bench follow-up |
+| 2 | `offer → egress` p99 < 200 µs, local | HDR histogram, same machine | pass on the bench machine — p99 9.6–12.6 µs at 50k/s, 18.2 µs at 100k/s |
 | 3 | snapshot, kill -9, restart, state hashes equal | `basic-auction` + `ClusterTool` | pass |
 | 4 | three-node leader kill, client recovers < 5 s, no duplicate fills | `cluster-spike gate4` | pass on the test configuration |
 
@@ -42,7 +42,10 @@ The measurements and their caveats are in "Spike results" below.
   deferred. The `engine-core` crate is unaffected either way because it depends
   only on `types`.
 
-## Spike results (2026-10-24 – 2026-10-25)
+## Spike results (WSL2, 2026-10-24 – 2026-10-25)
+
+Kept for the record: these are the numbers the decision was first taken on. The
+gate table and "Bench-machine re-run" below supersede gate 2.
 
 Environment: WSL2 on an Intel i7-10875H (16 logical CPUs), kernel
 6.6.87.2-microsoft-standard-WSL2, **release** profile, deepmsg `8c70972`.
@@ -107,6 +110,9 @@ client's lost-`NewLeaderEvent` behaviour above is accepted at this rev because
 the new leader serves immediately and the gateway fallback recovers the session;
 the gateway note below is part of the decision, not an open question.
 
+**2026-10-29:** gate 2 is closed on the bench machine — see the re-run at the
+end of this ADR. All four gates now pass.
+
 ### Implementation note for the gateway
 
 `AeronCluster::offer` returns `Some(Appended::EndOfLog)` when the ingress
@@ -123,3 +129,28 @@ new egress port (the client cannot refine a wildcard endpoint) and keep the
 old session until it times out. `gate4` is the reference implementation of
 that loop.
 
+## Bench-machine re-run (2026-10-29)
+
+The acceptance run behind the gate table: the same spike on the Linux bench
+machine, against the deepmsg revision `4bddeef` (the current pin; the binaries
+are the ones `just deps` stamps, see `docs/deps.md`).
+
+Environment: Intel i7-9700K (8 CPUs, no SMT), kernel 7.0.0-38-generic,
+**release** profile, deepmsg `4bddeef`. The topology, busy-spin idle strategies,
+archive sync levels and member timings are the ones described above.
+
+```bash
+DEEPBOOK_DEEPMSG_DIR=~/data/trader/deepmsg-pin \
+  cargo run --release -p deepbook-spike --bin cluster-spike -- p99 --rate 50000
+```
+
+| Gate | Result |
+|---|---|
+| 1. Rust CM + Rust container + Rust client, single node, echo | **pass** — `smoke: ok correlation=1 winner=7 best=100`; each p99 run completes 21,000 offers with every egress accounted for |
+| 2. `offer -> egress` p99 < 200 µs | **pass** — p50 2.7–2.8 µs and p99 12.6 / 9.6 / 12.0 µs over three 50k/s runs; 18.2 µs at 100k/s and 142.7 µs at 200k/s, both under the gate at twice and four times the rate. The worst 50k/s run's p99.9 is 307 µs and its max about 1.0 ms — host noise on an unpinned machine, not a queue, and 16× under the gate |
+| 3. snapshot, kill -9, restart, hashes equal | **pass** — `gate3 --bids 100`: winner=99 best=199 before the snapshot, one snapshot, `SIGKILL`, restart, `state restored (winner=99, best=199)` |
+| 4. three-node leader kill | **pass** — `gate4 --bids 100`: leader killed, new leader elected 4 083.7 ms after the kill, session told at 4 105.5 ms and egress at 4 106.7 ms, inside the 5 s gate; `bids=201 duplicates=0 reconnected=false` — the fresh-session fallback was not needed this run |
+
+**Gate 2 is closed.** The median barely moved from WSL2 (2.7 µs against
+4.5–5.4 µs); the p99 fell from 46–203 µs to 9.6–12.6 µs. The tail that made the
+gate borderline was the virtualised host, not the cluster.

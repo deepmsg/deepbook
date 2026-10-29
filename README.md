@@ -206,7 +206,7 @@ The one-click stack (driver + module + `engine-container` + `fix-gateway
 ```bash
 deploy/bench.sh --rate 10000 --samples 20000 --warmup 2000
 deploy/bench.sh --journal-sync each ...   # the M1 durability policy
-deploy/bench.sh --tick-us 50 ...          # poll ceiling; 100 ms default
+deploy/bench.sh --tick-us 50 ...          # epoll poll ceiling; 200 µs default
 ```
 
 `--journal-sync batch --journal-batch 64` (the script's default) batches the
@@ -226,26 +226,36 @@ account per arm, and prints:
 
 | backend | p50 | p90 | p99 | p99.9 | completed |
 |---|---|---|---|---|---|
-| epoll | 390 µs | 478 µs | 662 µs | 1.96 ms | 20 000 / 20 000 |
-| io_uring | 173 µs | 257 µs | 383 µs | 1.85 ms | 20 000 / 20 000 |
+| epoll | 311–312 µs | 313 µs | 339–403 µs | 1.6–6.0 ms | 20 000 / 20 000 |
+| io_uring | 112 µs | 112–113 µs | 123–175 µs | 0.6–1.2 ms | 20 000 / 20 000 |
 
-Both arms sustained 5 000 orders/s on WSL2 at a 5 k/s offered rate; the uring
-p50 is about 56% lower. The run takes about a minute because each arm waits
-out the consensus module's session timeout before the next. These are test
-numbers, not the bare-metal acceptance run.
+Both arms sustained 5 000 orders/s at a 5 k/s offered rate; the uring p50 is
+64% lower (median 112 µs against 311 µs). At this rate the epoll median is the
+uring median plus the 200 µs poll ceiling — the poll design, not the I/O path:
+at 10k/s the queue never empties and `--tick-us 50` and `--tick-us 200` give
+the same median (193 µs against 197 µs). The run takes about a minute because
+each arm waits out the consensus module's session timeout before the next.
 
-Measured on the WSL2 development machine (i7-10875H, 16 vCPU) with a 10k/s
-offered rate, 20k samples, `--tick-us 100`:
+The same stack at a 10k/s offered rate, 20k samples, default 200 µs tick:
 
 | journal policy | achieved | p50 | p99 | p99.9 |
 |---|---|---|---|---|
-| `each` (M1) | 5.5k orders/s | 1.07 ms | 1.76 ms | 1.77 ms |
-| `batch 64` | 9.8k orders/s | 0.54 ms | 1.04 ms | 8.04 ms |
+| `each` (M1) | 10.0k orders/s | 205 µs | 3.31 ms | 6.20 ms |
+| `batch 64` | 10.0k orders/s | 197 µs | 234 µs | 1.40 ms |
 
-These are a smoke check on WSL2, **not** the design's acceptance numbers;
-`deploy/bench.sh` on the bare-metal bench machine is the reproducible
-measurement. The 50k/s offered run saturates below that rate and is reported
-as a backlog, not as a throughput.
+Both policies keep up with the offered rate here, so batching buys the tail
+rather than the rate: p99 falls by 14× and p99.9 by 4.4×. (The WSL2 run of the
+same comparison also showed a throughput difference, 5.5k against 9.8k
+orders/s; it does not reproduce on this machine.) The 50k/s offered run still
+saturates below the offered rate — 45.9k orders/s with a 54 ms median backlog —
+reported as a backlog, not as a throughput.
+
+All numbers above are from the Linux bench machine (Intel i7-9700K, 8 CPUs,
+kernel 7.0.0-38-generic, `release` profile, deepmsg `4bddeef`, session
+directories on `/dev/shm`). Each run prints the machine fingerprint and the
+binary digests, and `bench.sh` refuses binaries that are not the pinned revision
+(`docs/deps.md`). The WSL2 numbers in earlier versions of this section are
+superseded.
 
 ### Dashboard and Grafana
 

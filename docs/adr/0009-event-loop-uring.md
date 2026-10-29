@@ -66,14 +66,32 @@ epoll reports readiness, io_uring reports completion.
   between arms; that is a correctness cost of measuring a restarted client
   against one consensus module.
 
-## Measured (WSL2, single node, 5k orders/s offered, 20k samples)
+## Measured (Linux bench machine, single node, 5k orders/s offered, 20k samples)
+
+Intel i7-9700K (8 CPUs), kernel 7.0.0-38-generic, `release` profile, deepmsg
+`4bddeef`, `--tick-us 200`, journal `batch 64`, session directories on
+`/dev/shm`. Two arms each, ABBA:
+
+| backend | p50 | p90 | p99 | p99.9 | completed |
+|---|---|---|---|---|---|
+| epoll | 311–312 µs | 313 µs | 339–403 µs | 1.6–6.0 ms | 20 000 / 20 000 |
+| io_uring | 112 µs | 112–113 µs | 123–175 µs | 0.6–1.2 ms | 20 000 / 20 000 |
+
+Both arms sustained 5 000 orders/s with the same journal policy. The uring p50
+is 64% lower (median 111.9 µs against 311.4 µs).
+
+The gap at this rate is the poll ceiling, not the I/O path: 311 ≈ 112 + 200 µs,
+and when the queue never empties the ceiling stops mattering — at 10k/s the
+epoll median is ~195 µs for both `--tick-us 50` and `--tick-us 200`. The
+completion API's gain is that an idle gateway is woken by the kernel as soon as
+the message is available instead of on its next tick.
+
+### Superseded (WSL2, 2026-10-25)
 
 | backend | p50 | p90 | p99 | p99.9 | completed |
 |---|---|---|---|---|---|
 | epoll | 390 µs | 478 µs | 662 µs | 1.96 ms | 20 000 / 20 000 |
 | io_uring | 173 µs | 257 µs | 383 µs | 1.85 ms | 20 000 / 20 000 |
 
-Both arms sustained 5 000 orders/s with the same journal policy
-(`batch 64`). The uring p50 is about 56% lower. These are test-machine
-numbers; `deploy/bench.sh --compare` on the bare-metal bench machine is the
-acceptance run.
+The development-machine run showed the same ordering with a smaller absolute
+gap; it is kept for the record.

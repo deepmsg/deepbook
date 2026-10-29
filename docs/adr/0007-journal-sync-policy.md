@@ -60,11 +60,19 @@ coordinated omission.
   throughput asks for `--journal-sync batch` and accepts the documented
   window; the crash story is "at most 63 unsynced reports", not "no loss".
 - The bench's numbers are client-side and include the gateway's tick and the
-  cluster round trip. On the WSL2 development machine, `batch 64` raised the
-  sustained rate from 5.5k to 9.8k orders/s at a 10k/s offered rate and cut
-  p50 from 1.07 ms to 0.54 ms. The design's p99 target is measured on the
-  bare-metal bench machine with `deploy/bench.sh`; the WSL2 numbers are a
-  smoke check, not the acceptance number.
+  cluster round trip. On the Linux bench machine (2026-10-29, deepmsg
+  `4bddeef`, `/dev/shm`, 10k/s offered, 20k samples, default 200 µs tick) both
+  policies keep up with the offered rate, so batching buys the tail rather than
+  the rate:
+
+  | journal policy | achieved | p50 | p99 | p99.9 |
+  |---|---|---|---|---|
+  | `each` (M1) | 10.0k orders/s | 205 µs | 3.31 ms | 6.20 ms |
+  | `batch 64` | 10.0k orders/s | 197 µs | 234 µs | 1.40 ms |
+
+  p99 falls by 14× and p99.9 by 4.4×. The WSL2 run of the same comparison also
+  showed a throughput difference (5.5k against 9.8k orders/s); that did not
+  reproduce here, so the claim this ADR rests on is the tail, which does.
 - `deploy/bench.sh` uses `/dev/shm` for the session directories so a tmpfs
   `fdatasync` does not dominate. A run on a physical disk is a different
   measurement and must set `BENCH_RUN_DIR` explicitly.

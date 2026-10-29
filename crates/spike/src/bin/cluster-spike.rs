@@ -5,6 +5,7 @@
 //! cluster-spike p99 [--rate N] [--samples N] [--warmup N]
 //! cluster-spike gate3 [--bids N]
 //! cluster-spike gate4 [--bids N]
+//! cluster-spike failover
 //! ```
 //!
 //! Common options: `--deepmsg-dir PATH`, `--profile release|debug`,
@@ -72,6 +73,7 @@ fn main() -> ExitCode {
         "p99" => scenarios::p99::run(config, rate, samples, warmup),
         "gate3" => scenarios::gate3::run(config, bids),
         "gate4" => scenarios::gate4::run(config, bids),
+        "failover" => scenarios::failover::run(config),
         other => {
             eprintln!("unknown command: {other}");
             usage();
@@ -103,6 +105,6 @@ fn take<T: std::str::FromStr>(args: &[String], index: &mut usize, name: &str) ->
 
 fn usage() {
     eprintln!(
-        "usage:\n  cluster-spike smoke\n  cluster-spike p99 [--rate N] [--samples N] [--warmup N]\n  cluster-spike gate3 [--bids N]\n  cluster-spike gate4 [--bids N]\n\ncommon: --deepmsg-dir PATH --profile release|debug --base-port N --keep"
+        "usage:\n  cluster-spike smoke\n  cluster-spike p99 [--rate N] [--samples N] [--warmup N]\n  cluster-spike gate3 [--bids N]\n  cluster-spike gate4 [--bids N]\n  cluster-spike failover\n\ncommon: --deepmsg-dir PATH --profile release|debug --base-port N --keep"
     );
 }

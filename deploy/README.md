@@ -105,7 +105,9 @@ quantity, trades, and the cluster's commit position/snapshot count/role.
 - A compose file for the whole stack (driver / cluster / gateway / market-data /
   admin) with the monitoring profile; today only Prometheus + Grafana are
   composed.
-- A three-node profile for the failover demo, no CPU pinning.
+- A compose or scripted three-node *deployment* profile. The failover itself is
+  checked by `just three-node` (`cluster-spike failover`), which owns its three
+  members' processes; a profile with CPU pinning and hostnames is later work.
 - Bind-core and huge-page scripts for the benchmark machine.
 - io_uring multishot accept/recv, registered buffers and optional SQPOLL;
   today the backend uses plain completion operations (ADR 0009).

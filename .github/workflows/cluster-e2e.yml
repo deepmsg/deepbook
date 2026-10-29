@@ -80,8 +80,11 @@ jobs:
           DEEPMSG_PROFILE: debug
         run: ./scripts/deepmsg-deps.sh build
 
-      - name: Build the engine container
-        run: cargo build -p deepbook-engine-cluster --bin engine-container
+      - name: Build the engine container and the gateway
+        run: |
+          cargo build -p deepbook-engine-cluster --bin engine-container \
+                      -p deepbook-gateway --bin fix-gateway \
+                      -p deepbook-spike --bin cluster-spike
 
       # DEEPBOOK_E2E_REQUIRED turns the harness's "no binaries, skip" path into
       # a failure, so a green job cannot mean "ran nothing". `check` adds the
@@ -95,3 +98,12 @@ jobs:
           ./scripts/deepmsg-deps.sh check
           cargo test -p deepbook-gateway --test cluster_e2e -- \
             --ignored --exact a_recovered_engine_continues_the_book --nocapture
+
+      # P1-3: the same three-member topology with deepbook's engine in every
+      # member and the FIX gateway as the client, and the leader killed
+      # mid-session.
+      - name: Run the three-node failover
+        env:
+          DEEPBOOK_DEEPMSG_DIR: ${{ github.workspace }}/deepmsg
+          DEEPMSG_PROFILE: debug
+        run: ./target/debug/cluster-spike failover

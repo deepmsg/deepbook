@@ -43,8 +43,19 @@ use deepmsg_cnc::file::CncFile;
 use crate::config::{Config, Ports};
 use crate::process::{d, spawn, tail, wait_for_driver_ready};
 
-/// The number of members gate 4 stands up.
+/// The number of members gate 4 and the deepbook failover run stand up.
 pub const MEMBERS: usize = 3;
+
+/// Which service every member runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Service {
+    /// deepmsg's `basic-auction` tutorial business (gates 1-4).
+    BasicAuction,
+    /// deepbook's `engine-container`: the engine, its snapshot and the FIX
+    /// command path. Market data is off, because every member would publish
+    /// its own stream from its own driver.
+    Engine,
+}
 
 /// `Cluster.Role`'s follower code, as counter 201 carries it.
 pub const ROLE_FOLLOWER: i64 = 0;
@@ -135,6 +146,7 @@ pub struct ClusterNodes {
     nodes: Vec<Node>,
     client_dirs: DirSet,
     client_driver: Option<Child>,
+    service: Service,
 }
 
 impl ClusterNodes {
@@ -144,8 +156,11 @@ impl ClusterNodes {
     ///
     /// A missing binary, a filesystem error, or a process that ends while it
     /// was coming up.
-    pub fn start(config: Config) -> Result<Self, String> {
+    pub fn start(config: Config, service: Service) -> Result<Self, String> {
         config.check_binaries()?;
+        if service == Service::Engine {
+            engine_binary()?;
+        }
         let root = config.run_root.clone();
         if root.exists() {
             std::fs::remove_dir_all(&root)
@@ -176,6 +191,7 @@ impl ClusterNodes {
             nodes,
             client_dirs,
             client_driver: None,
+            service,
         };
         cluster.start_client_driver()?;
         cluster.start_nodes()?;
@@ -301,13 +317,19 @@ impl ClusterNodes {
 
         for node in &mut self.nodes {
             let log = node.dirs.logs.join("container.log");
-            let arguments =
-                container_args(&self.config, self.ports, &node.dirs, &self.members, node.id);
-            let container = spawn(
-                &self.config.binary("deepmsg-clustered-service-container"),
-                &arguments,
-                &log,
-            )?;
+            let arguments = container_args(
+                &self.config,
+                self.ports,
+                &node.dirs,
+                &self.members,
+                node.id,
+                self.service,
+            );
+            let binary = match self.service {
+                Service::BasicAuction => self.config.binary("deepmsg-clustered-service-container"),
+                Service::Engine => engine_binary()?,
+            };
+            let container = spawn(&binary, &arguments, &log)?;
             node.container = Some(container);
         }
 
@@ -618,8 +640,50 @@ fn container_args(
     dirs: &DirSet,
     members: &str,
     member_id: usize,
+    service: Service,
 ) -> Vec<String> {
     let mut args = module_args(config, ports, dirs, members, member_id);
-    args.push(d("deepmsg.cluster.service", "basic-auction"));
+    match service {
+        Service::BasicAuction => args.push(d("deepmsg.cluster.service", "basic-auction")),
+        // Every member applies the log and would publish its own market-data
+        // stream from its own driver; the failover run observes the engine
+        // through FIX reports instead.
+        Service::Engine => args.push(d("deepbook.marketdata.enabled", false)),
+    }
     args
+}
+
+/// The deepbook engine container, from `DEEPBOOK_ENGINE_CONTAINER` or beside
+/// the running binary (cargo puts both in `target/<profile>/`).
+///
+/// # Errors
+///
+/// Neither location has an `engine-container`.
+pub fn engine_binary() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("DEEPBOOK_ENGINE_CONTAINER") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "DEEPBOOK_ENGINE_CONTAINER={} is not a file",
+            path.display()
+        ));
+    }
+    let exe = std::env::current_exe().map_err(|error| format!("current exe: {error}"))?;
+    let candidate = exe.with_file_name(format!("engine-container{}", std::env::consts::EXE_SUFFIX));
+    if candidate.is_file() {
+        Ok(candidate)
+    } else {
+        Err(format!(
+            "engine-container is not next to {}; build it:              cargo build --{} -p deepbook-engine-cluster --bin engine-container",
+            exe.display(),
+            if cfg!(debug_assertions) {
+                ""
+            } else {
+                "release "
+            }
+            .trim_end()
+        ))
+    }
 }

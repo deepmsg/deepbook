@@ -97,9 +97,17 @@ pub struct ClusterEngineConfig {
     pub aeron_dir: PathBuf,
     /// `aeron.cluster.ingress.channel`.
     pub ingress_channel: String,
+    /// `<memberId>=<endpoint>,…` for a multi-member cluster whose members own
+    /// their drivers; `None` for an IPC or self-naming channel (single node).
+    pub ingress_endpoints: Option<String>,
     /// `aeron.cluster.ingress.stream.id`.
     pub ingress_stream_id: i32,
     /// `aeron.cluster.egress.channel`.
+    ///
+    /// On a UDP channel name the endpoint: the gateway's driver is its own on a
+    /// multi-member cluster, and a session that shares an endpoint with an
+    /// older one cannot rejoin after a failover (see
+    /// [`ClusterEngine::reconnect`]).
     pub egress_channel: String,
     /// `aeron.cluster.egress.stream.id`.
     pub egress_stream_id: i32,
@@ -123,6 +131,7 @@ impl ClusterEngineConfig {
         Self {
             aeron_dir: aeron_dir.into(),
             ingress_channel: "aeron:ipc".to_owned(),
+            ingress_endpoints: None,
             ingress_stream_id: 101,
             egress_channel: "aeron:ipc".to_owned(),
             egress_stream_id: 102,
@@ -407,6 +416,12 @@ pub struct ClusterEngine {
     commands: VecDeque<PendingCommand>,
     mapping: Mapping,
     next_local_exec: u64,
+    /// Cluster sessions this engine has opened, including the first.
+    ///
+    /// The multi-member egress endpoint moves by one port per session: a fresh
+    /// session that names the endpoint of a session the cluster has not
+    /// finished reaping cannot join the new leader's publication.
+    sessions_opened: u16,
     last_keep_alive: Instant,
     reconnect_at: Option<Instant>,
 }
@@ -432,7 +447,7 @@ impl ClusterEngine {
         let mut client = Client::connect(&config.aeron_dir)
             .map_err(|error| ClusterEngineError::Driver(error.to_string()))?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
-        let session = open_session(&config, &egress, &mut client)?;
+        let session = open_session(&config, 0, &egress, &mut client)?;
         let mapping = Mapping::new(config.symbol, &config.symbol_name);
         Ok(Self {
             config,
@@ -443,6 +458,7 @@ impl ClusterEngine {
             commands: VecDeque::new(),
             mapping,
             next_local_exec: 0,
+            sessions_opened: 1,
             last_keep_alive: Instant::now(),
             reconnect_at: None,
         })
@@ -497,12 +513,22 @@ impl ClusterEngine {
         if self.reconnect_at.is_some_and(|at| now < at) {
             return;
         }
-        match open_session(&self.config, &self.egress, &mut self.client) {
+        // The offset is the number of sessions already open, so a reconnect
+        // never shares an endpoint with its predecessor. It only moves a UDP
+        // endpoint; an IPC channel is returned unchanged.
+        match open_session(
+            &self.config,
+            self.sessions_opened,
+            &self.egress,
+            &mut self.client,
+        ) {
             Ok(session) => {
                 eprintln!(
-                    "fix-gateway: cluster reconnected session={}",
-                    session.cluster_session_id()
+                    "fix-gateway: cluster reconnected session={} egress={}",
+                    session.cluster_session_id(),
+                    egress_channel_for(&self.config.egress_channel, self.sessions_opened)
                 );
+                self.sessions_opened = self.sessions_opened.saturating_add(1);
                 self.session = Some(session);
                 self.reconnect_at = None;
                 self.last_keep_alive = now;
@@ -748,13 +774,16 @@ impl EventSource for ClusterEngine {
 
 fn open_session(
     config: &ClusterEngineConfig,
+    egress_offset: u16,
     egress: &Rc<RefCell<VecDeque<EgressRecord>>>,
     client: &mut Client,
 ) -> Result<AeronCluster, ClusterEngineError> {
+    let egress_channel = egress_channel_for(&config.egress_channel, egress_offset);
     let context = AeronClusterContext::new()
         .ingress_channel(Some(&config.ingress_channel))
+        .ingress_endpoints(config.ingress_endpoints.as_deref())
         .ingress_stream_id(config.ingress_stream_id)
-        .egress_channel(Some(&config.egress_channel))
+        .egress_channel(Some(&egress_channel))
         .egress_stream_id(config.egress_stream_id)
         .message_timeout_ns(config.message_timeout_ns)
         .new_leader_timeout_ns(config.new_leader_timeout_ns)
@@ -762,6 +791,37 @@ fn open_session(
         .egress_listener(Box::new(EgressQueue(Rc::clone(egress))));
     AeronCluster::connect(context, client)
         .map_err(|error| ClusterEngineError::Connect(error.to_string()))
+}
+
+/// The egress channel for the `offset`-th session after the first.
+///
+/// A UDP egress endpoint names the port the gateway's own driver receives on.
+/// The cluster keeps a closed session until its timeout, so a fresh session
+/// that reuses the endpoint cannot join the new leader's publication; moving
+/// the port by one per session is the process-level equivalent of the
+/// reference's `Cluster.Role` reconnect, which lets the driver allocate a
+/// unique endpoint. IPC and endpoint-less channels come back unchanged.
+fn egress_channel_for(channel: &str, offset: u16) -> String {
+    if offset == 0 {
+        return channel.to_owned();
+    }
+    let Some(index) = channel.find("endpoint=") else {
+        return channel.to_owned();
+    };
+    let (head, tail) = channel.split_at(index + "endpoint=".len());
+    // The endpoint is the last `host:port` in the string; channel parameters
+    // after it (`|term-length=…`) are kept verbatim.
+    let Some((host, rest)) = tail.rsplit_once(':') else {
+        return channel.to_owned();
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    let Ok(port) = digits.parse::<u16>() else {
+        return channel.to_owned();
+    };
+    let Some(port) = port.checked_add(offset) else {
+        return channel.to_owned();
+    };
+    format!("{head}{host}:{port}{}", &rest[digits.len()..])
 }
 
 fn parse_account(value: Option<&str>) -> Result<(AccountId, String), String> {
@@ -1154,5 +1214,44 @@ mod tests {
         assert!(parse_account(Some("")).is_err());
         assert!(parse_account(Some("-1")).is_err());
         assert!(parse_account(Some("1.5")).is_err());
+    }
+
+    #[test]
+    fn the_first_session_keeps_the_configured_egress() {
+        let channel = "aeron:udp?term-length=128k|endpoint=localhost:25030";
+        assert_eq!(channel, egress_channel_for(channel, 0));
+    }
+
+    #[test]
+    fn each_session_moves_the_udp_egress_port() {
+        assert_eq!(
+            "aeron:udp?term-length=128k|endpoint=localhost:25031",
+            egress_channel_for("aeron:udp?term-length=128k|endpoint=localhost:25030", 1)
+        );
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:25032|term-length=128k",
+            egress_channel_for("aeron:udp?endpoint=localhost:25030|term-length=128k", 2)
+        );
+        assert_eq!(
+            "aeron:udp?endpoint=127.0.0.1:25041|term-length=128k",
+            egress_channel_for("aeron:udp?endpoint=127.0.0.1:25030|term-length=128k", 11)
+        );
+    }
+
+    #[test]
+    fn a_channel_that_names_no_udp_endpoint_is_unchanged() {
+        for channel in [
+            "aeron:ipc",
+            "aeron:ipc?term-length=64k",
+            "aeron:udp?term-length=128k",
+        ] {
+            assert_eq!(channel, egress_channel_for(channel, 3));
+        }
+        // A port that would not fit in the channel is left alone rather than
+        // silently wrapped.
+        assert_eq!(
+            "aeron:udp?endpoint=localhost:65535",
+            egress_channel_for("aeron:udp?endpoint=localhost:65535", 1)
+        );
     }
 }

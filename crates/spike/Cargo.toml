@@ -16,6 +16,7 @@ path = "src/bin/cluster-spike.rs"
 workspace = true
 
 [dependencies]
+deepbook-fix = { path = "../fix" }
 deepmsg-client = { workspace = true }
 deepmsg-codec = { workspace = true }
 deepmsg-core = { workspace = true }

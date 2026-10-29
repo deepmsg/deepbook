@@ -95,6 +95,12 @@ just check
 
 Toolchain: Rust 1.95.0 (`rust-toolchain.toml`), edition 2024, MSRV 1.85.
 
+The cluster tests and the benchmark also start deepmsg's binaries as processes.
+`just deps` builds them from the revision `Cargo.toml` pins and records it in a
+stamp that `bench.sh` and the e2e check, so a local measurement is the pinned
+deepmsg rather than whatever was last built in the checkout (`docs/deps.md`).
+The unit tests need nothing extra.
+
 ## Run the FIX gateway
 
 ```bash
@@ -118,8 +124,8 @@ FIX client ──TCP──▶ fix-gateway --cluster ──▶ cluster ingress �
                          └──── cluster egress ◀─────┘
 ```
 
-With the deepmsg binaries built (see
-[`crates/spike/README.md`](crates/spike/README.md)) and a driver + single-node
+With the deepmsg binaries built (`just deps`, which builds the revision
+`Cargo.toml` pins and stamps it; see `docs/deps.md`) and a driver + single-node
 cluster already running in `-Daeron.dir`:
 
 ```bash

@@ -15,6 +15,16 @@ test:
 
 check: fmt-check clippy test
 
+# Build the four deepmsg binaries the process tests start, from the revision
+# Cargo.toml pins, and stamp them (scripts/deepmsg-deps.sh).
+deps:
+    ./scripts/deepmsg-deps.sh build
+
+# Fail unless those binaries are the pinned revision. bench.sh and engine-e2e
+# run it themselves.
+deps-check:
+    ./scripts/deepmsg-deps.sh check
+
 fix-conformance:
     ./tests/fix_conformance/run.sh
 
@@ -24,7 +34,7 @@ marketdata-loss:
 # M4c: driver + module + engine-container + fix-gateway, a snapshot, kill -9
 # of the engine's host, recovery, and a continuation fill. Opt-in: it starts
 # real processes and needs the deepmsg binaries.
-engine-e2e:
+engine-e2e: deps-check
     cargo build -p deepbook-engine-cluster --bin engine-container
     cargo test -p deepbook-gateway --test cluster_e2e -- --ignored --nocapture
 

@@ -36,6 +36,13 @@ nothing.
 From the deepmsg checkout named by `DEEPBOOK_DEEPMSG_DIR` (default `../deepmsg`):
 
 ```bash
+just deps
+```
+
+That builds the pinned revision and stamps it (`scripts/deepmsg-deps.sh`); the
+spike runs the same four binaries by hand when it is not going through `just`:
+
+```bash
 cargo build --release \
   -p deepmsg-archive --bin deepmsg-archiving-media-driver \
   -p deepmsg-cluster --bin deepmsg-cluster-node \

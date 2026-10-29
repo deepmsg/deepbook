@@ -168,8 +168,8 @@ mod tests {
         assert_eq!(decode(&foreign_schema), Err(CodecError::BadMagic));
 
         let mut foreign_version = bytes;
-        foreign_version[10..12].copy_from_slice(&2_u16.to_le_bytes());
-        assert_eq!(decode(&foreign_version), Err(CodecError::BadVersion(2)));
+        foreign_version[10..12].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(decode(&foreign_version), Err(CodecError::BadVersion(3)));
     }
 
     #[test]
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 32); // block length
         assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 1); // template id
         assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 200); // schema id
-        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 1); // version
+        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 2); // version
         // header + fixed block + seven group headers and entries + var-data
         let expected = 4
             + 8
@@ -195,7 +195,7 @@ mod tests {
             + 6
             + 4 * snapshot.book.free.len()
             + 6
-            + 83 * snapshot.book.slots.len()
+            + 84 * snapshot.book.slots.len()
             + 6
             + 24 * snapshot.book.bids.len()
             + 6
@@ -241,6 +241,7 @@ mod tests {
                     side: Side::Buy,
                     state: OrderState::Partial,
                     is_market: false,
+                    is_day: false,
                     cl_ord_id: cl("N1"),
                 }],
                 generations: vec![0, 1, 2],

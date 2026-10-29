@@ -233,6 +233,29 @@ impl MarketDataService {
         self.book.snapshot(self.last_md_seq)
     }
 
+    /// Replace the mirrored levels with `snapshot`, keeping this service's
+    /// sequence.
+    ///
+    /// Used after restoring the engine from a cluster snapshot: the engine's
+    /// book comes back, but this service's mirror does not. The snapshot is a
+    /// `marketdata::Snapshot` built from the restored engine view; its
+    /// `md_seq` is ignored because the market-data sequence is this service's,
+    /// not the engine's.
+    ///
+    /// # Errors
+    ///
+    /// The snapshot belongs to another symbol.
+    pub fn install_snapshot(&mut self, snapshot: &Snapshot) -> Result<(), MarketDataError> {
+        if snapshot.symbol != self.config.symbol {
+            return Err(MarketDataError::WrongSymbol {
+                expected: self.config.symbol,
+                actual: snapshot.symbol,
+            });
+        }
+        self.book.install(snapshot);
+        Ok(())
+    }
+
     /// Answer a recovery request.
     ///
     /// A request with `last_md_seq == 0` (a subscriber without a base) or one
@@ -277,12 +300,47 @@ impl MarketDataService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Level;
 
     fn service() -> MarketDataService {
         MarketDataService::new(ServiceConfig {
             symbol: 1,
             recent_capacity: 4,
         })
+    }
+
+    #[test]
+    fn an_installed_snapshot_replaces_the_levels_and_keeps_the_sequence() {
+        let mut service = MarketDataService::with_sequence(
+            ServiceConfig {
+                symbol: 1,
+                recent_capacity: 4,
+            },
+            42,
+        );
+        service.on_book_update(43, Side::Sell, 100, 10).expect("43");
+        let restored = Snapshot {
+            md_seq: 0,
+            symbol: 1,
+            bids: vec![Level { price: 99, qty: 5 }],
+            asks: vec![Level { price: 101, qty: 7 }],
+        };
+        service.install_snapshot(&restored).expect("install");
+        assert_eq!(43, service.last_md_seq());
+        let snapshot = service.snapshot();
+        assert_eq!(43, snapshot.md_seq);
+        assert_eq!(restored.bids, snapshot.bids);
+        assert_eq!(restored.asks, snapshot.asks);
+        assert_eq!(
+            Err(MarketDataError::WrongSymbol {
+                expected: 1,
+                actual: 2
+            }),
+            service.install_snapshot(&Snapshot {
+                symbol: 2,
+                ..restored
+            })
+        );
     }
 
     #[test]

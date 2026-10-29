@@ -7,13 +7,14 @@
 //! publication's maximum payload needs; `on_start` concatenates them and
 //! restores whichever format the record carries (`DBS1` or `DBS2`; ADR 0005).
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use deepbook_engine_core::wire::{decode_command, encode_event};
-use deepbook_engine_core::{Engine, EngineConfig, EngineSnapshot, Event};
+use deepbook_engine_core::wire::{decode_command, encode_command, encode_event};
+use deepbook_engine_core::{Command, Engine, EngineConfig, EngineSnapshot, Event};
 use deepbook_marketdata::{
-    DeepmsgConfig, DeepmsgIncrementalPublisher, MarketDataService,
+    DeepmsgConfig, DeepmsgIncrementalPublisher, Level, MarketDataService,
     ServiceConfig as MarketServiceConfig, Snapshot,
 };
 use deepbook_types::{LogPos, Seq};
@@ -83,7 +84,48 @@ pub struct EngineService {
     config: EngineConfig,
     engine: Engine,
     market_data: Option<MarketDataState>,
+    /// The log position of the snapshot this service was restored from.
+    ///
+    /// The cluster replays the commands after that position into the service.
+    /// Events at or below it are already reflected in the mirror seeded from
+    /// the restored engine, so republishing them would duplicate data the
+    /// subscriber already has. Live events are always after it. `-1` means
+    /// "no snapshot, publish everything".
+    restored_log_pos: LogPos,
+    /// Encoded events that the cluster session could not accept yet.
+    ///
+    /// An egress publication is a bounded ring: when it is full, `offer`
+    /// returns back-pressure and the event would otherwise be lost. The
+    /// engine keeps the encoded events per session and retries them on the
+    /// next callback. This is a process-local queue: a service restart drops
+    /// it (the engine log can replay the commands, and the gateway's FIX
+    /// journal covers the reports it already received).
+    pending_egress: HashMap<SessionId, VecDeque<Vec<u8>>>,
+    /// The cluster sessions currently open, in open order.
+    ///
+    /// A command that originates in the service itself (the day-expiry
+    /// command) has no originating session; its reports go to every open
+    /// session. With one FIX peer per gateway (ADR 0006) that is the one
+    /// gateway; multi-peer routing is a later slice.
+    sessions: Vec<SessionId>,
+    /// Whether a day-expiry timer is armed.
+    expiry_scheduled: bool,
 }
+
+/// The most events queued for one cluster session. A gateway that stays
+/// back-pressured for this long is not consuming; dropping the oldest keeps
+/// the service bounded and is logged. The bound is the container's default
+/// slab capacity, so one end-of-day expiry (one cancel report and one book
+/// update per order) fits.
+const MAX_PENDING_EGRESS: usize = 65_536;
+
+/// Timer correlation ids.
+const EXPIRY_TIMER: i64 = 1;
+const EXPIRY_RETRY_TIMER: i64 = 2;
+/// Nanoseconds in a day; the expiry deadline is the next UTC midnight.
+const DAY_NANOS: i64 = 86_400_000_000_000;
+/// How long to wait before retrying an expiry command the ingress refused.
+const EXPIRY_RETRY_NANOS: i64 = 1_000_000_000;
 
 impl EngineService {
     /// A fresh engine with the deployment configuration.
@@ -93,6 +135,10 @@ impl EngineService {
             config,
             engine: Engine::new(config),
             market_data: None,
+            restored_log_pos: -1,
+            pending_egress: HashMap::new(),
+            sessions: Vec::new(),
+            expiry_scheduled: false,
         }
     }
 
@@ -122,6 +168,10 @@ impl EngineService {
                 recent_capacity: market.recent_capacity,
                 incrementals: 0,
             }),
+            restored_log_pos: -1,
+            pending_egress: HashMap::new(),
+            sessions: Vec::new(),
+            expiry_scheduled: false,
         })
     }
 
@@ -137,6 +187,10 @@ impl EngineService {
             config,
             engine,
             market_data: None,
+            restored_log_pos: snapshot.last_log_pos,
+            pending_egress: HashMap::new(),
+            sessions: Vec::new(),
+            expiry_scheduled: false,
         })
     }
 
@@ -208,6 +262,13 @@ impl EngineService {
             ..
         } = market;
         for event in events {
+            // Commands replayed after the snapshot were already reflected in
+            // the engine state that seeded the mirror; publishing them again
+            // would duplicate trades on the tape and advance `md_seq` for
+            // data the subscriber already has.
+            if event.header().log_pos <= self.restored_log_pos {
+                continue;
+            }
             let seq = service.last_md_seq() + 1;
             let incremental = match event {
                 Event::BookUpdate(update) => {
@@ -239,6 +300,76 @@ impl EngineService {
             }
         }
     }
+
+    /// Encode and enqueue events for one cluster session.
+    ///
+    /// The cluster's egress publication is a bounded ring; an event that does
+    /// not fit must be retried, not dropped. The queue is FIFO so the reports
+    /// reach the FIX session in event order.
+    fn queue_egress(&mut self, session: SessionId, events: &[Event]) {
+        let queue = self.pending_egress.entry(session).or_default();
+        for event in events {
+            if queue.len() >= MAX_PENDING_EGRESS {
+                queue.pop_front();
+                eprintln!(
+                    "engine: egress queue for cluster session {} is full; dropping the oldest",
+                    session.0
+                );
+            }
+            queue.push_back(encode_event(event));
+        }
+    }
+
+    /// Offer every queued event that the egress publication accepts now.
+    ///
+    /// Back pressure leaves the event for the next callback; the queue is
+    /// discarded only when `on_session_close` says the session is gone. This
+    /// runs after every command (and on the day timer once it is scheduled),
+    /// which is enough: a gateway that is not reading is also not sending
+    /// commands.
+    fn flush_egress(&mut self, cluster: &mut Cluster<'_>) {
+        if self.pending_egress.is_empty() {
+            return;
+        }
+        let sessions: Vec<SessionId> = self.pending_egress.keys().copied().collect();
+        for session in sessions {
+            let Some(queue) = self.pending_egress.get_mut(&session) else {
+                continue;
+            };
+            while let Some(payload) = queue.front() {
+                match offer_once(cluster, session, payload) {
+                    OfferOutcome::Sent => {
+                        queue.pop_front();
+                    }
+                    // Back pressure, and a session that is not visible for a
+                    // moment (a leader change): keep the event and retry. The
+                    // queue is removed explicitly on `on_session_close`; this
+                    // path must never drop a report.
+                    OfferOutcome::BackPressured => break,
+                }
+            }
+        }
+        self.pending_egress.retain(|_, queue| !queue.is_empty());
+    }
+
+    /// Offer the end-of-day command as a service message.
+    ///
+    /// The command goes through the log, so a replica that was not the leader
+    /// applies the same expiries at the same position. A refused offer is
+    /// retried on a short timer rather than forcing the expiry inline.
+    fn request_expiry(&mut self, cluster: &mut Cluster<'_>, timestamp: i64) {
+        let offered = matches!(
+            cluster.offer(&encode_command(&Command::ExpireDayOrders)),
+            Ok(position) if position > 0
+        );
+        if !offered {
+            eprintln!("engine: day expiry was not accepted; retrying");
+            let _ = cluster.schedule_timer(
+                EXPIRY_RETRY_TIMER,
+                timestamp.saturating_add(EXPIRY_RETRY_NANOS),
+            );
+        }
+    }
 }
 
 impl ClusteredService for EngineService {
@@ -251,6 +382,9 @@ impl ClusteredService for EngineService {
             let bytes = read_snapshot(cluster, reader)?;
             let (decoded, market_seq) = decode_service_snapshot(&bytes).map_err(container)?;
             self.engine = Engine::restore(self.config, &decoded).map_err(container)?;
+            self.restored_log_pos = decoded.last_log_pos;
+            let restored_book =
+                market_snapshot_from_engine(&self.engine, market_seq.unwrap_or_default());
             if let Some(market) = self.market_data.as_mut() {
                 if let Some(seq) = market_seq {
                     market.service = MarketDataService::with_sequence(
@@ -260,6 +394,11 @@ impl ClusteredService for EngineService {
                         },
                         seq,
                     );
+                }
+                // The engine snapshot carries the book but not the market-data
+                // mirror; seed the mirror before the first snapshot is served.
+                if let Err(error) = market.service.install_snapshot(&restored_book) {
+                    eprintln!("engine: market data restore: {error}");
                 }
                 let snapshot = market.service.snapshot();
                 if let Ok(mut cell) = market.snapshot.lock() {
@@ -284,19 +423,25 @@ impl ClusteredService for EngineService {
     fn on_session_open(
         &mut self,
         _cluster: &mut Cluster<'_>,
-        _session: SessionId,
+        session: SessionId,
         _timestamp: i64,
     ) -> Result<(), ContainerError> {
+        if !self.sessions.contains(&session) {
+            self.sessions.push(session);
+        }
         Ok(())
     }
 
     fn on_session_close(
         &mut self,
         _cluster: &mut Cluster<'_>,
-        _session: SessionId,
+        session: SessionId,
         _timestamp: i64,
         _reason: CloseReason,
     ) -> Result<(), ContainerError> {
+        // The cluster session is gone; nothing can deliver these reports.
+        self.pending_egress.remove(&session);
+        self.sessions.retain(|open| *open != session);
         Ok(())
     }
 
@@ -304,27 +449,59 @@ impl ClusteredService for EngineService {
         &mut self,
         cluster: &mut Cluster<'_>,
         session: Option<SessionId>,
-        _timestamp: i64,
+        timestamp: i64,
         payload: &[u8],
         header: &LogHeader,
     ) -> Result<(), ContainerError> {
+        // The first command after a start (or a leader change) arms the
+        // day-expiry timer. `on_start` has no cluster time to compute a
+        // deadline, and a follower must not arm it.
+        if !self.expiry_scheduled
+            && timestamp > 0
+            && matches!(
+                cluster.schedule_timer(EXPIRY_TIMER, next_midnight(timestamp)),
+                Ok(true)
+            )
+        {
+            self.expiry_scheduled = true;
+        }
+
         let events = self.apply(payload, header.position).map_err(container)?;
         self.publish_market_data(&events);
-        if let Some(session) = session {
-            for event in &events {
-                let bytes = encode_event(event);
-                offer_to_session(cluster, session, &bytes)?;
+        match session {
+            Some(session) => self.queue_egress(session, &events),
+            // A service-originated command (the day expiry) has no originating
+            // session; its reports go to every open session.
+            None => {
+                let targets = self.sessions.clone();
+                for target in targets {
+                    self.queue_egress(target, &events);
+                }
             }
         }
+        self.flush_egress(cluster);
         Ok(())
     }
 
     fn on_timer_event(
         &mut self,
-        _cluster: &mut Cluster<'_>,
-        _correlation_id: i64,
-        _timestamp: i64,
+        cluster: &mut Cluster<'_>,
+        correlation_id: i64,
+        timestamp: i64,
     ) -> Result<(), ContainerError> {
+        match correlation_id {
+            EXPIRY_TIMER => {
+                // Timers are one-shot: arm tomorrow's before doing any work.
+                self.expiry_scheduled = matches!(
+                    cluster.schedule_timer(EXPIRY_TIMER, next_midnight(timestamp)),
+                    Ok(true)
+                );
+                self.request_expiry(cluster, timestamp);
+            }
+            EXPIRY_RETRY_TIMER => self.request_expiry(cluster, timestamp),
+            _ => {}
+        }
+        self.flush_egress(cluster);
         Ok(())
     }
 
@@ -351,12 +528,43 @@ impl ClusteredService for EngineService {
         Ok(())
     }
 
-    fn on_role_change(&mut self, _new_role: Role) -> Result<(), ContainerError> {
+    fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError> {
+        if new_role == Role::Leader {
+            // Timers belong to the leader. The previous leader's timer is not
+            // ours; arm a new one on the next command (the callback has no
+            // cluster handle, so it cannot schedule here).
+            self.expiry_scheduled = false;
+        }
         Ok(())
     }
 
     fn on_terminate(&mut self, _cluster: &mut Cluster<'_>) -> Result<(), ContainerError> {
         Ok(())
+    }
+}
+
+/// Build the market-data snapshot for a restored engine.
+///
+/// The engine's `BookView` is the same state market data mirrors from
+/// `BookUpdate` events, so it is the right base for a mirror that lost its
+/// levels in a restart. `md_seq` is the market-data stream's sequence, not the
+/// engine's; the caller passes the sequence the stream resumes at.
+fn market_snapshot_from_engine(engine: &Engine, md_seq: Seq) -> Snapshot {
+    let view = engine.view();
+    let levels = |levels: Vec<deepbook_engine_core::LevelView>| {
+        levels
+            .into_iter()
+            .map(|level| Level {
+                price: level.price,
+                qty: level.qty,
+            })
+            .collect()
+    };
+    Snapshot {
+        md_seq,
+        symbol: view.symbol,
+        bids: levels(view.bids),
+        asks: levels(view.asks),
     }
 }
 
@@ -415,24 +623,37 @@ fn read_snapshot(
     Ok(bytes)
 }
 
-fn offer_to_session(
-    cluster: &mut Cluster<'_>,
-    session: SessionId,
-    payload: &[u8],
-) -> Result<(), ContainerError> {
-    for _ in 0..3 {
-        let offered = {
-            let Some(mut view) = cluster.session(session) else {
-                return Ok(());
-            };
-            view.offer(payload)?
-        };
-        if offered > 0 {
-            return Ok(());
-        }
-        cluster.idle(1)?;
+/// What one attempt to offer an egress record achieved.
+enum OfferOutcome {
+    /// The publication took the record.
+    Sent,
+    /// The ring is full, the session is mid-rotation, or the session is not
+    /// visible for the moment; retry later.
+    BackPressured,
+}
+
+fn offer_once(cluster: &mut Cluster<'_>, session: SessionId, payload: &[u8]) -> OfferOutcome {
+    let Some(mut view) = cluster.session(session) else {
+        return OfferOutcome::BackPressured;
+    };
+    match view.offer(payload) {
+        // A positive position means the record was appended. A negative
+        // answer is the publication's back-pressure code, not a fatal error:
+        // the event stays queued and is retried on the next callback.
+        Ok(offered) if offered > 0 => OfferOutcome::Sent,
+        Ok(_) | Err(_) => OfferOutcome::BackPressured,
     }
-    Ok(())
+}
+
+/// The UTC midnight after `timestamp_ns`.
+///
+/// The timer timestamp is cluster time in epoch nanoseconds, so the expiry
+/// runs at the same boundary on every replica regardless of process uptime.
+fn next_midnight(timestamp_ns: i64) -> i64 {
+    if timestamp_ns <= 0 {
+        return DAY_NANOS;
+    }
+    (timestamp_ns / DAY_NANOS + 1).saturating_mul(DAY_NANOS)
 }
 
 fn container(error: impl fmt::Display) -> ContainerError {
@@ -517,6 +738,47 @@ mod tests {
             assert_eq!(first, second);
         }
         assert_eq!(service.book_hash(), restored.book_hash());
+    }
+
+    #[test]
+    fn the_expiry_deadline_is_the_next_midnight() {
+        assert_eq!(DAY_NANOS, next_midnight(0));
+        assert_eq!(DAY_NANOS, next_midnight(1));
+        assert_eq!(DAY_NANOS, next_midnight(DAY_NANOS - 1));
+        assert_eq!(2 * DAY_NANOS, next_midnight(DAY_NANOS));
+        assert_eq!(2 * DAY_NANOS, next_midnight(DAY_NANOS + 1));
+    }
+
+    #[test]
+    fn the_market_snapshot_comes_from_the_restored_book() {
+        let mut service = EngineService::new(config());
+        service
+            .apply(&encode_command(&limit(1, "S1", Side::Sell, 100, 10)), 1)
+            .expect("sell");
+        service
+            .apply(&encode_command(&limit(2, "B1", Side::Buy, 99, 4)), 2)
+            .expect("buy");
+
+        let restored = market_snapshot_from_engine(service.engine(), 7);
+        assert_eq!(7, restored.md_seq);
+        assert_eq!(1, restored.symbol);
+        assert_eq!(vec![Level { price: 99, qty: 4 }], restored.bids);
+        assert_eq!(
+            vec![Level {
+                price: 100,
+                qty: 10
+            }],
+            restored.asks
+        );
+
+        let mut market = MarketDataService::new(MarketServiceConfig {
+            symbol: 1,
+            recent_capacity: 8,
+        });
+        market.install_snapshot(&restored).expect("install");
+        assert_eq!(0, market.last_md_seq());
+        assert_eq!(restored.bids, market.snapshot().bids);
+        assert_eq!(restored.asks, market.snapshot().asks);
     }
 
     #[test]

@@ -25,6 +25,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use deepbook_fix::ApplicationMessage;
 use deepbook_fix::clock::{Clock, SystemClock};
 use deepbook_fix::frame::FrameDecoder;
 use deepbook_fix::journal::{FileJournal, FileSequenceStore, SyncPolicy};
@@ -106,7 +107,19 @@ pub struct Gateway<E: Engine> {
     key: SessionKey,
     engine: E,
     connections: HashMap<u64, Connection>,
+    /// Reports that arrived while their FIX session had no connection.
+    ///
+    /// An execution report is an engine outcome; it cannot be reconstructed
+    /// from the FIX journal, which only holds messages that reached a live
+    /// session. A short disconnect therefore queues the report and a reconnect
+    /// sends it, rather than losing it.
+    pending_reports: HashMap<SessionKey, VecDeque<ApplicationMessage>>,
 }
+
+/// The most reports queued for one disconnected session. A peer that never
+/// returns must not grow the gateway without bound; the oldest report is
+/// dropped (and logged) when the bound is reached.
+const MAX_PENDING_REPORTS: usize = 4_096;
 
 impl<E: Engine> Gateway<E> {
     /// Bind and arm the first accept.
@@ -125,6 +138,7 @@ impl<E: Engine> Gateway<E> {
             key,
             engine,
             connections: HashMap::new(),
+            pending_reports: HashMap::new(),
         })
     }
 
@@ -180,6 +194,7 @@ impl<E: Engine> Gateway<E> {
         self.io.start_accept()?;
 
         work += self.tick_sessions();
+        work += self.flush_pending_reports();
         work += self.drain_engine_events()?;
         self.close_finished();
         Ok(work)
@@ -480,7 +495,18 @@ impl<E: Engine> Gateway<E> {
                 .find(|(_, connection)| connection.key == event.session)
                 .map(|(id, _)| *id)
             else {
-                // The session disconnected before its report came back.
+                // No live connection for the session: keep the report until
+                // the peer reconnects instead of dropping an engine outcome.
+                let key = event.session.clone();
+                let queue = self.pending_reports.entry(key.clone()).or_default();
+                if queue.len() >= MAX_PENDING_REPORTS {
+                    queue.pop_front();
+                    eprintln!(
+                        "gateway: pending reports for {} are full; dropping the oldest",
+                        key.directory_name()
+                    );
+                }
+                queue.push_back(event.message);
                 continue;
             };
             let action = self
@@ -494,6 +520,51 @@ impl<E: Engine> Gateway<E> {
             }
         }
         Ok(work)
+    }
+
+    /// Send reports queued while their session was disconnected.
+    ///
+    /// Only an active (logged-on) session can take application messages; the
+    /// order within a session is preserved because the queue is FIFO and old
+    /// reports are sent before `drain_engine_events` pulls new ones.
+    fn flush_pending_reports(&mut self) -> usize {
+        if self.pending_reports.is_empty() {
+            return 0;
+        }
+        let now = SystemClock.now_millis();
+        let active: Vec<(u64, SessionKey)> = self
+            .connections
+            .iter()
+            .filter(|(_, connection)| connection.session.is_active())
+            .map(|(id, connection)| (*id, connection.key.clone()))
+            .collect();
+        let mut work = 0;
+        for (id, key) in active {
+            while let Some(message) = self
+                .pending_reports
+                .get_mut(&key)
+                .and_then(std::collections::VecDeque::pop_front)
+            {
+                let action = self
+                    .connections
+                    .get_mut(&id)
+                    .map(|connection| connection.session.send_application(&message, now));
+                match action {
+                    Some(Ok(action)) => work += self.apply_actions(id, vec![action]),
+                    Some(Err(error)) => {
+                        // Put it back: the session is not ready after all.
+                        eprintln!("gateway: pending report: {error}");
+                        if let Some(queue) = self.pending_reports.get_mut(&key) {
+                            queue.push_front(message);
+                        }
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+        self.pending_reports.retain(|_, queue| !queue.is_empty());
+        work
     }
 }
 

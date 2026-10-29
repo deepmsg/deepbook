@@ -161,6 +161,7 @@ impl Engine {
                 }
                 None => self.kill_all = true,
             },
+            Command::ExpireDayOrders => self.expire_day_orders(sink),
             Command::Snapshot => self.emit_snapshot(sink),
         }
     }
@@ -189,27 +190,57 @@ impl Engine {
     fn new_order(&mut self, order: &NewOrder, sink: &mut impl EventSink) {
         if let Some(seen) = self.ids.get(order.account, order.cl_ord_id) {
             let header = self.header();
-            self.emit_report(
-                sink,
-                ExecutionReportEvent {
-                    header,
-                    order_id: seen.order_id,
-                    cl_ord_id: order.cl_ord_id,
-                    account: order.account,
-                    symbol: self.config.symbol,
-                    side: order.side,
-                    exec_type: ExecType::Rejected,
-                    state: OrderState::Rejected,
-                    price: order.price,
-                    order_qty: order.qty,
-                    last_qty: 0,
-                    last_px: None,
-                    leaves_qty: 0,
-                    cum_qty: 0,
-                    avg_px: 0,
-                    reason: Some(RejectReason::DuplicateClOrdId),
-                },
-            );
+            if seen.state == SeenState::Rejected {
+                // A retry of an order that never entered the book is still a
+                // reject. The original reason is not in the window, so the
+                // duplicate reason is the honest answer.
+                self.emit_report(
+                    sink,
+                    ExecutionReportEvent {
+                        header,
+                        order_id: seen.order_id,
+                        cl_ord_id: order.cl_ord_id,
+                        account: order.account,
+                        symbol: self.config.symbol,
+                        side: order.side,
+                        exec_type: ExecType::Rejected,
+                        state: OrderState::Rejected,
+                        price: order.price,
+                        order_qty: order.qty,
+                        last_qty: 0,
+                        last_px: None,
+                        leaves_qty: 0,
+                        cum_qty: 0,
+                        avg_px: 0,
+                        reason: Some(RejectReason::DuplicateClOrdId),
+                    },
+                );
+            } else {
+                // Idempotent retry: the order was accepted, so replay the
+                // original acknowledgement. A gateway retry after a lost
+                // report must not turn a live order into a rejection.
+                self.emit_report(
+                    sink,
+                    ExecutionReportEvent {
+                        header,
+                        order_id: seen.order_id,
+                        cl_ord_id: order.cl_ord_id,
+                        account: order.account,
+                        symbol: seen.symbol,
+                        side: seen.side,
+                        exec_type: ExecType::New,
+                        state: OrderState::New,
+                        price: seen.price,
+                        order_qty: seen.qty,
+                        last_qty: 0,
+                        last_px: None,
+                        leaves_qty: seen.qty,
+                        cum_qty: 0,
+                        avg_px: 0,
+                        reason: None,
+                    },
+                );
+            }
             return;
         }
 
@@ -225,6 +256,7 @@ impl Engine {
             order.qty,
             order.cl_ord_id,
             order.ord_type == OrdType::Market,
+            order.time_in_force == TimeInForce::Day,
         ) else {
             self.reject_unallocated(order, RejectReason::BookFull, sink);
             return;
@@ -632,6 +664,49 @@ impl Engine {
         }
     }
 
+    /// Cancel every resting DAY order, in slab order so replay is identical.
+    ///
+    /// The expiry is a logged command, not a wall-clock decision made inside
+    /// the callback: the cluster service offers it at the trading-day
+    /// boundary, the command is sequenced, and every replica applies the same
+    /// cancels at the same log position.
+    fn expire_day_orders(&mut self, sink: &mut impl EventSink) {
+        let slots: Vec<u32> = self
+            .book
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, order)| {
+                order.is_day
+                    && order.id != EMPTY_ORDER_ID
+                    && matches!(order.state, OrderState::New | OrderState::Partial)
+            })
+            .map(|(index, _)| u32::try_from(index).expect("slot <= 2^24"))
+            .collect();
+        for slot in slots {
+            let hot = self.book.orders[slot as usize];
+            let cold = self.book.cold[slot as usize];
+            self.book.unlink(slot);
+            self.book.free(slot);
+            self.decrement_open(hot.account);
+            let header = self.header();
+            let mut event = self.report_from_hot(
+                header,
+                &hot,
+                cold.cl_ord_id,
+                ExecType::Canceled,
+                0,
+                None,
+                None,
+            );
+            event.state = OrderState::Canceled;
+            event.leaves_qty = 0;
+            self.mark(hot.account, SeenState::Canceled, hot, cold);
+            self.emit_report(sink, event);
+            self.emit_book_update(hot.side, hot.price, sink);
+        }
+    }
+
     fn replace(&mut self, request: &ReplaceOrder, sink: &mut impl EventSink) {
         let Some(seen) = self.ids.get(request.account, request.orig_cl_ord_id) else {
             self.cancel_reject_replace(
@@ -761,6 +836,7 @@ impl Engine {
             {
                 let order = &mut self.book.orders[slot as usize];
                 order.qty = request.qty;
+                order.is_day = request.time_in_force == TimeInForce::Day;
             }
             self.reduce_level(hot.side, hot.price, old_leaves - new_leaves);
             let updated = self.book.orders[slot as usize];
@@ -786,6 +862,8 @@ impl Engine {
             let order = &mut self.book.orders[slot as usize];
             order.price = request.price.unwrap_or(0);
             order.qty = request.qty;
+            order.is_market = request.ord_type == OrdType::Market;
+            order.is_day = request.time_in_force == TimeInForce::Day;
             order.state = if order.filled > 0 {
                 OrderState::Partial
             } else {
@@ -1644,7 +1722,7 @@ mod tests {
     }
 
     #[test]
-    fn risk_limits_and_idempotency_reject_orders() {
+    fn risk_limits_reject_orders_and_duplicates_replay_the_ack() {
         let mut config = EngineConfig {
             max_orders: 1_024,
             recent_order_window: 1_024,
@@ -1667,6 +1745,9 @@ mod tests {
         let last = last_report(&events);
         assert_eq!(Some(RejectReason::MaxOrderQty), last.reason);
 
+        // A retry of an accepted order replays the original acknowledgement
+        // instead of rejecting it (a gateway retry after a lost report must
+        // stay idempotent), and it must not add a second order to the book.
         let mut second = new_engine();
         let events = run(
             &mut second,
@@ -1691,8 +1772,15 @@ mod tests {
                 ),
             ],
         );
-        let last = last_report(&events);
-        assert_eq!(Some(RejectReason::DuplicateClOrdId), last.reason);
+        let reports = reports(&events);
+        assert_eq!(2, reports.len());
+        assert_eq!(ExecType::New, reports[0].exec_type);
+        assert_eq!(reports[0].order_id, reports[1].order_id);
+        assert_eq!(ExecType::New, reports[1].exec_type);
+        assert_eq!(OrderState::New, reports[1].state);
+        assert_eq!(5, reports[1].leaves_qty);
+        assert_eq!(None, reports[1].reason);
+        assert_eq!(1, second.view().bids[0].orders.len());
     }
 
     #[test]
@@ -1733,6 +1821,77 @@ mod tests {
                 .iter()
                 .any(|report| report.exec_type == ExecType::Canceled)
         );
+    }
+
+    #[test]
+    fn end_of_day_cancels_day_orders_only() {
+        let mut engine = new_engine();
+        let events = run(
+            &mut engine,
+            &[
+                limit(1, "D1", Side::Sell, 101, 5, TimeInForce::Day, false),
+                limit(
+                    2,
+                    "G1",
+                    Side::Sell,
+                    102,
+                    7,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(3, "D2", Side::Buy, 99, 4, TimeInForce::Day, false),
+                Command::ExpireDayOrders,
+            ],
+        );
+        let canceled: Vec<_> = reports(&events)
+            .into_iter()
+            .filter(|report| report.exec_type == ExecType::Canceled)
+            .collect();
+        assert_eq!(2, canceled.len());
+        assert!(canceled.iter().any(|report| report.cl_ord_id == cl("D1")));
+        assert!(canceled.iter().any(|report| report.cl_ord_id == cl("D2")));
+        assert!(!canceled.iter().any(|report| report.cl_ord_id == cl("G1")));
+
+        let view = engine.view();
+        assert!(view.bids.is_empty());
+        assert_eq!(1, view.asks.len());
+        assert_eq!(cl("G1"), view.asks[0].orders[0].cl_ord_id);
+
+        // A second expiry is a no-op.
+        let mut again = Vec::new();
+        engine.on_command(&Command::ExpireDayOrders, 5, &mut again);
+        assert!(reports(&again).is_empty());
+
+        // The DAY flag is part of the snapshot: a restored DAY order is still
+        // expired by the next end of day.
+        let mut before = new_engine();
+        run(
+            &mut before,
+            &[
+                limit(4, "D3", Side::Sell, 103, 2, TimeInForce::Day, false),
+                limit(
+                    5,
+                    "G2",
+                    Side::Sell,
+                    104,
+                    3,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+            ],
+        );
+        let snapshot = before.snapshot();
+        let mut restored = Engine::restore(test_config(), &snapshot).expect("restore");
+        let mut expired = Vec::new();
+        restored.on_command(&Command::ExpireDayOrders, 3, &mut expired);
+        let canceled: Vec<_> = reports(&expired)
+            .into_iter()
+            .filter(|report| report.exec_type == ExecType::Canceled)
+            .collect();
+        assert_eq!(1, canceled.len());
+        assert_eq!(cl("D3"), canceled[0].cl_ord_id);
+        assert_eq!(1, restored.view().asks.len());
+        assert_eq!(cl("G2"), restored.view().asks[0].orders[0].cl_ord_id);
     }
 
     #[test]
@@ -1996,7 +2155,8 @@ mod tests {
         assert_eq!(engine.book_hash(), restored.book_hash());
         assert_eq!(engine.view(), restored.view());
 
-        // The idempotency window came back: a reused ClOrdID is a duplicate.
+        // The idempotency window came back: a retry of the accepted S1
+        // replays its acknowledgement instead of becoming a second order.
         let mut duplicate = Vec::new();
         restored.on_command(
             &limit(
@@ -2011,10 +2171,10 @@ mod tests {
             99,
             &mut duplicate,
         );
-        assert_eq!(
-            Some(RejectReason::DuplicateClOrdId),
-            last_report(&duplicate).reason
-        );
+        let replay = last_report(&duplicate);
+        assert_eq!(ExecType::New, replay.exec_type);
+        assert_eq!(OrderState::New, replay.state);
+        assert_eq!(None, replay.reason);
 
         // The per-account kill switch came back too.
         let mut killed = Vec::new();

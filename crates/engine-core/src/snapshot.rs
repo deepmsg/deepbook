@@ -39,6 +39,8 @@ pub struct OrderSlotSnapshot {
     pub state: OrderState,
     /// Whether the order is a market order.
     pub is_market: bool,
+    /// Whether the order dies at the end of the trading day.
+    pub is_day: bool,
     /// Client order id.
     pub cl_ord_id: ClientOrderId,
 }

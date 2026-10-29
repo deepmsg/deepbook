@@ -22,11 +22,13 @@ API, and its hot path must not block on a slow or absent subscriber.
    than stalling the cluster service. A subscriber repairs a gap through the
    recovery channel, which answers with a snapshot at the latest sequence.
 2. **The market-data sequence is part of the restored state.** The container
-   snapshot is the `DBS1` record prefixed with a 13-byte `MDS1` record (magic,
-   version, `u64` sequence). `decode_service_snapshot` accepts both forms, so
-   a snapshot written before market data was enabled still restores (sequence
-   0). `Session`/`Engine` state and the market-data stream therefore resume
-   together.
+   snapshot is the `DBS2`/`DBS1` engine record prefixed with a 13-byte `MDS1`
+   record (magic, version, `u64` sequence). `decode_service_snapshot` accepts
+   both forms, so a snapshot written before market data was enabled still
+   restores (sequence 0). `Session`/`Engine` state and the market-data stream
+   therefore resume together. On restore the mirror is seeded from the
+   restored engine view, so a recovery snapshot has the right levels even
+   before the next command arrives.
 3. **Recovery gets its own thread and client.** A recovery request must be
    answered while the cluster is idle (no command callback to piggy-back on),
    so `engine-container` starts a `deepbook-md-recovery` thread. It owns the
@@ -65,11 +67,14 @@ API, and its hot path must not block on a slow or absent subscriber.
 - Market data is not durable: a dropped incremental costs a recovery
   snapshot. That is the intended M5 trade-off; reliability belongs to the
   cluster's log, not to the UI feed.
-- A container restart replays commands after the snapshot and republishes
-  their events with new market-data sequences. A subscriber that had already
-  consumed them sees a sequence regression and recovers with a snapshot; the
-  tape may show those trades again. M6 should dedupe on `log_pos` or suppress
-  replay publication.
+- A container restart restores the market-data sequence with the engine
+  snapshot and seeds the mirror from the restored book, so the first recovery
+  snapshot after a restart has the right levels. Commands replayed after the
+  snapshot are deterministic, so their incrementals carry the same `md_seq`
+  the subscriber already saw; the subscriber and the admin's trade tape
+  (which keeps the highest `md_seq` it has) ignore them as stale. Events at or
+  below the snapshot position are not republished at all. The `log_pos`
+  dedupe is therefore no longer needed for the common restart path.
 - The dashboard is read-only. The kill switch and order queries still need an
   admin→cluster command session (a later slice), and the crate description's
   "control plane" is not claimed yet.

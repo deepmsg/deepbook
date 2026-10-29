@@ -32,6 +32,8 @@ pub(crate) struct OrderHot {
     pub side: Side,
     pub state: OrderState,
     pub is_market: bool,
+    /// Whether the order dies at the end of the trading day.
+    pub is_day: bool,
 }
 
 impl OrderHot {
@@ -48,6 +50,7 @@ impl OrderHot {
             side: Side::Buy,
             state: OrderState::Rejected,
             is_market: false,
+            is_day: false,
         }
     }
 
@@ -179,6 +182,9 @@ impl Book {
     }
 
     /// Allocate a slot for a new order.
+    // The fields mirror the order being created; a builder would only move
+    // the same arguments.
+    #[allow(clippy::too_many_arguments)]
     pub fn allocate(
         &mut self,
         account: AccountId,
@@ -187,6 +193,7 @@ impl Book {
         qty: Qty,
         cl_ord_id: ClientOrderId,
         is_market: bool,
+        is_day: bool,
     ) -> Option<(OrderId, u32)> {
         if self.free_head == EMPTY_SLOT {
             return None;
@@ -209,6 +216,7 @@ impl Book {
             side,
             state: OrderState::New,
             is_market,
+            is_day,
         };
         self.cold[index] = OrderCold { cl_ord_id };
         Some((id, slot))
@@ -435,6 +443,7 @@ impl Book {
                     side: order.side,
                     state: order.state,
                     is_market: order.is_market,
+                    is_day: order.is_day,
                     cl_ord_id: self.cold[index].cl_ord_id,
                 });
             }
@@ -530,6 +539,7 @@ impl Book {
                 side: entry.side,
                 state: entry.state,
                 is_market: entry.is_market,
+                is_day: entry.is_day,
             };
             cold[slot_index] = OrderCold {
                 cl_ord_id: entry.cl_ord_id,

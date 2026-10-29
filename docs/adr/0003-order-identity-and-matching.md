@@ -28,7 +28,10 @@ could cancel a different order. M2 also has to settle the matching rules, the
 4. **TIF.** DAY and GTC limit remainders rest. IOC cancels the remainder.
    FOK checks the fillable quantity first and rejects the order completely if
    it cannot fill. A market order never rests: its remainder is canceled even
-   when its TIF is DAY/GTC.
+   when its TIF is DAY/GTC. DAY orders die when the cluster service offers
+   `Command::ExpireDayOrders` (a service message sequenced through the log at
+   the trading-day boundary); GTC orders are untouched. The DAY flag is part
+   of the order's snapshot state.
 5. **Post-only.** A post-only limit order that would cross is rejected; it
    never takes liquidity. Post-only with a market order is invalid.
 6. **Self-trade.** `None` allows the trade; `CancelResting` cancels the
@@ -41,10 +44,14 @@ could cancel a different order. M2 also has to settle the matching rules, the
    leaves the original untouched.
 8. **Idempotency.** The `(account, ClOrdID)` window is a fixed-capacity,
    open-addressed table with tombstones; the oldest entry is evicted at the
-   configured bound. A repeated new order is rejected with
-   `DuplicateClOrdID`; a repeated cancel of a canceled order answers the
-   terminal state. Rejected new orders are recorded too, so a retry does not
-   become a second order.
+   configured bound. A repeated new order for an order that was **accepted**
+   replays the original acknowledgement (same `OrderID`, `ExecType=New`,
+   `OrdStatus=New`) instead of rejecting it: a gateway retry after a lost
+   report must not turn a live order into a failure. A repeated new order for
+   one that was **rejected at acceptance** answers `DuplicateClOrdID`,
+   because the window does not keep the original reject reason. A repeated
+   cancel of a canceled order answers the terminal state. Rejected new orders
+   are recorded too, so a retry does not become a second order.
 9. **Risk** is a pure function checked before matching, in a fixed order:
    duplicate id, symbol, kill switch, quantity, notional, price band, fat
    finger, open-order limit, self-trade, FOK. Cancels are allowed while a kill

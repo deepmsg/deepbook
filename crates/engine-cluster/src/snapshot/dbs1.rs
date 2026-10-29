@@ -206,6 +206,8 @@ pub fn decode(bytes: &[u8]) -> Result<EngineSnapshot, CodecError> {
             side: side_from(reader.u8()?)?,
             state: state_from(reader.u8()?)?,
             is_market: reader.u8()? != 0,
+            // The legacy DBS1 record predates DAY expiry; restore as GTC.
+            is_day: false,
             cl_ord_id: reader.client_order_id()?,
         });
     }

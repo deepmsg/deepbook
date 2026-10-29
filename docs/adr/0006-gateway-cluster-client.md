@@ -83,6 +83,15 @@ thread, which matches.
 - The egress path is one FIX peer per gateway. Multi-peer routing, a
   persistent account directory and a status query that survives a gateway
   restart are M5/M6 work.
+- **A report cannot be silently dropped by a short disconnect.** The gateway
+  queues reports for a FIX session that has no connection (bounded at 4,096,
+  oldest dropped with a log line) and sends them in order after the session
+  resumes its journaled sequence. The engine also keeps a bounded per-session
+  queue for an egress publication that returns back-pressure and retries it on
+  the next callback. Both queues are process-local: a gateway or container
+  restart loses what was not yet sent. The FIX journal still covers every
+  report that reached a live session, and the client can resend its order with
+  the same `ClOrdID` (the engine replays the original acknowledgement).
 - A reconnect drives the client on the acceptor thread, so the FIX loop is
   not polling while `AeronCluster::connect` runs (bounded by the message
   timeout). Moving the connect off the acceptor thread changes the seam and

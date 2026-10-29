@@ -82,6 +82,7 @@ pub fn encode_command(command: &Command) -> Vec<u8> {
             }
         }
         Command::Snapshot => out.push(5),
+        Command::ExpireDayOrders => out.push(6),
     }
     out
 }
@@ -133,6 +134,7 @@ pub fn decode_command(bytes: &[u8]) -> Result<Command, WireError> {
             Ok(Command::KillSwitch { account })
         }
         5 => Ok(Command::Snapshot),
+        6 => Ok(Command::ExpireDayOrders),
         other => Err(WireError::UnknownKind(other)),
     }
 }
@@ -583,6 +585,7 @@ mod tests {
             Command::KillSwitch { account: None },
             Command::KillSwitch { account: Some(7) },
             Command::Snapshot,
+            Command::ExpireDayOrders,
         ];
         for command in commands {
             let bytes = encode_command(&command);

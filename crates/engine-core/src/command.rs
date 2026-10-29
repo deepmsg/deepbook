@@ -20,7 +20,7 @@ pub enum OrdType {
 /// `TimeInForce`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimeInForce {
-    /// Day (the engine treats it like GTC; expiry is a timer, M4).
+    /// Day (expires when the cluster service offers [`Command::ExpireDayOrders`]).
     Day,
     /// Good till canceled.
     GoodTillCanceled,
@@ -107,6 +107,12 @@ pub enum Command {
         /// The account, or the whole market.
         account: Option<AccountId>,
     },
+    /// End of the trading day: cancel every resting DAY order.
+    ///
+    /// The cluster service schedules this command at the session boundary and
+    /// offers it back into the log, so every replica applies the same expiries
+    /// at the same log position. GTC orders are untouched.
+    ExpireDayOrders,
     /// Take an in-memory snapshot marker and hash.
     Snapshot,
 }

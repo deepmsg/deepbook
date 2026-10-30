@@ -93,7 +93,10 @@ fn run() -> Result<(), String> {
     }
 
     let config = ServiceContainerConfig::from_properties(&properties).map_err(|error| {
-        format!("the configuration is refused: {error} (see `aeron.cluster.*` in docs/compat.md)")
+        format!(
+            "the configuration is refused: {error} \
+             (see `aeron.cluster.*` in deepmsg's `docs/compat.md`)"
+        )
     })?;
     let engine_config = engine_config(&properties)?;
     println!("{NAME}: {}", describe_risk(&engine_config.risk));

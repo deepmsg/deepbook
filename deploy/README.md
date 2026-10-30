@@ -25,17 +25,20 @@ one. See the cluster section of the top-level README.
 
 ## M0 spike
 
-The M0 spike uses deepmsg's own `echo` or `basic-auction` business, not the
-deepbook engine:
+The M0 spike uses deepmsg's own `basic-auction` business, not the deepbook
+engine. It is the `cluster-spike` binary in `crates/spike`:
 
 1. Start the archiving media driver.
 2. Start the consensus module with a one-member `aeron.cluster.members` string.
-3. Start the service container with `deepmsg.cluster.service=echo`.
+3. Start the service container with `deepmsg.cluster.service=basic-auction`.
 4. Connect a Rust cluster client; measure `offer → egress`.
 5. Take a snapshot, `kill -9` the container, restart, compare state.
 
-The script and the exact property values land with the M0 spike; this file is
-the checklist, not a claim that the script exists.
+Run the checks with `cargo run -p deepbook-spike --bin cluster-spike -- smoke`,
+`p99`, `gate3` or `gate4`. The property values are built in
+`crates/spike/src/process.rs` and `nodes.rs`; `crates/spike/README.md` records
+the gate-4 timing values and ADR 0001 records the results. There is no
+standalone M0 shell script.
 
 ## M5 benchmark (`bench.sh`)
 

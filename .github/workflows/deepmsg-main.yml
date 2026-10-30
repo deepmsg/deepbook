@@ -1,0 +1,69 @@
+# Advisory only: build deepbook against deepmsg's main branch so upstream
+# breakage is visible before the pin is bumped. Scheduled and manual runs
+# only; this workflow is not a required PR check and commits nothing.
+#
+# The manifest rewrite is confined to this job's checkout. The committed
+# `Cargo.toml` keeps pinning one `rev`, per docs/deps.md.
+name: deepmsg-main
+
+on:
+  schedule:
+    # Nightly, offset from cluster-e2e's 04:17 run.
+    - cron: "43 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deepmsg-main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read deepmsg main
+        id: deepmsg
+        run: |
+          set -eu
+          sha=$(git ls-remote https://github.com/deepmsg/deepmsg refs/heads/main | cut -f1)
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "deepmsg main: $sha"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Point the workspace at deepmsg main
+        env:
+          SHA: ${{ steps.deepmsg.outputs.sha }}
+        run: |
+          set -eu
+          before=$(grep -c '^deepmsg-.*rev = "' Cargo.toml)
+          test "$before" -eq 9
+          old=$(./scripts/deepmsg-deps.sh pin)
+          sed -i "s/rev = \"$old\"/rev = \"$SHA\"/g" Cargo.toml
+          test "$(grep -c "rev = \"$SHA\"" Cargo.toml)" -eq 9
+          if grep -q "rev = \"$old\"" Cargo.toml; then
+            echo "::error::Cargo.toml still pins $old after the rewrite"
+            exit 1
+          fi
+          git diff -- Cargo.toml
+
+      # No --locked: the checked-in lock names the pin, and this job is
+      # deliberately testing another revision.
+      - name: Build against deepmsg main (advisory)
+        run: cargo check --workspace --all-targets
+
+      - name: Summarize
+        if: always()
+        run: |
+          echo "### deepmsg main ${{ steps.deepmsg.outputs.sha }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "This run is advisory; it does not gate pull requests." >> "$GITHUB_STEP_SUMMARY"

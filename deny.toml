@@ -3,3 +3,14 @@ allow = ["Apache-2.0", "MIT", "ISC", "BSD-3-Clause", "Zlib", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "warn"
+
+[advisories]
+yanked = "warn"
+unmaintained = "workspace"
+ignore = []
+
+[sources]
+unknown-registry = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+unknown-git = "deny"
+allow-git = ["https://github.com/deepmsg/deepmsg"]

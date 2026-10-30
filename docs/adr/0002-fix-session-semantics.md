@@ -31,7 +31,8 @@ interoperability oracle (M1d).
    without `141=Y` ends the session.
 5. **The journal is written before the socket.** Every outbound message is
    appended and `fdatasync`ed before it is returned to the caller; the window
-   is the design's 4096 entries. Inbound and outbound sequences are persisted
+   is the design's default 4096 **outbound messages** (not seconds or bytes),
+   configurable with `--journal`. Inbound and outbound sequences are persisted
    beside it and restored at Logon. A recovery uses the larger of the journal's
    next sequence and the stored one.
 6. **Resend.** `16=0` means to the end of the stream. An application message is
@@ -57,8 +58,10 @@ interoperability oracle (M1d).
 - M1d's QuickFIX/J conformance suite is the acceptance test for these rules:
   logon, order and report, an in-window resend with `43`/`122`, an over-window
   disconnect, and no application GapFill.
-- The 4096-entry window is a hard limit: a peer that falls further behind is
-  logged out, not served from disk.
+- The 4096-message window is a hard limit. At the 10k msg/s measured in
+  ADR 0007 that is about 0.41 s of outbound history. A peer is logged out only
+  when its `ResendRequest` starts before the oldest retained sequence, not
+  merely because it reads slowly; the request is never served from disk.
 - One `fdatasync` per journal append and one atomic state write per message are
   the M1 correctness policy and remain the default. M5 adds opt-in batching
   (`SyncPolicy`, ADR 0007); the session API does not change.

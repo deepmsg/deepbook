@@ -61,7 +61,10 @@ pub const fn next_generation(previous: u8) -> u8 {
     }
 }
 
-/// A client order id, exactly the FIX 4.4 20-byte field.
+/// A client order id, fixed at 20 bytes by deepbook's snapshot schema.
+///
+/// FIX 4.4 does not impose a width on tag 11; 20 is a local convention (see
+/// ADR 0003 and ADR 0005).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ClientOrderId([u8; 20]);
 

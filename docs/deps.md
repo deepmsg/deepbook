@@ -9,8 +9,9 @@ crates.io, so the dependency is a git dependency pinned to a revision.
   a moving branch would make builds non-reproducible.
 - Bump the pin deliberately, in its own commit, with a note in the commit
   message saying which deepmsg change is being taken.
-- CI builds against the pinned rev. A separate scheduled job may build against
-  deepmsg `main` to catch breakage early, but that job is advisory only.
+- CI builds against the pinned rev. `.github/workflows/deepmsg-main.yml` also
+  builds against deepmsg `main` nightly and on demand; it is advisory only and
+  is not a required check.
 
 ## Current pin
 
@@ -81,8 +82,8 @@ git -C ~/data/trader/deepmsg worktree add --detach ~/data/trader/deepmsg-pin f5d
 DEEPBOOK_DEEPMSG_DIR=~/data/trader/deepmsg-pin just deps
 ```
 
-CI does not use the script: the `cluster-e2e` workflow checks the same revision
-out and builds it with the same package/binary list.
+CI uses the same script (`scripts/deepmsg-deps.sh build` and `check`) in the
+`cluster-e2e` workflow.
 
 ## Cargo.toml shape
 

@@ -130,8 +130,9 @@ fn recovered_book(backend: &str, default_base: u16) {
     // module. A container alone cannot rejoin in this deepmsg revision: the
     // recovery-state counter that `ClusteredServiceAgent::recover_state` reads
     // is allocated by the module at *its* startup, not when a service rejoins
-    // (`tests/src/cluster.rs`: "the recovery-state counter is allocated once,
-    // at that startup"). The archive, the log and the snapshot stay on disk.
+    // (deepmsg's `tests/src/cluster.rs`: "the recovery-state counter is
+    // allocated once, at that startup"). The archive, the log and the snapshot
+    // stay on disk.
     drop(raw);
     harness.kill_container();
     harness.kill_node();

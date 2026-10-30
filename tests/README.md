@@ -11,8 +11,12 @@ that need more than one component:
   `crates/engine-core/tests/differential.rs`: proptest streams through the slab
   engine and a naive `Vec` oracle, comparing trades and the book view. The
   allocator report is `crates/engine-core/tests/allocation.rs`.
-- `replay` — the same log twice; compare book hash, trade hash, and `md_seq`.
-- `recovery` — snapshot, kill -9, restart, compare state.
+- `replay` — **not implemented (layout only)**: the same log twice; compare
+  book hash, trade hash, and `md_seq`.
+- `recovery` — **exists**: snapshot, kill -9, restart, compare state; see
+  `crates/marketdata/tests/recovery.rs`,
+  `crates/fix/tests/session_recovery.rs` and the cluster e2e's engine-host
+  restart.
 - `marketdata` — **exists (M3)** at `crates/marketdata/tests/deepmsg_loss.rs`:
   the production media driver with its send-side loss generator, a
   `reliable=false` incremental subscription, and recovery through the

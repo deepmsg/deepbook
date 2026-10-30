@@ -182,7 +182,7 @@ rather than fails when the deepmsg binaries are not built.
 
 CI runs the epoll e2e in a separate `cluster-e2e` workflow on pull requests,
 on `main` and nightly: it checks out the revision `Cargo.toml` pins from
-`deepmsg/deepmsg`, builds the three deepmsg binaries in the debug profile, and
+`deepmsg/deepmsg`, builds the four deepmsg binaries in the debug profile, and
 sets `DEEPBOOK_E2E_REQUIRED=1` so a missing binary fails the job instead of
 skipping it. The io_uring variant stays local because it depends on the
 runner's kernel and seccomp policy.

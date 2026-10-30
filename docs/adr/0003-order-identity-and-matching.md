@@ -77,3 +77,10 @@ could cancel a different order. M2 also has to settle the matching rules, the
 - M6 can replace the `BTreeMap` levels without changing the engine's public
   commands or events; the priced band removes the remaining new-level
   allocation.
+- **2026-10-30:** The 20-byte `ClientOrderId` width is a deepbook convention,
+  not a FIX 4.4 rule (tag 11 has no width limit in the specification). Schema
+  200 fixes it to match `ClientOrderId::LENGTH`. The FIX layer accepts longer
+  strings and the gateway rejects them with an application-level
+  `ExecutionReport(ExecType=Rejected)` or `OrderCancelReject`; it never
+  truncates them. Widening the field needs a new schema version and a
+  wire/snapshot migration (ADR 0005; `schemas/README.md`).

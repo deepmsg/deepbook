@@ -13,8 +13,8 @@ pub type Qty = i64;
 /// Slab slot index. [`EMPTY_ORDER_ID`] is the sentinel.
 ///
 /// A slab slot is reused after an order reaches a terminal state. The FIX
-/// `OrderID` must not be the bare slot index; see the review note in
-/// `docs/reviews/` about generation counters.
+/// `OrderID` must not be the bare slot index; see ADR 0003
+/// (`docs/adr/0003-order-identity-and-matching.md`) about generation counters.
 pub type OrderId = u32;
 
 /// Symbol id. The MVP has one symbol.

@@ -118,6 +118,7 @@ _member_properties() { # <member> <file>
         echo "container_cpu=$CLUSTER_CONTAINER_CPU"
         echo "heartbeat_timeout=$CLUSTER_HEARTBEAT"
         echo "election_timeout=$CLUSTER_ELECTION_TIMEOUT"
+        echo "appointed_leader=${CLUSTER_APPOINTED_LEADER:-}"
         echo "engine_symbol=$CLUSTER_ENGINE_SYMBOL"
         echo "engine_max_orders=$CLUSTER_ENGINE_MAX_ORDERS"
         echo "engine_recent_window=$CLUSTER_ENGINE_RECENT_WINDOW"

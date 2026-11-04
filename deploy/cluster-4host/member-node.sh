@@ -130,6 +130,7 @@ _cluster_args() {
         "-Daeron.cluster.replication.channel=aeron:udp?endpoint=$host:0" \
         "-Daeron.cluster.leader.heartbeat.timeout=${heartbeat_timeout:-2s}" \
         "-Daeron.cluster.election.timeout=${election_timeout:-250ms}" \
+        ${appointed_leader:+"-Daeron.cluster.appointed.leader.id=$appointed_leader"} \
         "-Daeron.cluster.service.count=1" \
         "-Daeron.cluster.service.id=0" \
         "-Daeron.cluster.service.responder=true" \

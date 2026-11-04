@@ -18,8 +18,27 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-f5d66c4
+b4844ca
 ```
+
+The bump from `f5d66c4` takes three deepmsg changes, all in the cluster client
+and the consensus module's log path; `cargo check --workspace` passes unchanged:
+
+- `An abort gives back one fragment, not the whole poll` — a controlled poll's
+  `Abort` used to rewind to the last `Commit`, so every fragment the caller had
+  already accepted in that batch was read again. Under a full log publication
+  this turned one refusal into a duplicate append per round.
+- `A closed image is not read, and the controlled answers are not dropped` —
+  the read loop now consults the image's closed state at the same three points
+  the reference does, and a closed image answers a bounded controlled poll
+  instead of `None`.
+- `A closed image answers the snapshot it was closed with` — the image's five
+  facts are taken once, at close, and the cluster log adapter reads through an
+  `ImageView` rather than re-reading a moving image.
+
+None of the three changes a signature this repository calls; they change when
+the client stops reading. The binaries shipped from `DEEPBOOK_DEEPMSG_DIR` must
+be built from this revision — `scripts/deepmsg-deps.sh check` is what says so.
 
 The bump from `4bddeef` takes two deepmsg commits — the four-arm
 single-member cluster benchmark and a documentation pass — and changes no

@@ -204,11 +204,48 @@ filled; the leader's three processes are `SIGKILL`ed. The same FIX session
 then fills the next buy against the replicated resting order, and the run
 checks that the connection was never reopened, that each `ClOrdID` produced one
 trade, and that the resting order ends `Filled`. It prints the election and
-recovery times — about 4.2–4.5 s to elect and tens of milliseconds to the
-first fill, with the test topology's 2 s heartbeat; the product default is
-10 s. Market data is off in this
-topology: every member applies the log, so every member would publish its own
-stream (ADR 0006).
+recovery times: about 4.2–4.5 s here, where all three members share one
+machine.
+
+**That number is the single-machine one and it does not carry across hosts.**
+On four separate machines a failover takes about 13.6 s, and the heartbeat is
+not what governs it: a follower's election state does not move until
+`aeron.image.liveness.timeout` (10 s by default) plus another 3.6 s, and the
+election itself takes 0.4 s. Raising or lowering `leader.heartbeat.timeout`
+barely moves the total, because it only lengthens one phase inside that window.
+Anything that must outlast a failover — the gateway's
+`--new-leader-timeout-ms`, a client's own timer — has to be sized against the
+image liveness setting, not against this 4.2–4.5 s.
+
+Market data is off in this topology: every member applies the log, so every
+member would publish its own stream (ADR 0006).
+
+### Four hosts
+
+`deploy/cluster-4host/` stands the same topology up across four machines — one
+member each, the gateway and the load client on the fourth — and adds the
+commands a failover run needs. Its README carries the deployment facts: where
+the memory-mapped files have to live, what the failover budget is made of, and
+why a killed member still answers `is-leader`.
+
+### What a leader change does to the trading
+
+Measured on four machines, with one deterministic order script run twice: once
+on a quiet cluster, and once with the leader's three processes killed between
+two halves of the script.
+
+- **The outcome is the same.** With the log position factored out, the engine
+  state after both runs is byte-identical, and three members that applied the
+  same log agree on their snapshot byte for byte.
+- **An order in flight when the leader dies is lost, not replayed.** Of 42,000
+  orders sent across a failover, 951–975 never reached the log, and exactly one
+  per run was applied without its report arriving. The gateway-to-cluster hop is
+  at-most-once, so a client that needs at-least-once semantics has to implement
+  FIX session recovery; `fix-scenario` does not.
+
+`fix-scenario` is the client behind the first of those: it replays a script in
+which every line carries the terminal status, cumulative quantity and fill
+prices the engine must produce, and fails on the first line that disagrees.
 
 ## Benchmark (M5)
 
@@ -222,6 +259,12 @@ cargo run --release -p deepbook-bench --bin fix-bench -- \
 # or one JSON object for a script:
 cargo run --release -p deepbook-bench --bin fix-bench -- --json ...
 ```
+
+Every order it sends is an IOC buy at a price the book does not cross, so each
+is acknowledged and then cancelled: **the benchmark produces no trades.** These
+numbers describe the pipe — FIX decode, gateway, cluster replication, book
+insertion and cancel — and never the matcher. `fix-scenario` is the client that
+does cross, and checks each fill (see below).
 
 The one-click stack (driver + module + `engine-container` + `fix-gateway
 --cluster`) prints the machine fingerprint and the result table:

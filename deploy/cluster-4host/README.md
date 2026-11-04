@@ -9,7 +9,9 @@ different hosts.
 deploy/cluster-4host/run-cluster.sh up
 deploy/cluster-4host/run-cluster.sh status
 deploy/cluster-4host/run-cluster.sh bench --rate 20000 --samples 200000 --warmup 20000
-deploy/cluster-4host/run-cluster.sh kill-leader
+deploy/cluster-4host/run-cluster.sh scenario my-orders.txt
+deploy/cluster-4host/run-cluster.sh kill-leader --with-bench 2000 40000
+deploy/cluster-4host/run-cluster.sh restart 1 --keep
 deploy/cluster-4host/run-cluster.sh counters
 deploy/cluster-4host/run-cluster.sh down
 ```
@@ -29,6 +31,12 @@ read it before the first `up`.
 members. It reads `member.properties` (written by `run-cluster.sh`) and starts,
 stops and checks the three processes; `counters` is `cnc-dump --all` against the
 member's own aeron directory, taken **before** anything is stopped.
+
+The driver's term buffers and its CnC are memory-mapped files, so they live in
+`CLUSTER_AERON_ROOT` — a tmpfs, `/dev/shm/deepbook` by default. The run root is
+on the ESSD, and a memory-mapped file there puts a page fault in whatever path
+touches it, which for this workload is the measured path. The archive and the
+cluster directory stay with the run root: those have to survive the run.
 
 ## Readiness is two checks, not one
 
@@ -62,14 +70,38 @@ between two runs.
 
 ## Before the first failover run
 
-`--new-leader-timeout-ms` is set to 15000 here, not the gateway's own 4000.
-The single-machine failover run measures an election at **4.2–4.5 s** with the
-`2s` heartbeat, so a 4 s gateway timeout would expire before a new leader
-exists and the run would measure the gateway, not the cluster.
+`--new-leader-timeout-ms` is set to 15000 here, not the gateway's own 4000, and
+the knob that decides the budget is **not** the heartbeat. On four machines a
+surviving member's election state does not move until
+`aeron.image.liveness.timeout` — 10 s by default — plus about 3.6 s, and the
+election itself takes 0.4 s. That is 13.6 s measured, so 15 s leaves under
+1.5 s of margin; anything else you change has to come out of that.
+
+`CLUSTER_IMAGE_LIVENESS` is that knob, and setting it to `2s` brings a failover
+under 6 s. Do not set it small without knowing how much the log channel jitters:
+a gap longer than the window is indistinguishable from a dead leader, and the
+cluster will elect a new one that nobody asked for.
 
 `market-data` is off (`deepbook.marketdata.enabled=false`, matching the spike's
 engine service): every member applies the log, so every member would publish its
 own stream.
+
+## Three things that look like bugs and are not
+
+**A killed member still answers `is-leader`.** The tool reads the member's CnC
+file, and that file outlives the process: for the whole of a failover the dead
+member's role counter still says leader. `_leader` therefore asks the member's
+own pid file first, and `status` prints `not running` rather than `leader`.
+
+**`up` deletes the previous run.** `CLUSTER_RUN_ROOT/member*` holds the logs,
+the archives and the counters; `up` removes it. Pull what a run produced before
+starting the next one, or it is gone — the archives take the snapshot with them.
+
+**The leader's host changes the numbers.** These machines were measured with an
+8–15% p50 difference between a leader on `node0` and the same cell with the
+leader elsewhere, so `CLUSTER_APPOINTED_LEADER` pins it by default. Clear it
+(`CLUSTER_APPOINTED_LEADER=`) for a failover run, where the election is the
+thing being measured — a pinned leader is not replaced when it dies.
 
 ## Not this script's job
 

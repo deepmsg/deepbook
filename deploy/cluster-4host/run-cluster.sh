@@ -49,6 +49,13 @@ _client_host() { printf '%s' "$CLUSTER_CLIENT_SSH"; }
 _client_ip() { printf '%s' "$CLUSTER_CLIENT_SSH" | sed 's/.*@//'; }
 
 _mdir() { printf '%s/member%s' "$CLUSTER_RUN_ROOT" "$1"; }
+# ★ The driver's term buffers and its CnC file are memory-mapped, and a
+# memory-mapped file on a disk-backed filesystem is a page fault in whatever
+# path touches it. `CLUSTER_RUN_ROOT` is on the ESSD; this is on a tmpfs. The
+# archive and cluster directories stay with the run root because they have to
+# survive the run.
+_adir() { printf '%s/member%s/aeron' "$CLUSTER_AERON_ROOT" "$1"; }
+_client_aeron() { printf '%s/client/aeron' "$CLUSTER_AERON_ROOT"; }
 _client_dir() { printf '%s/client' "$CLUSTER_RUN_ROOT"; }
 
 # A command on a host. The controller *is* node0, and node0 may or may not be
@@ -100,7 +107,7 @@ _member_properties() { # <member> <file>
         echo "host=$h"
         echo "cluster_id=$CLUSTER_ID"
         echo "members=$(_members_string)"
-        echo "aeron_dir=$(_mdir "$i")/aeron"
+        echo "aeron_dir=$(_adir "$i")"
         echo "archive_dir=$(_mdir "$i")/archive"
         echo "cluster_dir=$(_mdir "$i")/cluster"
         echo "driver=$CLUSTER_DEEPMSG_DIR/target/release/deepmsg-archiving-media-driver"
@@ -117,6 +124,7 @@ _member_properties() { # <member> <file>
         echo "cm_cpu=$CLUSTER_CM_CPU"
         echo "container_cpu=$CLUSTER_CONTAINER_CPU"
         echo "heartbeat_timeout=$CLUSTER_HEARTBEAT"
+        echo "image_liveness=${CLUSTER_IMAGE_LIVENESS:-}"
         echo "election_timeout=$CLUSTER_ELECTION_TIMEOUT"
         echo "appointed_leader=${CLUSTER_APPOINTED_LEADER:-}"
         echo "engine_symbol=$CLUSTER_ENGINE_SYMBOL"
@@ -130,12 +138,24 @@ _member_properties() { # <member> <file>
 _is_leader() { # <member> -> 0 leader, 1 not, other failure
     local i=$1
     _on "$(_host "$i")" \
-        "'$CLUSTER_DEEPMSG_DIR/target/release/deepmsg-cluster-tool' -Daeron.dir='$(_mdir "$i")/aeron' '$(_mdir "$i")/cluster' is-leader >/dev/null 2>&1"
+        "'$CLUSTER_DEEPMSG_DIR/target/release/deepmsg-cluster-tool' -Daeron.dir='$(_adir "$i")' '$(_mdir "$i")/cluster' is-leader >/dev/null 2>&1"
+}
+
+_member_alive() { # <member> -> 0 when every pid in its own pid file is still there
+    local i=$1 d
+    d=$(_mdir "$i")
+    _on "$(_host "$i")" \
+        "test -s '$d/pids' || exit 1; for p in \$(cat '$d/pids'); do kill -0 \"\$p\" 2>/dev/null || exit 1; done"
 }
 
 _leader() { # prints the member id that says it is leader, or nothing
     local i
     for ((i = 0; i < MEMBERS; i++)); do
+        # ★ A dead member's CnC file is still on disk and still says role=2:
+        # `is-leader` alone reported the killed leader for the whole 30 s of a
+        # failover, and nothing else was ever elected. The pid file is the
+        # liveness, and it is checked first because it is the cheaper question.
+        _member_alive "$i" || continue
         if _is_leader "$i"; then printf '%s' "$i"; return 0; fi
     done
     return 1
@@ -170,6 +190,35 @@ _member_start() { # <member>
     # started them. The exit status of a `-f` session is not the member's, so
     # readiness is the `up`/`failed` file the script writes.
     _daemon "$host" "bash '$mdir/member-node.sh' start '$mdir'" "$mdir/start.log"
+}
+
+# ★ A *restart* is not a start. The run root holds the archive (which holds the
+# snapshot) and the cluster directory (which holds the leadership term); wiping
+# them turns every recovery question into a fresh-join question. `--keep` keeps
+# both and rewrites only the properties and the script.
+_member_restart() { # <member> [--keep]
+    local i=$1 keep=${2:-} host mdir
+    host=$(_host "$i")
+    mdir=$(_mdir "$i")
+    mkdir -p "$stage/member$i"
+    _member_properties "$i" "$stage/member$i/member.properties"
+    if [ "$keep" = "--keep" ]; then
+        _on "$host" "mkdir -p '$mdir'"
+    else
+        _on "$host" "rm -rf '$mdir'; mkdir -p '$mdir'"
+    fi
+    scp -q "$stage/member$i/member.properties" "$here/member-node.sh" "$host:$mdir/"
+    _on "$host" "chmod +x '$mdir/member-node.sh'"
+    # The readiness file from before the kill is still there and would make
+    # `_member_wait_up` answer at once.
+    _on "$host" "rm -f '$mdir/up' '$mdir/failed'"
+    _daemon "$host" "bash '$mdir/member-node.sh' start '$mdir' $keep" "$mdir/start.log"
+}
+
+_member_commit_pos() { # <member> -> the position it has applied, or empty
+    local i=$1
+    _on "$(_host "$i")" \
+        "'$CLUSTER_DEEPMSG_DIR/target/release/cnc-dump' --all '$(_adir "$i")' 2>/dev/null | awk '/Cluster commit-pos/ {print \$3; exit}'"
 }
 
 _member_wait_up() { # <member> <seconds>
@@ -212,7 +261,7 @@ _client_driver_start() {
     local cdir
     cdir=$(_client_dir)
     local args=(
-        "-Ddeepmsg.dir=$cdir/aeron" "-Daeron.dir=$cdir/aeron"
+        "-Ddeepmsg.dir=$(_client_aeron)" "-Daeron.dir=$(_client_aeron)"
         -Ddeepmsg.dir.delete.on.start=false -Daeron.dir.delete.on.start=false
         "-Daeron.archive.dir=$cdir/archive"
         "-Daeron.archive.control.channel=aeron:udp?endpoint=$(_client_ip):$((BASE + 43))"
@@ -230,10 +279,10 @@ _client_driver_start() {
         "${args[@]}"
     _client_start "$cdir/driver.sh" "$cdir/driver.log" "$cdir/driver.pid"
     for _ in $(seq 1 200); do
-        _on "$(_client_host)" "test -f '$cdir/aeron/cnc.dat'" 2>/dev/null && break
+        _on "$(_client_host)" "test -f '$(_client_aeron)/cnc.dat'" 2>/dev/null && break
         sleep 0.1
     done
-    _on "$(_client_host)" "test -f '$cdir/aeron/cnc.dat'" || {
+    _on "$(_client_host)" "test -f '$(_client_aeron)/cnc.dat'" || {
         echo "the client's driver never published its CnC file" >&2
         _on "$(_client_host)" "tail -20 '$cdir/driver.log'" >&2 || true
         return 1
@@ -247,7 +296,7 @@ _gateway_start() {
         --bind "0.0.0.0:$FIX_PORT"
         --session-dir "$cdir/sessions"
         --cluster
-        --aeron-dir "$cdir/aeron"
+        --aeron-dir "$(_client_aeron)"
         --ingress-channel "aeron:udp?term-length=128k"
         --ingress-endpoints "$(_ingress_endpoints)"
         --egress-channel "aeron:udp?endpoint=$(_client_ip):0"
@@ -322,6 +371,7 @@ cmd_list() {
     echo "run root        $CLUSTER_RUN_ROOT (on each host)"
     echo "binaries        $CLUSTER_DEEPMSG_DIR/target/release, $CLUSTER_DEEPBOOK_DIR/target/release"
     echo "timing          heartbeat $CLUSTER_HEARTBEAT, election $CLUSTER_ELECTION_TIMEOUT, gateway new-leader $CLUSTER_GATEWAY_NEW_LEADER_MS ms"
+    echo "leader          ${CLUSTER_APPOINTED_LEADER:-elected}${CLUSTER_APPOINTED_LEADER:+ (appointed; empty = elected)}"
 }
 
 _check_binaries() {
@@ -352,6 +402,7 @@ cmd_up() {
     for ((i = 0; i < MEMBERS; i++)); do _member_stop "$i"; done
     _client_kill gateway
     _client_kill driver
+    _on "$(_client_host)" "rm -rf '$(_client_aeron)'" || true
 
     echo "== members"
     for ((i = 0; i < MEMBERS; i++)); do _member_start "$i"; done
@@ -370,12 +421,14 @@ cmd_status() {
     local i
     for ((i = 0; i < MEMBERS; i++)); do
         printf 'member %s: ' "$i"
-        if _is_leader "$i"; then echo "leader"; else
-            if _on "$(_host "$i")" "bash '$(_mdir "$i")/member-node.sh' check '$(_mdir "$i")' >/dev/null 2>&1"; then
-                echo "follower"
-            else
-                echo "not running"
-            fi
+        if ! _member_alive "$i"; then
+            echo "not running"
+        elif _is_leader "$i"; then
+            echo "leader"
+        elif _on "$(_host "$i")" "bash '$(_mdir "$i")/member-node.sh' check '$(_mdir "$i")' >/dev/null 2>&1"; then
+            echo "follower"
+        else
+            echo "not running"
         fi
     done
     printf 'gateway: '
@@ -405,8 +458,30 @@ cmd_bench() {
 }
 
 cmd_kill_leader() {
-    local leader start now
+    local leader start now rate="" samples="" settle=5
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --with-bench) rate=${2:-2000}; samples=${3:-60000}; shift 3 ;;
+            --settle) settle=$2; shift 2 ;;
+            *) echo "kill-leader: unknown option $1" >&2; return 2 ;;
+        esac
+    done
     leader=$(_leader) || { echo "no leader to kill" >&2; return 1; }
+    # ★ A failover is only interesting while the cluster is carrying orders:
+    # the election time says how long the module needed, and the client's own
+    # numbers say what the *trading system* lost. Without this the run says
+    # nothing about fills.
+    if [ -n "$rate" ]; then
+        local cdir
+        cdir=$(_client_dir)
+        echo "fix-bench ${rate}/s x ${samples} samples, starting ${settle}s before the kill"
+        _daemon "$(_client_host)" \
+            "taskset -c $CLUSTER_CLIENT_CPU '$CLUSTER_DEEPBOOK_DIR/target/release/fix-bench' \
+             --connect '127.0.0.1:$FIX_PORT' --rate $rate --samples $samples --warmup 2000 \
+             --account 1 --price 1.00 --qty 1 --timeout-ms 120000 --seed-book" \
+            "$cdir/kill-leader-bench.txt"
+        sleep "$settle"
+    fi
     echo "leader is member $leader; killing its three processes"
     start=$(date +%s.%N)
     _on "$(_host "$leader")" "kill -9 \$(cat '$(_mdir "$leader")/pids') 2>/dev/null || true"
@@ -423,6 +498,61 @@ cmd_kill_leader() {
         echo "no new leader within 30 s" >&2
         return 1
     fi
+    if [ -n "$rate" ]; then
+        echo "waiting for the client's own account..."
+        for _ in $(seq 1 240); do
+            _on "$(_client_host)" "grep -q '^sent=' '$(_client_dir)/kill-leader-bench.txt' 2>/dev/null" && break
+            sleep 0.5
+        done
+        echo "--- the client's own account"
+        _on "$(_client_host)" "cat '$(_client_dir)/kill-leader-bench.txt'"
+    fi
+}
+
+cmd_scenario() { # <script-on-the-controller> [--pace-ms N]
+    local script="" pace=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --pace-ms) pace=$2; shift 2 ;;
+            *) script=$1; shift ;;
+        esac
+    done
+    [ -n "$script" ] || { echo "usage: run-cluster.sh scenario <file> [--pace-ms N]" >&2; return 2; }
+    [ -f "$script" ] || { echo "no such script: $script" >&2; return 1; }
+    local cdir
+    cdir=$(_client_dir)
+    _on "$(_client_host)" "mkdir -p '$cdir'" || return 1
+    scp -q "$script" "$(_client_host):$cdir/scenario.txt" || return 1
+    echo "== fix-scenario $(basename "$script")"
+    _on "$(_client_host)" "taskset -c $CLUSTER_CLIENT_CPU '$CLUSTER_DEEPBOOK_DIR/target/release/fix-scenario' \
+        --connect '127.0.0.1:$FIX_PORT' --script '$cdir/scenario.txt' ${pace:+--pace-ms $pace}"
+}
+
+cmd_restart() { # <member> [--keep]
+    local i=${1:?usage: run-cluster.sh restart <member> [--keep]}
+    local keep="${2:-}" leader target t0 t1 pos
+    leader=$(_leader) || { echo "no leader; there is nothing to catch up with" >&2; return 1; }
+    if [ "$leader" = "$i" ]; then
+        echo "member $i is the leader; restarting it is a failover, use kill-leader" >&2
+        return 1
+    fi
+    target=$(_member_commit_pos "$leader")
+    echo "restarting member $i${keep:+ (keeping its directories)}; leader $leader at commit-pos ${target:-?}"
+    _member_stop "$i"
+    t0=$(date +%s.%N)
+    _member_restart "$i" "$keep"
+    _member_wait_up "$i" 90 || return 1
+    for _ in $(seq 1 1200); do
+        pos=$(_member_commit_pos "$i")
+        if [ -n "$pos" ] && [ -n "$target" ] &&
+           awk -v a="$pos" -v b="$target" 'BEGIN { exit !(a + 0 >= b + 0) }'; then
+            break
+        fi
+        sleep 0.25
+    done
+    t1=$(date +%s.%N)
+    awk -v a="$t0" -v b="$t1" -v p="${pos:-?}" -v t="${target:-?}" \
+        'BEGIN { printf "member caught up: commit-pos %s (leader was %s) after %.2f s\n", p, t, b - a }'
 }
 
 cmd_counters() {
@@ -448,8 +578,13 @@ case "$action" in
     up)          cmd_up ;;
     status)      cmd_status ;;
     bench)       cmd_bench "$@" ;;
-    kill-leader) cmd_kill_leader ;;
+    # ★ `"$@"`, or every option the command takes is dropped on the floor:
+    # `kill-leader --with-bench` ran without a benchmark and said so only by
+    # the absence of a line nobody was looking for.
+    kill-leader) cmd_kill_leader "$@" ;;
+    restart)     cmd_restart "$@" ;;
+    scenario)    cmd_scenario "$@" ;;
     counters)    cmd_counters ;;
     down)        cmd_down ;;
-    *) echo "usage: run-cluster.sh list|up|status|bench|kill-leader|counters|down" >&2; exit 2 ;;
+    *) echo "usage: run-cluster.sh list|up|status|bench|kill-leader|restart|scenario|counters|down" >&2; exit 2 ;;
 esac

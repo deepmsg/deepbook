@@ -24,8 +24,15 @@
 # with "failed to join live log".
 set -euo pipefail
 
-action=${1:?usage: member-node.sh start|stop|check|counters <dir>}
-dir=${2:?usage: member-node.sh start|stop|check|counters <dir>}
+action=${1:?usage: member-node.sh start|stop|check|counters <dir> [--keep]}
+dir=${2:?usage: member-node.sh start|stop|check|counters <dir> [--keep]}
+# ★ `--keep` is what makes a *restart* different from a *fresh join*. The
+# default wipes the member's three directories, which is right for a cell that
+# starts from nothing and wrong for every question about recovery: a wiped
+# archive has no snapshot to recover from and a wiped cluster directory has no
+# leadership term to resume.
+keep=0
+[ "${3:-}" = "--keep" ] && keep=1
 props=$dir/member.properties
 
 _need() {
@@ -111,6 +118,15 @@ _driver_args() {
             "-Daeron.sender.cpu.affinity=$driver_sender_cpu" \
             "-Daeron.receiver.cpu.affinity=$driver_receiver_cpu"
     fi
+    # ★ How long a follower's *driver* keeps an image it has stopped hearing
+    # from before it reports it unavailable. The failover measurement of
+    # 2026-11-04 15:3x says a survivor's election state does not move until
+    # 13.65 s after the leader dies, whatever `leader.heartbeat.timeout` is --
+    # and the default here is 10 s, which is the leading candidate for that
+    # constant. Empty keeps the build's default.
+    if [ -n "${image_liveness:-}" ]; then
+        printf '%s\n' "-Daeron.image.liveness.timeout=$image_liveness"
+    fi
 }
 
 # What the consensus module and the container both read. `crates/spike`'s
@@ -174,7 +190,11 @@ _start() {
 
     # A run starts from nothing: a leftover cluster directory is a leftover
     # leadership term, and a leftover aeron directory is a leftover window.
-    rm -rf "$aeron_dir" "$archive_dir" "$cluster_dir"
+    # `--keep` keeps all three, which is the only shape in which "recover from
+    # the snapshot" is a question at all.
+    if [ "$keep" -eq 0 ]; then
+        rm -rf "$aeron_dir" "$archive_dir" "$cluster_dir"
+    fi
     mkdir -p "$aeron_dir" "$archive_dir" "$cluster_dir"
 
     args=("$driver")

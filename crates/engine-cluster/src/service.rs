@@ -378,11 +378,22 @@ impl ClusteredService for EngineService {
         cluster: &mut Cluster<'_>,
         snapshot: Option<&mut SnapshotReader<'_>>,
     ) -> Result<(), ContainerError> {
+        let restored_from_snapshot = snapshot.is_some();
         if let Some(reader) = snapshot {
             let bytes = read_snapshot(cluster, reader)?;
             let (decoded, market_seq) = decode_service_snapshot(&bytes).map_err(container)?;
             self.engine = Engine::restore(self.config, &decoded).map_err(container)?;
             self.restored_log_pos = decoded.last_log_pos;
+            // ★ Said out loud, and said on **both** branches, because "did this
+            // member come back from its snapshot or replay the log from the
+            // beginning" has no other observable: with a small log the two take
+            // the same time, and a recovery that quietly became a full replay
+            // is exactly what a four-host run is supposed to catch.
+            eprintln!(
+                "engine: restored from snapshot at log-pos {} ({} bytes)",
+                decoded.last_log_pos,
+                bytes.len()
+            );
             let restored_book =
                 market_snapshot_from_engine(&self.engine, market_seq.unwrap_or_default());
             if let Some(market) = self.market_data.as_mut() {
@@ -416,6 +427,9 @@ impl ClusteredService for EngineService {
             if let Err(error) = market.publisher.try_publish_snapshot(&snapshot) {
                 eprintln!("engine: market data snapshot: {error}");
             }
+        }
+        if !restored_from_snapshot {
+            eprintln!("engine: no snapshot; the engine starts empty and replays the log");
         }
         Ok(())
     }
@@ -507,6 +521,40 @@ impl ClusteredService for EngineService {
 
     fn on_take_snapshot(&mut self, writer: &mut SnapshotWriter<'_>) -> Result<(), ContainerError> {
         let bytes = self.snapshot_bytes().map_err(container)?;
+        // The snapshot's identity, into the container's own log. Three members
+        // that applied the same log must produce the same bytes, and this is
+        // the only point where all three hold them at the same position, so
+        // this line is what makes a four-host run checkable: compare the three
+        // logs, and they must agree.
+        //
+        // `DefaultHasher` rather than a digest crate because the three members
+        // run the same binary, so the value is comparable without adding a
+        // dependency to the product for a diagnostic.
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            eprintln!(
+                "engine: snapshot len={} hash={:016x}",
+                bytes.len(),
+                hasher.finish()
+            );
+            // ★ A second digest with `last_log_pos` zeroed. The plain one is
+            // only comparable between members that applied the *same* log: a
+            // leadership change appends control records, every later command's
+            // position moves, and two runs that traded identically then hash
+            // differently. This one is the trading state alone, so it can be
+            // compared across a failover -- which is the question a four-host
+            // run actually asks.
+            if let Ok((mut snapshot, seq)) = decode_service_snapshot(&bytes) {
+                snapshot.last_log_pos = 0;
+                if let Ok(body) = encode(&snapshot) {
+                    let mut state = std::collections::hash_map::DefaultHasher::new();
+                    encode_service_snapshot(body, seq).hash(&mut state);
+                    eprintln!("engine: state hash={:016x}", state.finish());
+                }
+            }
+        }
         let chunk = writer.max_payload_length().max(1);
         for part in bytes.chunks(chunk) {
             loop {

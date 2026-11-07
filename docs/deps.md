@@ -18,8 +18,39 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-b4844ca
+6bde4f7
 ```
+
+The bump from `b4844ca` takes eight deepmsg changes, the first one that also
+adds a crate: `deepmsg-log` is now in `[workspace.dependencies]` (nothing uses it
+yet; the application-side events arrive in a later change). `cargo check
+--workspace` passes unchanged. The stamp now covers six binaries instead of
+four: the two exporters joined `scripts/deepmsg-deps.sh`. The four that were
+already there no longer hash the same as at `b4844ca`, because the cluster error
+rescue and the CnC/driver read side the exporters need change code underneath
+them — not a command-line surface deepbook calls.
+
+- `The vocabulary opens to applications` — `deepmsg-log` grows `Name`,
+  `event_named` and `Config::from_env_with`, so an application can log with its
+  own event enum instead of asking deepmsg to add members to its built-in
+  vocabulary. The crate is a dependency from this bump on; the wiring into
+  deepbook's processes is a later commit.
+- `The cluster rescues the error log it is about to clear` — adopting an old
+  cluster mark file now writes `<TYPE>-<epoch_ms>-error.log` before clearing the
+  error buffer, which is what the errorlog exporter tails; member
+  `cluster.error` events stop being silent. `crates/cluster/common`,
+  `crates/cnc`, `crates/driver` change with it.
+- `The observability pipeline, from the counters exporter to the alert drills` —
+  the log facade, the two exporters and the collector configuration. The driver
+  and CnC changes in the diff above are the read side those exporters need; no
+  client or service signature moves.
+- `The agent takes an application's metrics through an overlay` — deployment
+  side only: `agent/otelcol-app.yaml`, `deepmsg-app-agent.service` and
+  `DEEPMSG_APP_METRICS_ENDPOINT`. No crate source changes.
+- `The plan is the whole answer, and --list stops there`, `A cluster benchmark
+  that says what happened in each cell`, `The cloud batches run from this tree`
+  and `Two tests stop waiting on a ten-second driver timeout` are the harness,
+  its scripts and two test fixes.
 
 The bump from `f5d66c4` takes three deepmsg changes, all in the cluster client
 and the consensus module's log path; `cargo check --workspace` passes unchanged:
@@ -83,11 +114,16 @@ just deps          # scripts/deepmsg-deps.sh build
 just deps-check    # scripts/deepmsg-deps.sh check
 ```
 
-`deps` builds the four binaries (`deepmsg-archiving-media-driver`,
+`deps` builds the six binaries (`deepmsg-archiving-media-driver`,
 `deepmsg-cluster-node`, `deepmsg-clustered-service-container`,
-`deepmsg-cluster-tool`) in `DEEPBOOK_DEEPMSG_DIR` at `DEEPMSG_PROFILE`
+`deepmsg-cluster-tool`, and the two observability exporters
+`deepmsg-counters-exporter` / `deepmsg-errorlog-exporter`) in
+`DEEPBOOK_DEEPMSG_DIR` at `DEEPMSG_PROFILE`
 (`release` by default) and writes `target/<profile>/deepbook-deps.txt`: the
-revision, the profile, the compiler and the SHA-256 of each binary. `check`
+revision, the profile, the compiler and the SHA-256 of each binary. The two
+exporters are not started by deepbook's tests; they are the processes the
+cluster deployment installs next to the agents, and they are in the stamp so
+that all four hosts can be checked against the same revision. `check`
 fails when the stamp is missing, names another revision, or a binary no longer
 matches its hash — that is what makes a benchmark number reproducible rather
 than "whatever was last built". `bench.sh` and `just engine-e2e` run it by

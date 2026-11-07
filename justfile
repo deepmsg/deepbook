@@ -15,7 +15,7 @@ test:
 
 check: fmt-check clippy test
 
-# Build the four deepmsg binaries the process tests start, from the revision
+# Build the six deepmsg binaries the process tests start, from the revision
 # Cargo.toml pins, and stamp them (scripts/deepmsg-deps.sh).
 deps:
     ./scripts/deepmsg-deps.sh build

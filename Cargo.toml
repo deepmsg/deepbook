@@ -23,15 +23,16 @@ repository = "https://github.com/deepmsg/deepbook"
 
 [workspace.dependencies]
 # deepmsg is pinned by revision; see docs/deps.md. Never use a branch here.
-deepmsg-client = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-codec = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-codec-cluster = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-core = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-cnc = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-cluster-client = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-cluster-common = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-cluster-service = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
-deepmsg-driver = { git = "https://github.com/deepmsg/deepmsg", rev = "b4844ca" }
+deepmsg-client = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-codec = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-codec-cluster = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-core = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-cnc = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-cluster-client = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-cluster-common = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-cluster-service = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-driver = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
+deepmsg-log = { git = "https://github.com/deepmsg/deepmsg", rev = "6bde4f7" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

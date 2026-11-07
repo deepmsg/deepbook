@@ -1,0 +1,24 @@
+# The deepbook dashboard provider.
+#
+# deepmsg's provider scans its own directory and loads everything there into
+# the `deepmsg` folder. This one loads deepbook's dashboard(s) into `deepbook`:
+# the directory is the one `deploy/cluster-4host/observability.sh` creates and
+# fills, and it is fixed rather than environment-expanded because the two
+# directories are the whole point — a single glob would put both products in
+# one folder.
+#
+# `disableDeletion` and `allowUiUpdates: false` are the deepmsg provider's
+# settings too: what is in the repository is what Grafana serves, so a change
+# made in the UI does not survive and does not confuse the next deploy.
+apiVersion: 1
+
+providers:
+  - name: deepbook
+    orgId: 1
+    folder: deepbook
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/deepmsg/grafana/dashboards-deepbook

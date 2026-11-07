@@ -77,6 +77,7 @@ fn run() -> Result<(), String> {
         cluster_config.egress_channel = options.egress_channel.clone();
         cluster_config.egress_stream_id = options.egress_stream_id;
         cluster_config.message_timeout_ns = options.message_timeout_ms.saturating_mul(1_000_000);
+        cluster_config.connect_attempts = options.connect_attempts;
         cluster_config.new_leader_timeout_ns = (options.new_leader_timeout_ms > 0)
             .then(|| options.new_leader_timeout_ms.saturating_mul(1_000_000));
         cluster_config.symbol = options.symbol_id;
@@ -135,6 +136,7 @@ struct Options {
     egress_channel: String,
     egress_stream_id: i32,
     message_timeout_ms: i64,
+    connect_attempts: u32,
     new_leader_timeout_ms: i64,
     symbol_id: u16,
     symbol: String,
@@ -163,6 +165,7 @@ impl Options {
             egress_channel: "aeron:ipc".to_owned(),
             egress_stream_id: 102,
             message_timeout_ms: 5_000,
+            connect_attempts: 3,
             new_leader_timeout_ms: 0,
             symbol_id: 1,
             symbol: "AAPL".to_owned(),
@@ -247,6 +250,11 @@ impl Options {
                         .parse()
                         .map_err(|_| "--message-timeout-ms must be a number".to_owned())?;
                 }
+                "--connect-attempts" => {
+                    options.connect_attempts = value("--connect-attempts")?
+                        .parse()
+                        .map_err(|_| "--connect-attempts must be a number".to_owned())?;
+                }
                 "--new-leader-timeout-ms" => {
                     options.new_leader_timeout_ms = value("--new-leader-timeout-ms")?
                         .parse()
@@ -280,7 +288,7 @@ fn print_usage() {
          \x20                  [--ingress-channel URI] [--ingress-stream-id N]\n\
          \x20                  [--ingress-endpoints M=HOST:PORT,...]\n\
          \x20                  [--egress-channel URI] [--egress-stream-id N]\n\
-         \x20                  [--message-timeout-ms N]\n\
+         \x20                  [--message-timeout-ms N] [--connect-attempts N]\n\
          \x20                  [--new-leader-timeout-ms N]\n\
          \x20                  [--symbol-id N] [--symbol S]"
     );

@@ -11,6 +11,7 @@ description = "deepbook: ClusteredService adapter and snapshot serialization"
 workspace = true
 
 [dependencies]
+deepbook-http = { path = "../http" }
 deepbook-types = { path = "../types" }
 deepbook-engine-core = { path = "../engine-core" }
 deepbook-codec-snapshot = { path = "../codec/snapshot" }

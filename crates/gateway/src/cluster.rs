@@ -40,6 +40,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deepbook_engine_core::{
@@ -59,6 +60,7 @@ use deepmsg_client::fragment_assembler::MessageHeader;
 use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
+use crate::metrics::GatewayMetrics;
 use crate::obs;
 use crate::sink::{CommandSink, EventSource, SessionEvent, SessionKey};
 
@@ -438,6 +440,8 @@ pub struct ClusterEngine {
     sessions_opened: u16,
     last_keep_alive: Instant,
     reconnect_at: Option<Instant>,
+    /// What the loopback `/metrics` page reads.
+    metrics: Arc<GatewayMetrics>,
 }
 
 impl fmt::Debug for ClusterEngine {
@@ -463,6 +467,18 @@ impl ClusterEngine {
     /// The driver cannot be reached, or every attempt failed. The error is the
     /// last attempt's.
     pub fn connect(config: ClusterEngineConfig) -> Result<Self, ClusterEngineError> {
+        Self::connect_with(config, Arc::new(GatewayMetrics::default()))
+    }
+
+    /// The same, with the counters the binary's `/metrics` page reads.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::connect`].
+    pub fn connect_with(
+        config: ClusterEngineConfig,
+        metrics: Arc<GatewayMetrics>,
+    ) -> Result<Self, ClusterEngineError> {
         let mut client = Client::connect(&config.aeron_dir)
             .map_err(|error| ClusterEngineError::Driver(error.to_string()))?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
@@ -482,6 +498,7 @@ impl ClusterEngine {
             }
         };
         let mapping = Mapping::new(config.symbol, &config.symbol_name);
+        metrics.set_cluster_connected(true);
         Ok(Self {
             config,
             client,
@@ -494,6 +511,7 @@ impl ClusterEngine {
             sessions_opened: 1,
             last_keep_alive: Instant::now(),
             reconnect_at: None,
+            metrics,
         })
     }
 
@@ -524,6 +542,7 @@ impl ClusterEngine {
                 eprintln!("fix-gateway: cluster egress: {error}");
             }
             if session.is_closed() {
+                self.metrics.set_cluster_connected(false);
                 eprintln!("fix-gateway: cluster session closed");
                 obs::cluster_lost(session.cluster_session_id(), self.sessions_opened);
                 self.session = None;
@@ -563,6 +582,7 @@ impl ClusterEngine {
                     egress_channel_for(&self.config.egress_channel, self.sessions_opened)
                 );
                 obs::cluster_recovered(session.cluster_session_id(), self.sessions_opened);
+                self.metrics.set_cluster_connected(true);
                 self.sessions_opened = self.sessions_opened.saturating_add(1);
                 self.session = Some(session);
                 self.reconnect_at = None;
@@ -678,6 +698,7 @@ impl ClusterEngine {
     }
 
     fn reject_new(&mut self, session: &SessionKey, order: &NewOrderSingle, text: String) {
+        self.metrics.note_reject();
         obs::command_rejected(&order.cl_ord_id, &text);
         let exec_id = self.local_exec_id();
         let now = format_utc(SystemClock.now_millis());
@@ -710,6 +731,7 @@ impl ClusterEngine {
         is_replace: bool,
         text: String,
     ) {
+        self.metrics.note_reject();
         obs::command_rejected(cl_ord_id, &text);
         let reject = OrderCancelReject {
             order_id: "NONE".to_owned(),

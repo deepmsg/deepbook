@@ -16,6 +16,7 @@
 //! | `deepbook.risk.reference-price` | off |
 //! | `deepbook.risk.max-open-orders` | unlimited |
 //! | `deepbook.risk.self-trade` | `none` |
+//! | `deepbook.metrics.bind` | `127.0.0.1:26100` (`off` serves nothing) |
 //!
 //! Every `deepbook.*` value is parsed strictly: a malformed limit stops the
 //! container instead of silently falling back to "unlimited". The limits are
@@ -31,10 +32,13 @@
 //! The media driver and the archive are separate processes in the same
 //! `aeron.dir`.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use deepbook_engine_cluster::metrics as engine_metrics;
 use deepbook_engine_cluster::obs::{self, COMPONENTS, Engine as EngineComponent};
 use deepbook_engine_cluster::{EngineService, MarketDataConfig};
 use deepbook_engine_core::{EngineConfig, RiskConfig, SelfTradePrevention};
@@ -161,6 +165,16 @@ fn run() -> Result<(), String> {
     sys::set_current_thread_name("deepbook-engine")
         .map_err(|error| format!("the thread cannot be named: {error}"))?;
     let metrics = service.metrics_handle();
+    let metrics_bind = property_string(&properties, "deepbook.metrics.bind", "127.0.0.1:26100");
+    if !metrics_bind.is_empty() && metrics_bind != "off" {
+        let bind: SocketAddr = metrics_bind
+            .parse()
+            .map_err(|_| format!("deepbook.metrics.bind={metrics_bind} is not IP:port"))?;
+        let page = Arc::clone(&metrics);
+        deepbook_http::serve_metrics(bind, move || engine_metrics::prometheus(&page))
+            .map_err(|error| format!("cannot serve metrics on {bind}: {error}"))?;
+        println!("{NAME}: metrics on {bind}");
+    }
     let mut idle = Strategy::by_agrona_name(&config.idle_strategy).ok_or_else(|| {
         format!(
             "aeron.cluster.idle.strategy={} names no strategy this build has",

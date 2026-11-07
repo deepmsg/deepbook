@@ -23,6 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use deepbook_fix::ApplicationMessage;
@@ -32,6 +33,7 @@ use deepbook_fix::journal::{FileJournal, FileSequenceStore, SyncPolicy};
 use deepbook_fix::session::{Action, Session, SessionConfig};
 use deepbook_io::{BackendKind, Event, EventLoop};
 
+use crate::metrics::GatewayMetrics;
 use crate::obs;
 use crate::sink::{Engine, SessionKey};
 
@@ -120,6 +122,8 @@ pub struct Gateway<E: Engine> {
     /// session. A short disconnect therefore queues the report and a reconnect
     /// sends it, rather than losing it.
     pending_reports: HashMap<SessionKey, VecDeque<ApplicationMessage>>,
+    /// What the loopback `/metrics` page reads.
+    metrics: Arc<GatewayMetrics>,
 }
 
 /// The most reports queued for one disconnected session. A peer that never
@@ -135,6 +139,20 @@ impl<E: Engine> Gateway<E> {
     /// The address cannot be bound, the backend cannot be created, or the
     /// accept cannot be armed.
     pub fn bind(config: GatewayConfig, engine: E) -> io::Result<Self> {
+        Self::bind_with_metrics(config, engine, Arc::new(GatewayMetrics::default()))
+    }
+
+    /// The same, with the counters the binary's `/metrics` page reads.
+    ///
+    /// # Errors
+    ///
+    /// The address cannot be bound, the backend cannot be created, or the
+    /// accept cannot be armed.
+    pub fn bind_with_metrics(
+        config: GatewayConfig,
+        engine: E,
+        metrics: Arc<GatewayMetrics>,
+    ) -> io::Result<Self> {
         let mut io = deepbook_io::open(config.backend, config.bind)?;
         io.start_accept()?;
         let key = SessionKey::new(&config.sender_comp_id, &config.target_comp_id);
@@ -145,6 +163,7 @@ impl<E: Engine> Gateway<E> {
             engine,
             connections: HashMap::new(),
             pending_reports: HashMap::new(),
+            metrics,
         })
     }
 
@@ -311,6 +330,7 @@ impl<E: Engine> Gateway<E> {
     fn drop_connection(&mut self, id: u64) {
         if let Some(connection) = self.connections.remove(&id) {
             if connection.announced_open {
+                self.metrics.note_session_close();
                 obs::session_close(
                     connection.peer,
                     &self.config.sender_comp_id,
@@ -335,6 +355,7 @@ impl<E: Engine> Gateway<E> {
             return false;
         }
         connection.announced_open = true;
+        self.metrics.note_session_open();
         obs::session_open(
             connection.peer,
             &self.config.sender_comp_id,
@@ -510,6 +531,7 @@ impl<E: Engine> Gateway<E> {
                         .get(&id)
                         .map(|connection| connection.key.clone());
                     if let Some(key) = key {
+                        self.metrics.note_order();
                         self.engine.deliver(&key, message);
                     }
                 }
@@ -530,6 +552,7 @@ impl<E: Engine> Gateway<E> {
         let now = SystemClock.now_millis();
         let mut work = 0;
         while let Some(event) = self.engine.poll_event() {
+            self.metrics.note_report();
             let Some(id) = self
                 .connections
                 .iter()

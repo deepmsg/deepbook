@@ -13,6 +13,7 @@ deploy/cluster-4host/run-cluster.sh scenario my-orders.txt
 deploy/cluster-4host/run-cluster.sh kill-leader --with-bench 2000 40000
 deploy/cluster-4host/run-cluster.sh restart 1 --keep
 deploy/cluster-4host/run-cluster.sh counters
+deploy/cluster-4host/run-cluster.sh observability up|status|down
 deploy/cluster-4host/run-cluster.sh down
 ```
 
@@ -102,6 +103,62 @@ starting the next one, or it is gone — the archives take the snapshot with the
 leader elsewhere, so `CLUSTER_APPOINTED_LEADER` pins it by default. Clear it
 (`CLUSTER_APPOINTED_LEADER=`) for a failover run, where the election is the
 thing being measured — a pinned leader is not replaced when it dies.
+
+## Observability
+
+The applications write local JSON lines and a loopback Prometheus page; a node
+agent reads them and ships them to a fifth machine. That machine is neither a
+member nor the client — the gateway and the load client own those cores, and a
+log store's compactions must not be part of a reading.
+
+```
+deploy/cluster-4host/run-cluster.sh observability up
+deploy/cluster-4host/run-cluster.sh observability status
+deploy/cluster-4host/run-cluster.sh observability down
+```
+
+| host | units | what the applications write |
+|---|---|---|
+| node0 / node1 / node2 | `deepmsg-app-agent`, `deepmsg-counters-exporter`, `deepmsg-errorlog-exporter` | `/var/log/deepmsg/{driver,cluster,engine}-node<N>.json` |
+| client | the same three | `/var/log/deepmsg/{driver,gateway,tool}-client.json` |
+| `CLUSTER_OBS_SSH` | `victoria-logs`, `victoria-metrics`, `vmauth`, and `grafana` when installed | — |
+
+`up` needs three variables it cannot invent:
+
+```bash
+export CLUSTER_OBS_SSH=root@172.16.1.21      # the fifth host, private address
+export CLUSTER_OBS_WRITE_TOKEN=...            # vmauth's write bearer
+export CLUSTER_OBS_READ_TOKEN=...             # vmauth's read bearer (Grafana)
+# optional: CLUSTER_OBS_GRAFANA_PASSWORD=...
+```
+
+The units, the collector configs and the pinned tool releases are deepmsg's
+(`deploy/observability/`), read from the controller's checkout
+(`DEEPBOOK_DEEPMSG_DIR`, default the sibling `deepmsg`); the hosts' own
+checkouts are at `CLUSTER_DEEPMSG_DIR`, whose `deploy/observability/e2e/
+fetch-tools.sh` downloads and SHA-verifies `otelcol-contrib`, `victoria-logs`,
+`victoria-metrics` and `vmauth`.
+
+Three things worth knowing:
+
+- **The log directory is outside the run root** (`CLUSTER_LOG_DIR`,
+  `/var/log/deepmsg`), because `up` removes the run root. `observability down`
+  stops processes and keeps the logs and the backends' data.
+- **`deepmsg-app-agent` replaces `deepmsg-log-agent`**, not adds to it: they
+  share a state directory, and two collectors would each keep their own file
+  offsets. All four application hosts expose a `/metrics` endpoint (D3), so the
+  overlay unit is the enabled one; the base unit is installed for a host that
+  later has none.
+- **A member's cluster directory is under the run root** (`/root/...`) and
+  `ProtectHome=yes` hides it from the error-log exporter. The installer adds a
+  drop-in with `ProtectHome=read-only` for that unit on members only — the
+  exporter reads that directory and nothing else there.
+
+`observability up` changes nothing about the run: the applications are still
+started by `run-cluster.sh`, which exports `DEEPMSG_LOG_DIR`,
+`DEEPMSG_NODE_ID` and `DEEPMSG_LOG_LEVEL` for them (`member-node.sh` and the
+client's scripts). With the agent stopped, the processes keep writing and their
+stderr stays empty; that contract is deepmsg's `crates/log/README.md`.
 
 ## Not this script's job
 

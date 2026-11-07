@@ -47,10 +47,15 @@ jobs:
         run: |
           set -eu
           before=$(grep -c '^deepmsg-.*rev = "' Cargo.toml)
-          test "$before" -eq 9
+          declared=$(grep -c '^deepmsg-' Cargo.toml)
+          # The count is what the manifest says, not a number in this file: the
+          # bump that added `deepmsg-log` made it ten and this step failed
+          # before it built anything.
+          test "$before" -gt 0
+          test "$before" -eq "$declared"
           old=$(./scripts/deepmsg-deps.sh pin)
           sed -i "s/rev = \"$old\"/rev = \"$SHA\"/g" Cargo.toml
-          test "$(grep -c "rev = \"$SHA\"" Cargo.toml)" -eq 9
+          test "$(grep -c "rev = \"$SHA\"" Cargo.toml)" -eq "$before"
           if grep -q "rev = \"$old\"" Cargo.toml; then
             echo "::error::Cargo.toml still pins $old after the rewrite"
             exit 1

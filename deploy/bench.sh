@@ -149,11 +149,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Children inherit no DEEPMSG_*/AERON_*: those names beat -D in the driver.
+# Children inherit no DEEPMSG_*/AERON_* — those names beat a `-D` in the
+# driver — except the log facade's own names, which are the process's
+# configuration and have no `-D` equivalent. Nothing here turns logging on: a
+# cell that wants it exports DEEPMSG_LOG_DIR, and its cost is then part of the
+# cell by construction.
+LOG_NAMES='^(DEEPMSG_LOG_(DIR|LEVEL|ROLL|CPU)|DEEPMSG_NODE_ID)$'
 SANITIZE=()
 while IFS= read -r name; do
     SANITIZE+=(-u "$name")
-done < <(env | grep -E '^(DEEPMSG_|AERON_)' | cut -d= -f1 || true)
+done < <(env | grep -E '^(DEEPMSG_|AERON_)' | cut -d= -f1 | grep -Ev "$LOG_NAMES" || true)
 
 DRIVER_ARGS=(
     "-Ddeepmsg.dir=$AERON" "-Daeron.dir=$AERON"
@@ -202,7 +207,7 @@ LAST_PID=""
 start() {
     local log=$1
     shift
-    "${SANITIZE[@]}" "$@" >"$log" 2>&1 &
+    env "${SANITIZE[@]}" "$@" >"$log" 2>&1 &
     LAST_PID=$!
     PIDS+=("$LAST_PID")
 }

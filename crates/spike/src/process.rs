@@ -366,8 +366,21 @@ pub(crate) fn spawn(binary: &Path, args: &[String], log: &Path) -> Result<Child,
     // `DEEPMSG_DIR` to locate the binaries would therefore point the child's
     // aeron directory at the source checkout. Strip both families; the
     // explicit arguments above are the only configuration a child gets.
+    //
+    // The log facade's own names are the exception: they have no `-D`
+    // equivalent and are the child's configuration, so they pass through. A
+    // test that does not set them pays nothing (the facade is off).
+    const LOG_ENV: [&str; 5] = [
+        "DEEPMSG_LOG_DIR",
+        "DEEPMSG_LOG_LEVEL",
+        "DEEPMSG_LOG_ROLL",
+        "DEEPMSG_LOG_CPU",
+        "DEEPMSG_NODE_ID",
+    ];
     for (key, _) in std::env::vars() {
-        if key.starts_with("DEEPMSG_") || key.starts_with("AERON_") {
+        if (key.starts_with("DEEPMSG_") || key.starts_with("AERON_"))
+            && !LOG_ENV.contains(&key.as_str())
+        {
             command.env_remove(key);
         }
     }

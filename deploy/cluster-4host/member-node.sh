@@ -59,6 +59,7 @@ _load() {
     _need threading_mode
     _need driver_conductor_cpu; _need driver_sender_cpu; _need driver_receiver_cpu
     _need cm_cpu; _need container_cpu
+    _need node_id
 }
 
 PIDS=()
@@ -196,6 +197,21 @@ _start() {
         rm -rf "$aeron_dir" "$archive_dir" "$cluster_dir"
     fi
     mkdir -p "$aeron_dir" "$archive_dir" "$cluster_dir"
+
+    # The application logs are a deployment concern, not a run artifact: the
+    # directory is outside the run root (see hosts.env) and the collector reads
+    # it as another user. An empty `log_dir` keeps the facade off, which is
+    # what a cell measuring the log's own cost wants.
+    if [ -n "${log_dir:-}" ]; then
+        mkdir -p "$log_dir"
+        chmod 0755 "$log_dir"
+        export DEEPMSG_LOG_DIR=$log_dir
+        export DEEPMSG_NODE_ID=$node_id
+        export DEEPMSG_LOG_LEVEL=${log_level:-info}
+        if [ -n "${log_roll:-}" ]; then
+            export DEEPMSG_LOG_ROLL=$log_roll
+        fi
+    fi
 
     args=("$driver")
     while IFS= read -r line; do args+=("$line"); done < <(_driver_args)

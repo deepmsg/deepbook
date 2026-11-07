@@ -30,6 +30,8 @@ BINARIES=(
     "deepmsg-cluster:deepmsg-cluster-node"
     "deepmsg-cluster-service:deepmsg-clustered-service-container"
     "deepmsg-cluster-tool:deepmsg-cluster-tool"
+    "deepmsg-tools:deepmsg-counters-exporter"
+    "deepmsg-tools:deepmsg-errorlog-exporter"
 )
 
 die() {

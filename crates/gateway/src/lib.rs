@@ -21,6 +21,7 @@
 
 pub mod acceptor;
 pub mod cluster;
+pub mod obs;
 pub mod sink;
 pub mod stub;
 

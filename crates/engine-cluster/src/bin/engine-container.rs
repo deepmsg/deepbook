@@ -33,7 +33,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
+use deepbook_engine_cluster::obs::{self, COMPONENTS, Engine as EngineComponent};
 use deepbook_engine_cluster::{EngineService, MarketDataConfig};
 use deepbook_engine_core::{EngineConfig, RiskConfig, SelfTradePrevention};
 use deepbook_marketdata::{DeepmsgConfig, DeepmsgRecoveryResponder};
@@ -42,8 +44,14 @@ use deepmsg_cluster_common::config::Properties;
 use deepmsg_cluster_service::{ClusteredServiceAgent, ServiceContainerConfig};
 use deepmsg_driver::idle::Strategy;
 use deepmsg_driver::sys;
+use deepmsg_log::Guard;
 
 const NAME: &str = "engine-container";
+
+/// How often the cumulative `engine.stats` line is written. The dashboard's
+/// rates need something finer than a snapshot, and per-order events would put
+/// the whole order flow into the log store; five seconds is the compromise.
+const STATS_INTERVAL: Duration = Duration::from_secs(5);
 
 const USAGE: &str = "\
 Usage: engine-container [options] [properties file ...]
@@ -60,6 +68,15 @@ or reject-taker). A malformed value is refused at startup. The media driver and
 the archive are separate processes in the same -Daeron.dir.";
 
 fn main() -> ExitCode {
+    // Off unless DEEPMSG_LOG_DIR is set. A bad configuration stops the
+    // container rather than quietly writing no lines (the launcher fixes it).
+    let _log = match Guard::from_env_with(EngineComponent, &COMPONENTS, None) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("{NAME}: the log configuration is refused: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -143,6 +160,7 @@ fn run() -> Result<(), String> {
 
     sys::set_current_thread_name("deepbook-engine")
         .map_err(|error| format!("the thread cannot be named: {error}"))?;
+    let metrics = service.metrics_handle();
     let mut idle = Strategy::by_agrona_name(&config.idle_strategy).ok_or_else(|| {
         format!(
             "aeron.cluster.idle.strategy={} names no strategy this build has",
@@ -157,9 +175,16 @@ fn run() -> Result<(), String> {
     }
 
     println!("STARTED service=deepbook-engine");
+    let mut last_stats = Instant::now();
     while sys::stop_signal().is_none() {
         match agent.do_work() {
-            Ok(work) => idle.idle(work),
+            Ok(work) => {
+                idle.idle(work);
+                if last_stats.elapsed() >= STATS_INTERVAL {
+                    obs::stats(&metrics);
+                    last_stats = Instant::now();
+                }
+            }
             Err(error) if error.is_termination() => {
                 return agent.close().map_err(|error| error.to_string());
             }

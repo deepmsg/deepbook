@@ -12,7 +12,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use deepbook_engine_core::wire::{decode_command, encode_command, encode_event};
-use deepbook_engine_core::{Command, Engine, EngineConfig, EngineSnapshot, Event};
+use deepbook_engine_core::{Command, Engine, EngineConfig, EngineSnapshot, Event, ExecType};
 use deepbook_marketdata::{
     DeepmsgConfig, DeepmsgIncrementalPublisher, Level, MarketDataService,
     ServiceConfig as MarketServiceConfig, Snapshot,
@@ -24,6 +24,8 @@ use deepmsg_cluster_service::{
 };
 use deepmsg_codec_cluster::close_reason::CloseReason;
 
+use crate::metrics::EngineMetrics;
+use crate::obs;
 use crate::snapshot::{CodecError, decode, encode};
 
 /// A service-layer failure.
@@ -110,6 +112,8 @@ pub struct EngineService {
     sessions: Vec<SessionId>,
     /// Whether a day-expiry timer is armed.
     expiry_scheduled: bool,
+    /// The cumulative numbers the container's log tick reads.
+    metrics: Arc<EngineMetrics>,
 }
 
 /// The most events queued for one cluster session. A gateway that stays
@@ -139,6 +143,7 @@ impl EngineService {
             pending_egress: HashMap::new(),
             sessions: Vec::new(),
             expiry_scheduled: false,
+            metrics: Arc::new(EngineMetrics::default()),
         }
     }
 
@@ -172,6 +177,7 @@ impl EngineService {
             pending_egress: HashMap::new(),
             sessions: Vec::new(),
             expiry_scheduled: false,
+            metrics: Arc::new(EngineMetrics::default()),
         })
     }
 
@@ -191,6 +197,7 @@ impl EngineService {
             pending_egress: HashMap::new(),
             sessions: Vec::new(),
             expiry_scheduled: false,
+            metrics: Arc::new(EngineMetrics::default()),
         })
     }
 
@@ -203,6 +210,12 @@ impl EngineService {
         self.market_data
             .as_ref()
             .map(|market| Arc::clone(&market.snapshot))
+    }
+
+    /// The engine's cumulative numbers, for the container's log tick.
+    #[must_use]
+    pub fn metrics_handle(&self) -> Arc<EngineMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// The engine, for a test or an operator.
@@ -241,6 +254,17 @@ impl EngineService {
         let command = decode_command(payload).map_err(ServiceError::Wire)?;
         let mut events = Vec::new();
         self.engine.on_command(&command, log_pos, &mut events);
+        self.metrics.note_applied(log_pos);
+        for event in &events {
+            match event {
+                Event::Trade(_) => self.metrics.note_filled(),
+                Event::CancelReject(_) => self.metrics.note_rejected(),
+                Event::ExecutionReport(report) if report.exec_type == ExecType::Rejected => {
+                    self.metrics.note_rejected();
+                }
+                _ => {}
+            }
+        }
         Ok(events)
     }
 
@@ -379,8 +403,11 @@ impl ClusteredService for EngineService {
         snapshot: Option<&mut SnapshotReader<'_>>,
     ) -> Result<(), ContainerError> {
         let restored_from_snapshot = snapshot.is_some();
+        let mut restored_bytes = 0_usize;
+        obs::start(self.config.symbol);
         if let Some(reader) = snapshot {
             let bytes = read_snapshot(cluster, reader)?;
+            restored_bytes = bytes.len();
             let (decoded, market_seq) = decode_service_snapshot(&bytes).map_err(container)?;
             self.engine = Engine::restore(self.config, &decoded).map_err(container)?;
             self.restored_log_pos = decoded.last_log_pos;
@@ -431,6 +458,15 @@ impl ClusteredService for EngineService {
         if !restored_from_snapshot {
             eprintln!("engine: no snapshot; the engine starts empty and replays the log");
         }
+        obs::recover(
+            restored_from_snapshot,
+            if restored_from_snapshot {
+                self.restored_log_pos
+            } else {
+                -1
+            },
+            restored_bytes,
+        );
         Ok(())
     }
 
@@ -530,15 +566,12 @@ impl ClusteredService for EngineService {
         // `DefaultHasher` rather than a digest crate because the three members
         // run the same binary, so the value is comparable without adding a
         // dependency to the product for a diagnostic.
-        {
+        let (hash, state_hash) = {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             bytes.hash(&mut hasher);
-            eprintln!(
-                "engine: snapshot len={} hash={:016x}",
-                bytes.len(),
-                hasher.finish()
-            );
+            let hash = hasher.finish();
+            eprintln!("engine: snapshot len={} hash={hash:016x}", bytes.len());
             // ★ A second digest with `last_log_pos` zeroed. The plain one is
             // only comparable between members that applied the *same* log: a
             // leadership change appends control records, every later command's
@@ -546,15 +579,20 @@ impl ClusteredService for EngineService {
             // differently. This one is the trading state alone, so it can be
             // compared across a failover -- which is the question a four-host
             // run actually asks.
+            let mut state_hash = None;
             if let Ok((mut snapshot, seq)) = decode_service_snapshot(&bytes) {
                 snapshot.last_log_pos = 0;
                 if let Ok(body) = encode(&snapshot) {
                     let mut state = std::collections::hash_map::DefaultHasher::new();
                     encode_service_snapshot(body, seq).hash(&mut state);
+                    state_hash = Some(state.finish());
                     eprintln!("engine: state hash={:016x}", state.finish());
                 }
             }
-        }
+            (hash, state_hash)
+        };
+        self.metrics.note_snapshot();
+        obs::snapshot(bytes.len(), hash, state_hash);
         let chunk = writer.max_payload_length().max(1);
         for part in bytes.chunks(chunk) {
             loop {
@@ -577,6 +615,8 @@ impl ClusteredService for EngineService {
     }
 
     fn on_role_change(&mut self, new_role: Role) -> Result<(), ContainerError> {
+        self.metrics.set_leader(new_role == Role::Leader);
+        obs::role(role_name(new_role), new_role == Role::Leader);
         if new_role == Role::Leader {
             // Timers belong to the leader. The previous leader's timer is not
             // ours; arm a new one on the next command (the callback has no
@@ -587,7 +627,17 @@ impl ClusteredService for EngineService {
     }
 
     fn on_terminate(&mut self, _cluster: &mut Cluster<'_>) -> Result<(), ContainerError> {
+        obs::stop();
         Ok(())
+    }
+}
+
+/// The role's name in the log; the same words `aeron.cluster` uses.
+const fn role_name(role: Role) -> &'static str {
+    match role {
+        Role::Follower => "follower",
+        Role::Candidate => "candidate",
+        Role::Leader => "leader",
     }
 }
 

@@ -83,6 +83,15 @@ const MEMBER_IMAGE_LIVENESS: &str = "500ms";
 
 const CHILD_SETTLE: Duration = Duration::from_millis(500);
 const COUNTER_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long a service container may take to announce that it started.
+///
+/// An election closes before the service container has attached, and a client
+/// that connects in that window waits for a session message nobody answers
+/// (fix-gateway's `--message-timeout-ms`, 5 s in the failover run). Waiting for
+/// the container's own line is what the deployment scripts do
+/// (`member-node.sh` `_await_line`); a run that skips it is a race, not a
+/// measurement.
+const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The four directories one member (or the client) owns.
 struct DirSet {
@@ -195,7 +204,53 @@ impl ClusterNodes {
         };
         cluster.start_client_driver()?;
         cluster.start_nodes()?;
+        cluster.wait_for_services(SERVICE_START_TIMEOUT)?;
         Ok(cluster)
+    }
+
+    /// Wait until every member's service container says it started.
+    ///
+    /// [`Self::wait_for_leader`] is not enough on its own: the module closes
+    /// the election before the container has attached to it, and a cluster
+    /// session message that arrives in that window is not answered. The
+    /// deployment scripts gate on the container's own line; this is the same
+    /// gate.
+    fn wait_for_services(&self, timeout: Duration) -> Result<(), String> {
+        let needle = match self.service {
+            Service::BasicAuction => "STARTED serviceId=",
+            Service::Engine => "STARTED service=deepbook-engine",
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            let missing: Vec<usize> = self
+                .nodes
+                .iter()
+                .filter(|node| {
+                    let log = node.dirs.logs.join("container.log");
+                    let text = std::fs::read_to_string(&log).unwrap_or_default();
+                    !text.contains(needle)
+                })
+                .map(|node| node.id)
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                let detail = missing
+                    .iter()
+                    .map(|id| {
+                        let log = self.nodes[*id].dirs.logs.join("container.log");
+                        format!("member {id}:\n{}", tail(&log))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(format!(
+                    "the service container did not start on members {missing:?} \
+                     within {timeout:?}:\n{detail}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// The aeron directory of the client's own driver.

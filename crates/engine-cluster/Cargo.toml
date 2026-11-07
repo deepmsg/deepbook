@@ -19,3 +19,4 @@ deepmsg-cluster-common = { workspace = true }
 deepmsg-codec-cluster = { workspace = true }
 deepmsg-cluster-service = { workspace = true }
 deepmsg-driver = { workspace = true }
+deepmsg-log = { workspace = true }

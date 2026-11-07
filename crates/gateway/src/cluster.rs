@@ -59,6 +59,7 @@ use deepmsg_client::fragment_assembler::MessageHeader;
 use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
+use crate::obs;
 use crate::sink::{CommandSink, EventSource, SessionEvent, SessionKey};
 
 /// How many commands may wait for the cluster before new ones are refused.
@@ -113,6 +114,18 @@ pub struct ClusterEngineConfig {
     pub egress_stream_id: i32,
     /// The connect's `aeron.cluster.message.timeout`.
     pub message_timeout_ns: i64,
+    /// How many times the initial connect is attempted before the gateway
+    /// gives up.
+    ///
+    /// A connect request can land on a follower: the request names every
+    /// member's ingress, the client offers to the first publication that
+    /// connects, and a follower answers with a redirect instead of a session.
+    /// Following that redirect re-examines every member, and the same follower
+    /// can be chosen again — the connect then spends its whole timeout
+    /// redirecting to itself. Retrying the connect is what the reference's
+    /// applications are documented to do; three attempts makes the outcome
+    /// independent of which publication connected first.
+    pub connect_attempts: u32,
     /// `newLeaderTimeoutNs`; `None` lets the connect derive it.
     pub new_leader_timeout_ns: Option<i64>,
     /// The engine's symbol id, sent in every command.
@@ -136,6 +149,7 @@ impl ClusterEngineConfig {
             egress_channel: "aeron:ipc".to_owned(),
             egress_stream_id: 102,
             message_timeout_ns: 5_000_000_000,
+            connect_attempts: 3,
             new_leader_timeout_ns: None,
             symbol: 1,
             symbol_name: "AAPL".to_owned(),
@@ -439,15 +453,34 @@ impl fmt::Debug for ClusterEngine {
 impl ClusterEngine {
     /// Connect the media driver and open a cluster session.
     ///
+    /// The attempt is retried [`ClusterEngineConfig::connect_attempts`] times:
+    /// a connect that lands on a follower can spend its whole timeout being
+    /// redirected to the leader it already named, and a fresh attempt is the
+    /// only way out (see the field's documentation).
+    ///
     /// # Errors
     ///
-    /// The driver cannot be reached, or the cluster does not answer a connect
-    /// within the configured message timeout.
+    /// The driver cannot be reached, or every attempt failed. The error is the
+    /// last attempt's.
     pub fn connect(config: ClusterEngineConfig) -> Result<Self, ClusterEngineError> {
         let mut client = Client::connect(&config.aeron_dir)
             .map_err(|error| ClusterEngineError::Driver(error.to_string()))?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
-        let session = open_session(&config, 0, &egress, &mut client)?;
+        let attempts = config.connect_attempts.max(1);
+        let mut attempt = 0;
+        let session = loop {
+            attempt += 1;
+            match open_session(&config, 0, &egress, &mut client) {
+                Ok(session) => break session,
+                Err(error) if attempt < attempts => {
+                    eprintln!(
+                        "fix-gateway: cluster connect attempt {attempt}/{attempts} failed: \
+                         {error}; connecting again"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let mapping = Mapping::new(config.symbol, &config.symbol_name);
         Ok(Self {
             config,
@@ -492,6 +525,7 @@ impl ClusterEngine {
             }
             if session.is_closed() {
                 eprintln!("fix-gateway: cluster session closed");
+                obs::cluster_lost(session.cluster_session_id(), self.sessions_opened);
                 self.session = None;
                 self.reconnect_at = Some(Instant::now() + RECONNECT_DELAY);
             } else if self.last_keep_alive.elapsed() >= KEEP_ALIVE_INTERVAL {
@@ -528,6 +562,7 @@ impl ClusterEngine {
                     session.cluster_session_id(),
                     egress_channel_for(&self.config.egress_channel, self.sessions_opened)
                 );
+                obs::cluster_recovered(session.cluster_session_id(), self.sessions_opened);
                 self.sessions_opened = self.sessions_opened.saturating_add(1);
                 self.session = Some(session);
                 self.reconnect_at = None;
@@ -643,6 +678,7 @@ impl ClusterEngine {
     }
 
     fn reject_new(&mut self, session: &SessionKey, order: &NewOrderSingle, text: String) {
+        obs::command_rejected(&order.cl_ord_id, &text);
         let exec_id = self.local_exec_id();
         let now = format_utc(SystemClock.now_millis());
         let report = ExecutionReport {
@@ -674,6 +710,7 @@ impl ClusterEngine {
         is_replace: bool,
         text: String,
     ) {
+        obs::command_rejected(cl_ord_id, &text);
         let reject = OrderCancelReject {
             order_id: "NONE".to_owned(),
             cl_ord_id: cl_ord_id.to_owned(),

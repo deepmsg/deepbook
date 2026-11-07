@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 deepbook-types = { path = "../types" }
 deepbook-fix = { path = "../fix" }
+deepmsg-log = { workspace = true }
 
 [dev-dependencies]
 deepbook-gateway = { path = "../gateway" }

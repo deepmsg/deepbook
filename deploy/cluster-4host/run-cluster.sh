@@ -104,6 +104,7 @@ _member_properties() { # <member> <file>
     h=$(_ip "$i")
     {
         echo "member_id=$i"
+        echo "node_id=node$i"
         echo "host=$h"
         echo "cluster_id=$CLUSTER_ID"
         echo "members=$(_members_string)"
@@ -130,6 +131,9 @@ _member_properties() { # <member> <file>
         echo "engine_symbol=$CLUSTER_ENGINE_SYMBOL"
         echo "engine_max_orders=$CLUSTER_ENGINE_MAX_ORDERS"
         echo "engine_recent_window=$CLUSTER_ENGINE_RECENT_WINDOW"
+        echo "log_dir=$CLUSTER_LOG_DIR"
+        echo "log_level=$CLUSTER_LOG_LEVEL"
+        echo "log_roll=$CLUSTER_LOG_ROLL"
     } >"$file"
 }
 
@@ -326,6 +330,19 @@ _client_script() { # <dir> <name> <cpu|-> <binary> [args...]
         echo '#!/usr/bin/env bash'
         echo 'set -euo pipefail'
         echo "echo \$\$ >\"$cdir/${name%.sh}.pid\""
+        # The application logs are the process's own files; the environment is
+        # what turns the facade on, and every process on the client shares the
+        # `client` node id (the component in the file name is what separates
+        # them).
+        if [ -n "$CLUSTER_LOG_DIR" ]; then
+            echo "mkdir -p $(printf '%q' "$CLUSTER_LOG_DIR")"
+            echo "export DEEPMSG_LOG_DIR=$(printf '%q' "$CLUSTER_LOG_DIR")"
+            echo "export DEEPMSG_NODE_ID=client"
+            echo "export DEEPMSG_LOG_LEVEL=$(printf '%q' "$CLUSTER_LOG_LEVEL")"
+            if [ -n "$CLUSTER_LOG_ROLL" ]; then
+                echo "export DEEPMSG_LOG_ROLL=$(printf '%q' "$CLUSTER_LOG_ROLL")"
+            fi
+        fi
         if [ "$cpu" = "-" ]; then
             printf 'exec "%s"' "$binary"
         else
@@ -336,6 +353,15 @@ _client_script() { # <dir> <name> <cpu|-> <binary> [args...]
     } >"$stage/$name"
     scp -q "$stage/$name" "$(_client_host):$cdir/$name"
     _on "$(_client_host)" "chmod +x '$cdir/$name'"
+}
+
+# The environment a process the client host starts *directly* (not through
+# `_client_script`) needs: the same log directory and node id.
+_client_env() {
+    if [ -n "$CLUSTER_LOG_DIR" ]; then
+        printf 'DEEPMSG_LOG_DIR=%q DEEPMSG_NODE_ID=client DEEPMSG_LOG_LEVEL=%q ' \
+            "$CLUSTER_LOG_DIR" "$CLUSTER_LOG_LEVEL"
+    fi
 }
 
 _client_start() { # <script> <log> <pidfile>
@@ -412,6 +438,9 @@ cmd_up() {
     _wait_leader 90 || return 1
 
     echo "== client"
+    if [ -n "$CLUSTER_LOG_DIR" ]; then
+        _on "$(_client_host)" "mkdir -p '$CLUSTER_LOG_DIR' && chmod 0755 '$CLUSTER_LOG_DIR'" || true
+    fi
     _client_driver_start || return 1
     _gateway_start || return 1
     echo "== up"
@@ -453,7 +482,10 @@ cmd_bench() {
                 --warmup "$warmup" --account 1 --price 1.00 --qty 1 --timeout-ms 120000 --seed-book)
     [ "$json" -eq 1 ] && args+=(--json)
     echo "== fix-bench rate=$rate samples=$samples warmup=$warmup"
-    _on "$(_client_host)" "taskset -c $CLUSTER_CLIENT_CPU '$CLUSTER_DEEPBOOK_DIR/target/release/fix-bench' $(printf '%q ' "${args[@]}")" | tee "$out"
+    if [ -n "$CLUSTER_LOG_DIR" ]; then
+        _on "$(_client_host)" "mkdir -p '$CLUSTER_LOG_DIR'" || true
+    fi
+    _on "$(_client_host)" "$(_client_env)taskset -c $CLUSTER_CLIENT_CPU '$CLUSTER_DEEPBOOK_DIR/target/release/fix-bench' $(printf '%q ' "${args[@]}")" | tee "$out"
     echo "saved $out"
 }
 
@@ -475,8 +507,11 @@ cmd_kill_leader() {
         local cdir
         cdir=$(_client_dir)
         echo "fix-bench ${rate}/s x ${samples} samples, starting ${settle}s before the kill"
+        if [ -n "$CLUSTER_LOG_DIR" ]; then
+            _on "$(_client_host)" "mkdir -p '$CLUSTER_LOG_DIR'" || true
+        fi
         _daemon "$(_client_host)" \
-            "taskset -c $CLUSTER_CLIENT_CPU '$CLUSTER_DEEPBOOK_DIR/target/release/fix-bench' \
+            "$(_client_env)taskset -c $CLUSTER_CLIENT_CPU '$CLUSTER_DEEPBOOK_DIR/target/release/fix-bench' \
              --connect '127.0.0.1:$FIX_PORT' --rate $rate --samples $samples --warmup 2000 \
              --account 1 --price 1.00 --qty 1 --timeout-ms 120000 --seed-book" \
             "$cdir/kill-leader-bench.txt"

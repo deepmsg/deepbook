@@ -14,9 +14,20 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use deepbook_bench::obs::{self, COMPONENTS, Tool};
 use deepbook_bench::{BenchConfig, run};
+use deepmsg_log::Guard;
 
 fn main() -> ExitCode {
+    // Off unless DEEPMSG_LOG_DIR is set; a measurement normally leaves it off
+    // (the facade's cost would be part of the number).
+    let _log = match Guard::from_env_with(Tool, &COMPONENTS, None) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("fix-bench: the log configuration is refused: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let (config, json, prometheus) = match parse() {
         Ok(options) => options,
         Err(error) => {
@@ -24,8 +35,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    obs::benchmark_start(config.rate_per_second, config.samples, config.warmup);
     match run(&config) {
         Ok(report) => {
+            let summary = report.summary();
+            obs::benchmark_end(&report, &summary);
             if json {
                 println!("{}", report.to_json());
             } else {

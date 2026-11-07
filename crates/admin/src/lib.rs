@@ -18,7 +18,7 @@
 
 pub mod control;
 pub mod feed;
-pub mod http;
+pub use deepbook_http as http;
 pub mod metrics;
 pub mod state;
 pub mod web;

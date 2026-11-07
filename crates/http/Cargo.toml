@@ -1,0 +1,11 @@
+[package]
+name = "deepbook-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "deepbook: the small HTTP/1.1 side the admin and the metrics endpoints share"
+
+[lints]
+workspace = true

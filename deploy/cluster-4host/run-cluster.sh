@@ -10,6 +10,7 @@
 #   run-cluster.sh kill-leader
 #   run-cluster.sh counters
 #   run-cluster.sh down
+#   run-cluster.sh observability up|status|down
 #
 # `up` writes one `member.properties` per member, ships it with
 # `member-node.sh`, starts it under `ssh -f` + `setsid`, then waits for two
@@ -620,6 +621,9 @@ case "$action" in
     restart)     cmd_restart "$@" ;;
     scenario)    cmd_scenario "$@" ;;
     counters)    cmd_counters ;;
+    # The stack the applications ship to; see `observability.sh` and the
+    # README's observability section. `up` never deletes /var/log/deepmsg.
+    observability) shift; "$here/observability.sh" "$@" ;;
     down)        cmd_down ;;
-    *) echo "usage: run-cluster.sh list|up|status|bench|kill-leader|restart|scenario|counters|down" >&2; exit 2 ;;
+    *) echo "usage: run-cluster.sh list|up|status|bench|kill-leader|restart|scenario|counters|observability|down" >&2; exit 2 ;;
 esac

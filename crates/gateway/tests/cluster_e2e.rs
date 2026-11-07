@@ -337,6 +337,7 @@ impl Harness {
         args.push("-Ddeepbook.engine.symbol=1".to_owned());
         args.push("-Ddeepbook.engine.max-orders=1024".to_owned());
         args.push("-Ddeepbook.engine.recent-window=1024".to_owned());
+        args.push("-Ddeepbook.metrics.bind=off".to_owned());
         let binary =
             engine_container_binary().ok_or_else(|| "engine-container is not built".to_owned())?;
         let child = spawn(&binary, &args, &log)?;
@@ -394,6 +395,10 @@ impl Harness {
             self.backend.clone(),
             "--new-leader-timeout-ms".to_owned(),
             "4000".to_owned(),
+            // Tests run in parallel and their own harness owns no metrics
+            // port; the deployment sets one.
+            "--metrics-bind".to_owned(),
+            "off".to_owned(),
         ];
         self.gateway = Some(spawn(binary, &args, &log)?);
 

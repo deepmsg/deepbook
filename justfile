@@ -20,6 +20,12 @@ check: fmt-check clippy test
 deps:
     ./scripts/deepmsg-deps.sh build
 
+# The deepbook dashboard's own config check: every metric it names is one the
+# deployment publishes, the provider names the deepbook folder, and the node
+# variable reads the hosts that run the engine and the gateway.
+check-observability:
+    python3 deploy/observability/check.py
+
 # Fail unless those binaries are the pinned revision. bench.sh and engine-e2e
 # run it themselves.
 deps-check:

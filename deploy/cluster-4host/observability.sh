@@ -46,6 +46,9 @@ MEMBERS=3
 # checkouts are at CLUSTER_DEEPMSG_DIR; a controller that is not one of them
 # (a laptop) needs its own. Default: the sibling checkout.
 OBS_SOURCE=${DEEPBOOK_DEEPMSG_DIR:-$(cd "$here/../../.." && pwd)/deepmsg}
+# This repository: the dashboard and its provider are deepbook's, and they go
+# into their own folder.
+DEEPBOOK_ROOT=$(cd "$here/../.." && pwd)
 stage=${TMPDIR:-/tmp}/deepbook-observability
 self_ip=$(hostname -I | awk '{print $1}')
 
@@ -320,6 +323,13 @@ install_obs_host() {
         done
         _put "$OBS_SOURCE/deploy/observability/systemd/grafana.service" \
             "$host" /etc/systemd/system/grafana.service
+        # A second provider and a second folder: deepmsg's three dashboards and
+        # deepbook's one are not the same product's screens.
+        _on "$host" "mkdir -p /etc/deepmsg/grafana/dashboards-deepbook"
+        _put "$DEEPBOOK_ROOT/deploy/observability/grafana/provisioning/dashboards/deepbook.yaml" \
+            "$host" /etc/deepmsg/grafana/provisioning/dashboards/deepbook.yaml
+        _put_tree "$DEEPBOOK_ROOT/deploy/observability/grafana/dashboards/." \
+            "$host" /etc/deepmsg/grafana/dashboards-deepbook/
 
         cat >"$stage/observability.env" <<EOF
 DEEPMSG_VMAUTH_URL=http://$obs_ip:8427
@@ -390,6 +400,8 @@ status_obs_host() {
 cmd_up() {
     [ -d "$OBS_SOURCE/deploy/observability" ] ||
         _die "no deepmsg checkout at $OBS_SOURCE (set DEEPBOOK_DEEPMSG_DIR)"
+    [ -f "$DEEPBOOK_ROOT/deploy/observability/grafana/dashboards/deepbook-engine.json" ] ||
+        _die "no deepbook dashboard at $DEEPBOOK_ROOT"
     [ -n "$CLUSTER_OBS_SSH" ] || _die "CLUSTER_OBS_SSH is not set (the fifth host)"
     [ -n "${CLUSTER_OBS_WRITE_TOKEN:-}" ] || _die "CLUSTER_OBS_WRITE_TOKEN is not set"
     [ -n "${CLUSTER_OBS_READ_TOKEN:-}" ] || _die "CLUSTER_OBS_READ_TOKEN is not set"

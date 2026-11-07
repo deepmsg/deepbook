@@ -154,6 +154,18 @@ Three things worth knowing:
   drop-in with `ProtectHome=read-only` for that unit on members only — the
   exporter reads that directory and nothing else there.
 
+### Dashboards
+
+The log host's Grafana loads deepmsg's three dashboards into the `deepmsg`
+folder and deepbook's `deepbook-engine` into a `deepbook` folder of its own:
+the provider is `deploy/observability/grafana/provisioning/dashboards/deepbook.yaml`
+and the directory it scans is `/etc/deepmsg/grafana/dashboards-deepbook`. The
+dashboard source is `deploy/observability/grafana/dashboards/deepbook-engine.json`
+and `just check-observability` (or `python3 deploy/observability/check.py`) is
+its gate: every metric a panel names must be a series the deployment
+publishes, and the `node` variable reads `node_id` from `deepmsg_driver_up`, so
+it covers the client host as well as the members.
+
 `observability up` changes nothing about the run: the applications are still
 started by `run-cluster.sh`, which exports `DEEPMSG_LOG_DIR`,
 `DEEPMSG_NODE_ID` and `DEEPMSG_LOG_LEVEL` for them (`member-node.sh` and the

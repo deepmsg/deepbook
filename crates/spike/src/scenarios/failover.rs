@@ -314,6 +314,10 @@ impl Gateway {
             egress,
             "--message-timeout-ms".to_owned(),
             "5000".to_owned(),
+            // The spike's host is not the deployment; nothing scrapes it and
+            // the port belongs to whatever else is running.
+            "--metrics-bind".to_owned(),
+            "off".to_owned(),
             // If the one-shot NewLeaderEvent is lost the client gives up after
             // this and the gateway opens a fresh session on a new egress port
             // (see `ClusterEngine::reconnect`). The event arrives in every run

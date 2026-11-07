@@ -10,6 +10,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use deepbook_engine_core::wire::{decode_command, encode_command, encode_event};
 use deepbook_engine_core::{Command, Engine, EngineConfig, EngineSnapshot, Event, ExecType};
@@ -24,7 +25,7 @@ use deepmsg_cluster_service::{
 };
 use deepmsg_codec_cluster::close_reason::CloseReason;
 
-use crate::metrics::EngineMetrics;
+use crate::metrics::{BookShape, EngineMetrics};
 use crate::obs;
 use crate::snapshot::{CodecError, decode, encode};
 
@@ -114,6 +115,10 @@ pub struct EngineService {
     expiry_scheduled: bool,
     /// The cumulative numbers the container's log tick reads.
     metrics: Arc<EngineMetrics>,
+    /// When the book's shape was last read for the metrics page. The book is
+    /// walked at most once a second: a scrape wants a recent shape, not the
+    /// cost of walking every level on every command.
+    last_book_refresh: Instant,
 }
 
 /// The most events queued for one cluster session. A gateway that stays
@@ -130,6 +135,8 @@ const EXPIRY_RETRY_TIMER: i64 = 2;
 const DAY_NANOS: i64 = 86_400_000_000_000;
 /// How long to wait before retrying an expiry command the ingress refused.
 const EXPIRY_RETRY_NANOS: i64 = 1_000_000_000;
+/// How often the book's shape is read for the metrics page.
+const BOOK_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 impl EngineService {
     /// A fresh engine with the deployment configuration.
@@ -144,6 +151,7 @@ impl EngineService {
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
+            last_book_refresh: Instant::now(),
         }
     }
 
@@ -178,6 +186,7 @@ impl EngineService {
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
+            last_book_refresh: Instant::now(),
         })
     }
 
@@ -198,6 +207,7 @@ impl EngineService {
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
+            last_book_refresh: Instant::now(),
         })
     }
 
@@ -265,7 +275,24 @@ impl EngineService {
                 _ => {}
             }
         }
+        self.refresh_book_metrics(false);
         Ok(events)
+    }
+
+    /// Read the book's shape for the metrics page, at most once a second.
+    fn refresh_book_metrics(&mut self, force: bool) {
+        if !force && self.last_book_refresh.elapsed() < BOOK_REFRESH_INTERVAL {
+            return;
+        }
+        self.last_book_refresh = Instant::now();
+        let view = self.engine.view();
+        self.metrics.note_book(BookShape {
+            bid_levels: view.bids.len() as u64,
+            ask_levels: view.asks.len() as u64,
+            bid_qty: view.bids.iter().map(|level| level.qty).sum(),
+            ask_qty: view.asks.iter().map(|level| level.qty).sum(),
+            md_seq: i64::try_from(view.md_seq).unwrap_or(i64::MAX),
+        });
     }
 
     /// Feed the engine's trades and book updates into the market-data stream
@@ -458,6 +485,7 @@ impl ClusteredService for EngineService {
         if !restored_from_snapshot {
             eprintln!("engine: no snapshot; the engine starts empty and replays the log");
         }
+        self.refresh_book_metrics(true);
         obs::recover(
             restored_from_snapshot,
             if restored_from_snapshot {

@@ -11,6 +11,7 @@ members = [
     "crates/admin",
     "crates/bench",
     "crates/io",
+    "crates/http",
     "crates/spike",
 ]
 

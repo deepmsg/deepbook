@@ -17,8 +17,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use deepbook_fix::journal::SyncPolicy;
+use deepbook_gateway::metrics::{self, GatewayMetrics};
 use deepbook_gateway::obs::{COMPONENTS, Gateway as GatewayComponent};
 use deepbook_gateway::{
     ClusterEngine, ClusterEngineConfig, Engine, Gateway, GatewayConfig, SessionKey, StubEngine,
@@ -48,6 +50,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let options = Options::parse()?;
+    let metrics = Arc::new(GatewayMetrics::default());
     let mut config = GatewayConfig::new(
         options.bind,
         options.session_dir.clone(),
@@ -83,7 +86,7 @@ fn run() -> Result<(), String> {
         cluster_config.symbol = options.symbol_id;
         cluster_config.symbol_name = options.symbol.clone();
 
-        let engine = ClusterEngine::connect(cluster_config)
+        let engine = ClusterEngine::connect_with(cluster_config, Arc::clone(&metrics))
             .map_err(|error| format!("cannot connect the cluster: {error}"))?;
         println!(
             "fix-gateway cluster session={} aeron={}",
@@ -95,15 +98,26 @@ fn run() -> Result<(), String> {
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string())
         );
-        serve(config, engine, &options)
+        serve(config, engine, &options, metrics)
     } else {
-        serve(config, StubEngine::new(), &options)
+        serve(config, StubEngine::new(), &options, metrics)
     }
 }
 
-fn serve<E: Engine>(config: GatewayConfig, engine: E, options: &Options) -> Result<(), String> {
-    let mut gateway = Gateway::bind(config, engine)
+fn serve<E: Engine>(
+    config: GatewayConfig,
+    engine: E,
+    options: &Options,
+    metrics: Arc<GatewayMetrics>,
+) -> Result<(), String> {
+    let mut gateway = Gateway::bind_with_metrics(config, engine, Arc::clone(&metrics))
         .map_err(|error| format!("cannot bind {}: {error}", options.bind))?;
+    if let Some(bind) = options.metrics_bind {
+        let page = Arc::clone(&metrics);
+        deepbook_http::serve_metrics(bind, move || metrics::prometheus(&page))
+            .map_err(|error| format!("cannot serve metrics on {bind}: {error}"))?;
+        println!("fix-gateway metrics on {bind}");
+    }
     let address = gateway
         .local_addr()
         .map_err(|error| format!("cannot read the bound address: {error}"))?;
@@ -119,6 +133,8 @@ fn serve<E: Engine>(config: GatewayConfig, engine: E, options: &Options) -> Resu
 
 struct Options {
     bind: SocketAddr,
+    /// Where the Prometheus text endpoint listens; `None` serves nothing.
+    metrics_bind: Option<SocketAddr>,
     session_dir: PathBuf,
     sender: String,
     target: String,
@@ -148,6 +164,11 @@ impl Options {
             bind: "127.0.0.1:9876"
                 .parse()
                 .expect("the default address parses"),
+            metrics_bind: Some(
+                "127.0.0.1:26101"
+                    .parse()
+                    .expect("the default metrics address parses"),
+            ),
             session_dir: "fix-sessions".into(),
             sender: "DEEPBOOK".to_owned(),
             target: "CLIENT".to_owned(),
@@ -188,6 +209,17 @@ impl Options {
                     options.bind = value("--bind")?
                         .parse()
                         .map_err(|_| "--bind must be IP:port".to_owned())?;
+                }
+                "--metrics-bind" => {
+                    let text = value("--metrics-bind")?;
+                    options.metrics_bind = if text == "off" {
+                        None
+                    } else {
+                        Some(
+                            text.parse()
+                                .map_err(|_| "--metrics-bind must be IP:port or off".to_owned())?,
+                        )
+                    };
                 }
                 "--session-dir" => options.session_dir = value("--session-dir")?.into(),
                 "--sender" => options.sender = value("--sender")?,

@@ -703,7 +703,12 @@ fn container_args(
         // Every member applies the log and would publish its own market-data
         // stream from its own driver; the failover run observes the engine
         // through FIX reports instead.
-        Service::Engine => args.push(d("deepbook.marketdata.enabled", false)),
+        Service::Engine => {
+            args.push(d("deepbook.marketdata.enabled", false));
+            // Three engine containers on the same machine would all want the
+            // deployment's metrics port; this run does not scrape it.
+            args.push(d("deepbook.metrics.bind", "off"));
+        }
     }
     args
 }

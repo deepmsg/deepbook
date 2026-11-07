@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 /// The largest request head accepted.
@@ -234,6 +235,50 @@ pub fn respond_json(
     body: &str,
 ) -> io::Result<()> {
     respond(stream, status, reason, "application/json", body.as_bytes())
+}
+
+/// Serve one `/metrics` page from a background thread.
+///
+/// One request per connection and `GET /metrics` only; anything else is a
+/// `404`. The endpoint is the process's own view and nothing else, so there is
+/// no keep-alive and no body: a scrape reads it and closes.
+///
+/// # Errors
+///
+/// The address cannot be bound or the thread cannot be started.
+pub fn serve_metrics<F>(bind: SocketAddr, render: F) -> io::Result<JoinHandle<()>>
+where
+    F: Fn() -> String + Send + 'static,
+{
+    let listener = TcpListener::bind(bind)?;
+    std::thread::Builder::new()
+        .name("deepbook-metrics".to_owned())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = serve_one(&mut stream, &render);
+            }
+        })
+}
+
+fn serve_one(stream: &mut TcpStream, render: &impl Fn() -> String) -> io::Result<()> {
+    let Some(request) = read_request(stream, Duration::from_millis(500))? else {
+        return Ok(());
+    };
+    if request.method != "GET" {
+        return method_not_allowed(stream);
+    }
+    if request.path != "/metrics" {
+        return not_found(stream);
+    }
+    let body = render();
+    ok(
+        stream,
+        "text/plain; version=0.0.4; charset=utf-8",
+        body.as_bytes(),
+    )
 }
 
 #[cfg(test)]

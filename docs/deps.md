@@ -18,8 +18,25 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-6bde4f7
+3dc783d
 ```
+
+The bump from `6bde4f7` takes one deepmsg change, in the cluster client:
+`fix: a redirect is answered by the leader it names` (#171). A connect names
+every member's ingress endpoint and offers to the first publication that
+connects; a follower answers with a redirect naming the leader. The client
+now offers the request to that leader, and carries the leader's pending
+`registrationId` across the redirect as the reference does — before this, a
+connect that started on a follower could spend its whole `messageTimeout`
+being redirected to itself (each round re-examined every member, the same
+follower connected first, and the leader never saw a byte). That is the
+three-node failover's intermittent `cluster connect timeout`; `fix-gateway`
+also retries the connect now, but this is the cause.
+
+No signature this repository calls changes; `cargo check --workspace` passes
+unchanged. The pin's own test is
+`async_connect::tests::a_redirect_is_answered_by_the_leader_it_names`, and the
+behavioural divergence it records is a row in deepmsg's `docs/compat.md`.
 
 The bump from `b4844ca` takes eight deepmsg changes, the first one that also
 adds a crate: `deepmsg-log` is now in `[workspace.dependencies]` (nothing uses it

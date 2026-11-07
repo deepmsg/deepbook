@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod obs;
 pub mod report;
 
 pub use client::{BenchConfig, ClientError, run};

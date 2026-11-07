@@ -32,6 +32,7 @@ use deepbook_fix::journal::{FileJournal, FileSequenceStore, SyncPolicy};
 use deepbook_fix::session::{Action, Session, SessionConfig};
 use deepbook_io::{BackendKind, Event, EventLoop};
 
+use crate::obs;
 use crate::sink::{Engine, SessionKey};
 
 /// The acceptor's configuration.
@@ -87,11 +88,16 @@ impl GatewayConfig {
 
 struct Connection {
     key: SessionKey,
+    /// The peer that opened the TCP connection; carried for the log only.
+    peer: SocketAddr,
     decoder: FrameDecoder,
     session: Session<FileJournal, FileSequenceStore>,
     outbound: VecDeque<Vec<u8>>,
     writing: bool,
     close_after_flush: bool,
+    /// Whether the facade was told this session logged on, so the close is
+    /// announced exactly once and never without an open.
+    announced_open: bool,
 }
 
 impl Connection {
@@ -265,11 +271,13 @@ impl<E: Engine> Gateway<E> {
             id,
             Connection {
                 key: self.key.clone(),
+                peer,
                 decoder: FrameDecoder::new(),
                 session,
                 outbound: VecDeque::new(),
                 writing: false,
                 close_after_flush: false,
+                announced_open: false,
             },
         );
         if self.io.start_read(id).is_err() {
@@ -301,8 +309,38 @@ impl<E: Engine> Gateway<E> {
     }
 
     fn drop_connection(&mut self, id: u64) {
-        self.connections.remove(&id);
+        if let Some(connection) = self.connections.remove(&id) {
+            if connection.announced_open {
+                obs::session_close(
+                    connection.peer,
+                    &self.config.sender_comp_id,
+                    &self.config.target_comp_id,
+                );
+            }
+        }
         self.io.close(id);
+    }
+
+    /// Announce a session that just logged on.
+    ///
+    /// The FIX session becomes active on the peer's `Logon` (or its `Logout`'s
+    /// acknowledge), which is inside `on_inbound`; the connection itself is
+    /// older than that. Emitting here keeps `session.open` meaning "this peer
+    /// can trade", not "a socket was accepted".
+    fn note_logon(&mut self, id: u64) -> bool {
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return false;
+        };
+        if connection.announced_open || !connection.session.is_active() {
+            return false;
+        }
+        connection.announced_open = true;
+        obs::session_open(
+            connection.peer,
+            &self.config.sender_comp_id,
+            &self.config.target_comp_id,
+        );
+        true
     }
 
     fn close_finished(&mut self) {
@@ -359,7 +397,10 @@ impl<E: Engine> Gateway<E> {
                 break;
             };
             match result {
-                Ok(actions) => work += self.apply_actions(id, actions),
+                Ok(actions) => {
+                    work += self.apply_actions(id, actions);
+                    self.note_logon(id);
+                }
                 Err(_) => {
                     self.drop_connection(id);
                     return work;

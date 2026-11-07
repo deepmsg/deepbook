@@ -18,6 +18,7 @@ deepbook-io = { path = "../io" }
 deepmsg-client = { workspace = true }
 deepmsg-core = { workspace = true }
 deepmsg-cluster-client = { workspace = true }
+deepmsg-log = { workspace = true }
 mio = { version = "1", features = ["net", "os-poll"] }
 
 [dev-dependencies]

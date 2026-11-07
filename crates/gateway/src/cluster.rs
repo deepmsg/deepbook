@@ -59,6 +59,7 @@ use deepmsg_client::fragment_assembler::MessageHeader;
 use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
+use crate::obs;
 use crate::sink::{CommandSink, EventSource, SessionEvent, SessionKey};
 
 /// How many commands may wait for the cluster before new ones are refused.
@@ -492,6 +493,7 @@ impl ClusterEngine {
             }
             if session.is_closed() {
                 eprintln!("fix-gateway: cluster session closed");
+                obs::cluster_lost(session.cluster_session_id(), self.sessions_opened);
                 self.session = None;
                 self.reconnect_at = Some(Instant::now() + RECONNECT_DELAY);
             } else if self.last_keep_alive.elapsed() >= KEEP_ALIVE_INTERVAL {
@@ -528,6 +530,7 @@ impl ClusterEngine {
                     session.cluster_session_id(),
                     egress_channel_for(&self.config.egress_channel, self.sessions_opened)
                 );
+                obs::cluster_recovered(session.cluster_session_id(), self.sessions_opened);
                 self.sessions_opened = self.sessions_opened.saturating_add(1);
                 self.session = Some(session);
                 self.reconnect_at = None;
@@ -643,6 +646,7 @@ impl ClusterEngine {
     }
 
     fn reject_new(&mut self, session: &SessionKey, order: &NewOrderSingle, text: String) {
+        obs::command_rejected(&order.cl_ord_id, &text);
         let exec_id = self.local_exec_id();
         let now = format_utc(SystemClock.now_millis());
         let report = ExecutionReport {
@@ -674,6 +678,7 @@ impl ClusterEngine {
         is_replace: bool,
         text: String,
     ) {
+        obs::command_rejected(cl_ord_id, &text);
         let reject = OrderCancelReject {
             order_id: "NONE".to_owned(),
             cl_ord_id: cl_ord_id.to_owned(),

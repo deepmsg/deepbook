@@ -19,12 +19,24 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use deepbook_fix::journal::SyncPolicy;
+use deepbook_gateway::obs::{COMPONENTS, Gateway as GatewayComponent};
 use deepbook_gateway::{
     ClusterEngine, ClusterEngineConfig, Engine, Gateway, GatewayConfig, SessionKey, StubEngine,
 };
 use deepbook_io::BackendKind;
+use deepmsg_log::Guard;
 
 fn main() -> ExitCode {
+    // Off unless DEEPMSG_LOG_DIR is set. When it is on, a malformed
+    // configuration stops the gateway instead of silently losing lines: the
+    // launcher, not the process, is where that gets fixed.
+    let _log = match Guard::from_env_with(GatewayComponent, &COMPONENTS, None) {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("fix-gateway: the log configuration is refused: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

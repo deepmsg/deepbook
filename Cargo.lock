@@ -122,6 +122,7 @@ dependencies = [
  "deepbook-fix",
  "deepbook-gateway",
  "deepbook-types",
+ "deepmsg-log",
 ]
 
 [[package]]
@@ -140,6 +141,7 @@ dependencies = [
  "deepmsg-cluster-service",
  "deepmsg-codec-cluster",
  "deepmsg-driver",
+ "deepmsg-log",
 ]
 
 [[package]]
@@ -170,6 +172,7 @@ dependencies = [
  "deepmsg-cluster-common",
  "deepmsg-cnc",
  "deepmsg-core",
+ "deepmsg-log",
  "mio",
 ]
 

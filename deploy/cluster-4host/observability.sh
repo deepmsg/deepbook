@@ -16,7 +16,9 @@
 #   node0/1/2 + client   deepmsg-app-agent, deepmsg-counters-exporter,
 #                        deepmsg-errorlog-exporter
 #   CLUSTER_OBS_SSH      victoria-logs, victoria-metrics, vmauth, and Grafana
-#                        when the distribution package is installed
+#                        when the distribution package is installed; Grafana's
+#                        provisioning gets deepmsg's three dashboards and six
+#                        rules, deepbook's dashboard and six rules
 #
 # The applications are not units: they are started by `run-cluster.sh`, which
 # exports the log directory and node id they need (see `member-node.sh`). The
@@ -28,6 +30,8 @@
 #   CLUSTER_OBS_WRITE_TOKEN    the bearer token vmauth accepts for writes
 #   CLUSTER_OBS_READ_TOKEN     the token Grafana's datasources read with
 #   CLUSTER_OBS_GRAFANA_PASSWORD  Grafana's admin password (optional)
+#   CLUSTER_OBS_WEBHOOK_URL    where Grafana posts alerts (optional; default
+#                              is the E2E's local receiver)
 #
 # The units and configs are read from the controller's checkout (default: the
 # sibling `deepmsg`; set `DEEPBOOK_DEEPMSG_DIR`), and the hosts' own checkouts
@@ -321,6 +325,17 @@ install_obs_host() {
             _put_tree "$OBS_SOURCE/deploy/observability/grafana/$entry/." \
                 "$host" "/etc/deepmsg/grafana/$entry/"
         done
+        # alerting: deepmsg's three files and deepbook's rules live in the same
+        # provisioned directory — Grafana loads every YAML in it. They are
+        # separate files so deepmsg's own check keeps counting exactly its six
+        # and this repository's check counts its own six.
+        _on "$host" "mkdir -p /etc/deepmsg/grafana/provisioning/alerting"
+        for entry in contact-points.yaml policies.yaml rules.yaml; do
+            _put "$OBS_SOURCE/deploy/observability/grafana/provisioning/alerting/$entry" \
+                "$host" "/etc/deepmsg/grafana/provisioning/alerting/$entry"
+        done
+        _put "$DEEPBOOK_ROOT/deploy/observability/grafana/alerting/deepbook-rules.yaml" \
+            "$host" /etc/deepmsg/grafana/provisioning/alerting/deepbook-rules.yaml
         _put "$OBS_SOURCE/deploy/observability/systemd/grafana.service" \
             "$host" /etc/systemd/system/grafana.service
         # A second provider and a second folder: deepmsg's three dashboards and
@@ -335,7 +350,7 @@ install_obs_host() {
 DEEPMSG_VMAUTH_URL=http://$obs_ip:8427
 DEEPMSG_GRAFANA_READ_TOKEN=$CLUSTER_OBS_READ_TOKEN
 DEEPMSG_GRAFANA_DASHBOARDS_DIR=/etc/deepmsg/grafana/provisioning/dashboards
-DEEPMSG_GRAFANA_WEBHOOK_URL=http://127.0.0.1:9099/alerts
+DEEPMSG_GRAFANA_WEBHOOK_URL=${CLUSTER_OBS_WEBHOOK_URL:-http://127.0.0.1:9099/alerts}
 GF_SECURITY_ADMIN_PASSWORD=${CLUSTER_OBS_GRAFANA_PASSWORD:-replace-me}
 EOF
         _put "$stage/observability.env" "$host" /etc/deepmsg/observability.env 0600
@@ -381,6 +396,15 @@ status_app_host() { # <host> <member|client>
 status_obs_host() {
     local host fails=0
     host=$(_obs_host)
+    # A host with Grafana must have all four alerting files: Grafana loads the
+    # whole directory, and an install from before this file was copied would
+    # otherwise look healthy while deepbook has no rules.
+    _on "$host" "if [ -f /etc/deepmsg/grafana.ini ]; then
+        for file in rules.yaml deepbook-rules.yaml contact-points.yaml policies.yaml; do
+            test -f \"/etc/deepmsg/grafana/provisioning/alerting/\$file\" ||
+                { echo \"missing alerting/\$file\"; exit 1; }
+        done
+    fi" || fails=1
     if ! _on "$host" "set -u
         for unit in victoria-logs victoria-metrics vmauth; do
             state=\$(systemctl is-active \$unit 2>/dev/null || true)
@@ -402,6 +426,8 @@ cmd_up() {
         _die "no deepmsg checkout at $OBS_SOURCE (set DEEPBOOK_DEEPMSG_DIR)"
     [ -f "$DEEPBOOK_ROOT/deploy/observability/grafana/dashboards/deepbook-engine.json" ] ||
         _die "no deepbook dashboard at $DEEPBOOK_ROOT"
+    [ -f "$DEEPBOOK_ROOT/deploy/observability/grafana/alerting/deepbook-rules.yaml" ] ||
+        _die "no deepbook alert rules at $DEEPBOOK_ROOT"
     [ -n "$CLUSTER_OBS_SSH" ] || _die "CLUSTER_OBS_SSH is not set (the fifth host)"
     [ -n "${CLUSTER_OBS_WRITE_TOKEN:-}" ] || _die "CLUSTER_OBS_WRITE_TOKEN is not set"
     [ -n "${CLUSTER_OBS_READ_TOKEN:-}" ] || _die "CLUSTER_OBS_READ_TOKEN is not set"

@@ -95,6 +95,11 @@ struct Connection {
     decoder: FrameDecoder,
     session: Session<FileJournal, FileSequenceStore>,
     outbound: VecDeque<Vec<u8>>,
+    /// The bytes currently submitted to the backend, and how many of them it
+    /// has written. Reports are coalesced into this chunk at submit time, so a
+    /// connection's reports do not cost one backend submission and completion
+    /// each.
+    write_chunk: Option<(Vec<u8>, usize)>,
     writing: bool,
     close_after_flush: bool,
     /// Whether the facade was told this session logged on, so the close is
@@ -104,7 +109,10 @@ struct Connection {
 
 impl Connection {
     fn finished(&self) -> bool {
-        self.close_after_flush && self.outbound.is_empty() && !self.writing
+        self.close_after_flush
+            && self.outbound.is_empty()
+            && self.write_chunk.is_none()
+            && !self.writing
     }
 }
 
@@ -130,6 +138,11 @@ pub struct Gateway<E: Engine> {
 /// returns must not grow the gateway without bound; the oldest report is
 /// dropped (and logged) when the bound is reached.
 const MAX_PENDING_REPORTS: usize = 4_096;
+
+/// The most bytes coalesced into one backend write. Reports are ~150–200 B, so
+/// this is a few hundred reports per submission; the epoll/uring backends copy
+/// the bytes, and one 64 KiB copy replaces hundreds of report-sized ones.
+const MAX_WRITE_BYTES: usize = 64 * 1024;
 
 impl<E: Engine> Gateway<E> {
     /// Bind and arm the first accept.
@@ -221,6 +234,7 @@ impl<E: Engine> Gateway<E> {
         work += self.tick_sessions();
         work += self.flush_pending_reports();
         work += self.drain_engine_events()?;
+        self.flush_writes();
         self.close_finished();
         Ok(work)
     }
@@ -294,6 +308,7 @@ impl<E: Engine> Gateway<E> {
                 decoder: FrameDecoder::new(),
                 session,
                 outbound: VecDeque::new(),
+                write_chunk: None,
                 writing: false,
                 close_after_flush: false,
                 announced_open: false,
@@ -444,7 +459,6 @@ impl<E: Engine> Gateway<E> {
             self.drop_connection(id);
             work += 1;
         }
-        self.submit_next_write(id);
         work
     }
 
@@ -455,11 +469,11 @@ impl<E: Engine> Gateway<E> {
             }
             Ok(count) => {
                 if let Some(connection) = self.connections.get_mut(&id) {
-                    if let Some(front) = connection.outbound.front_mut() {
-                        let count = count.min(front.len());
-                        front.drain(..count);
-                        if front.is_empty() {
-                            connection.outbound.pop_front();
+                    if let Some((chunk, offset)) = &mut connection.write_chunk {
+                        let advance = count.min(chunk.len() - *offset);
+                        *offset += advance;
+                        if *offset >= chunk.len() {
+                            connection.write_chunk = None;
                         }
                     }
                     connection.writing = false;
@@ -473,24 +487,73 @@ impl<E: Engine> Gateway<E> {
         1
     }
 
-    /// Submit the front of `outbound` if no write is in flight.
+    /// Submit the next chunk for `id` if no write is in flight.
+    ///
+    /// A partially written chunk continues where the backend stopped — the
+    /// backend copies what it is given, so the remainder is submitted again.
+    /// Otherwise the front reports are coalesced into one chunk of at most
+    /// [`MAX_WRITE_BYTES`]. Submissions happen at the end of a poll cycle, not
+    /// per report, so the reports a cycle produced travel together.
     fn submit_next_write(&mut self, id: u64) {
-        let front = match self.connections.get(&id) {
-            Some(connection) if !connection.writing && !connection.outbound.is_empty() => {
-                connection.outbound.front().cloned()
-            }
-            _ => return,
-        };
-        let Some(front) = front else {
+        let Some(connection) = self.connections.get(&id) else {
             return;
         };
-        match self.io.submit_write(id, &front) {
+        if connection.writing {
+            return;
+        }
+
+        if let Some((chunk, offset)) = &connection.write_chunk {
+            if *offset < chunk.len() {
+                let remainder = chunk[*offset..].to_vec();
+                match self.io.submit_write(id, &remainder) {
+                    Ok(()) => {
+                        if let Some(connection) = self.connections.get_mut(&id) {
+                            connection.writing = true;
+                        }
+                    }
+                    Err(_) => self.drop_connection(id),
+                }
+                return;
+            }
+        }
+
+        let mut chunk = Vec::new();
+        {
+            let Some(connection) = self.connections.get_mut(&id) else {
+                return;
+            };
+            connection.write_chunk = None;
+            while let Some(front) = connection.outbound.front() {
+                if !chunk.is_empty() && chunk.len() + front.len() > MAX_WRITE_BYTES {
+                    break;
+                }
+                chunk.extend_from_slice(front);
+                connection.outbound.pop_front();
+                if chunk.len() >= MAX_WRITE_BYTES {
+                    break;
+                }
+            }
+        }
+        if chunk.is_empty() {
+            return;
+        }
+        match self.io.submit_write(id, &chunk) {
             Ok(()) => {
                 if let Some(connection) = self.connections.get_mut(&id) {
+                    connection.write_chunk = Some((chunk, 0));
                     connection.writing = true;
                 }
             }
             Err(_) => self.drop_connection(id),
+        }
+    }
+
+    /// Submit whatever the cycle queued. Called once per poll cycle, after the
+    /// engine events and the timers, so those reports share one chunk.
+    fn flush_writes(&mut self) {
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        for id in ids {
+            self.submit_next_write(id);
         }
     }
 
@@ -543,7 +606,6 @@ impl<E: Engine> Gateway<E> {
                 }
             }
         }
-        self.submit_next_write(id);
         work
     }
 

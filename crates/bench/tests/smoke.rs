@@ -35,9 +35,13 @@ fn the_bench_measures_reports_over_a_real_socket() {
     config.tick = Duration::from_millis(1);
     let mut gateway = Gateway::bind(config, StubEngine::new()).expect("bind");
     let address = gateway.local_addr().expect("local address");
+    // ★ A 3 s window left this test returning `completed = 0` on a loaded CI
+    // runner: the gateway thread had not been scheduled for long enough to
+    // serve the 220 orders. The window is the test's leeway, not a performance
+    // figure, so it is generous.
     let handle = thread::spawn(move || {
         gateway
-            .run_until(Instant::now() + Duration::from_secs(3))
+            .run_until(Instant::now() + Duration::from_secs(10))
             .expect("gateway");
     });
 
@@ -46,7 +50,7 @@ fn the_bench_measures_reports_over_a_real_socket() {
         samples: 200,
         warmup: 20,
         rate_per_second: 5_000,
-        timeout: Duration::from_secs(3),
+        timeout: Duration::from_secs(10),
         ..BenchConfig::default()
     };
     let report = run(&bench).expect("bench run");

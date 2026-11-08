@@ -130,6 +130,8 @@ export CLUSTER_OBS_SSH=root@172.16.1.21      # the fifth host, private address
 export CLUSTER_OBS_WRITE_TOKEN=...            # vmauth's write bearer
 export CLUSTER_OBS_READ_TOKEN=...             # vmauth's read bearer (Grafana)
 # optional: CLUSTER_OBS_GRAFANA_PASSWORD=...
+# optional: CLUSTER_OBS_WEBHOOK_URL=https://...  (alerts; default is the E2E's
+#           local receiver at http://127.0.0.1:9099/alerts)
 ```
 
 The units, the collector configs and the pinned tool releases are deepmsg's
@@ -171,6 +173,28 @@ started by `run-cluster.sh`, which exports `DEEPMSG_LOG_DIR`,
 `DEEPMSG_NODE_ID` and `DEEPMSG_LOG_LEVEL` for them (`member-node.sh` and the
 client's scripts). With the agent stopped, the processes keep writing and their
 stderr stays empty; that contract is deepmsg's `crates/log/README.md`.
+
+### Alerts and the runbook
+
+The log host's Grafana provisions deepmsg's six rules and deepbook's six. They
+are separate files in the same alerting directory — Grafana loads every YAML
+there, while deepmsg's own config check only counts `rules.yaml`, so the split
+keeps deepmsg's "exactly six" green and this repository owns its own six:
+
+- source: `deploy/observability/grafana/alerting/deepbook-rules.yaml`
+- installed as `/etc/deepmsg/grafana/provisioning/alerting/deepbook-rules.yaml`
+- group `deepbook` in folder `deepbook` (the same folder as the dashboard)
+
+The six: fewer than three engines reporting, no leader, commit stalled while
+orders arrive, no gateway session, a reject stream, and dropped log lines. Each
+names an anchor in `deploy/observability/runbook.md`, which is the page to open
+when one fires. `just check-observability` validates the rules the same way it
+validates the dashboard: every series they name is one the deployment
+publishes, every rule has the classic condition, a P1/P2/P3 severity and a
+runbook anchor that exists.
+
+`CLUSTER_OBS_WEBHOOK_URL` is where the log host's contact point posts; it is
+read by Grafana's provisioning as `$__env{DEEPMSG_GRAFANA_WEBHOOK_URL}`.
 
 ## Not this script's job
 

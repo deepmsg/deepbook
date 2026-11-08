@@ -1,0 +1,265 @@
+# deepbook's six alert rules.
+#
+# They are provisioned into the same Grafana alerting directory as deepmsg's
+# six (`rules.yaml`), as a second file: Grafana loads every YAML in
+# `/etc/deepmsg/grafana/provisioning/alerting/`, while deepmsg's own config
+# check only globs `rules.yaml` and its Grafana E2E only counts that file, so
+# splitting the files keeps deepmsg's "exactly six" true and lets this
+# repository's `deploy/observability/check.py` count its own six.
+#
+# No rule uses a dashboard variable: an alert rule is evaluated without a
+# dashboard, and a `$node` written into one is a silent filter that never
+# matches. The series carry `node_id` (the agent's resource and transform
+# processors attach it), so the alert instances are per host by construction.
+#
+# The thresholds live in the classic condition (query A, condition C), so the
+# query stays the raw signal and the rule says what "too much" is.
+#
+# ★ `deepbook_gateway_new_leader_timeouts_total` is deliberately not referenced:
+# the pinned deepmsg client closes its session when its newLeaderTimeoutNs
+# expires but does not expose *why* it closed, so the gateway does not publish
+# that counter (`crates/gateway/src/metrics.rs`). The dashboard carries the
+# same note as a text panel.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: deepbook
+    folder: deepbook
+    interval: 30s
+    rules:
+      # Fewer than three members reporting is either a dead engine or a member
+      # whose agent stopped shipping. `noDataState: Alerting` because zero
+      # reporting members is this rule's meaning, not an unknown.
+      - uid: deepbook-engine-count
+        title: Fewer than three engines are up
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: count(deepbook_engine_up)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [3], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: Alerting
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: Fewer than three members report a running engine.
+          runbook_url: https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#deepbook-engine-count
+        labels:
+          severity: P1
+        isPaused: false
+
+      # The cluster's own counters, not the engines': a member's CnC keeps
+      # answering after its process dies, so this rule answers "does the
+      # cluster believe it has a leader", and `deepbook-engine-count` is the
+      # liveness one. No data is the counters exporter being gone, which
+      # deepmsg's `driver-metrics-absent` already owns.
+      - uid: deepbook-no-leader
+        title: The cluster reports no leader
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: max(deepmsg_cluster_is_leader)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [1], type: lt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 30s
+        annotations:
+          summary: No member reports itself as leader.
+          runbook_url: https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#deepbook-no-leader
+        labels:
+          severity: P1
+        isPaused: false
+
+      # ★ The commit position only has to move when there is something to
+      # commit. Without the gateway leg, an idle cluster (no run in progress)
+      # would fire a P1 every ten minutes. The three legs are unlabelled
+      # scalars after aggregation, so `and` matches them without label tricks.
+      - uid: deepbook-commit-stalled
+        title: Commit position is not moving while orders arrive
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 120, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: count(deepbook_engine_up) == 3 and sum(rate(deepbook_gateway_orders_total[2m])) > 0 and sum(increase(deepmsg_cluster_commit_position[2m])) == 0
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: The gateway is forwarding orders but commit position has not advanced for two minutes.
+          runbook_url: https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#deepbook-commit-stalled
+        labels:
+          severity: P1
+        isPaused: false
+
+      # `== bool 0` on purpose: a plain comparison keeps the sample's value,
+      # so the zero leg would feed 0 into the condition and never fire. The
+      # absent leg is the total-absence backstop once VM's staleness window
+      # has passed.
+      - uid: deepbook-gateway-lost
+        title: The gateway is not publishing a session
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 120, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: absent(deepbook_gateway_sessions) or (deepbook_gateway_sessions == bool 0)
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: The gateway has no open FIX session, or its page is gone.
+          runbook_url: https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#deepbook-gateway-lost
+        labels:
+          severity: P1
+        isPaused: false
+
+      # Every rejected command is a client's order refused before the cluster
+      # saw it. One is worth knowing; a stream of them for ten minutes is P2.
+      - uid: deepbook-reject-rate
+        title: The gateway is rejecting commands
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: victoriametrics
+            model:
+              editorMode: code
+              expr: rate(deepbook_gateway_rejects_total[5m])
+              instant: true
+              range: false
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: Commands are being rejected at the gateway.
+          runbook_url: https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#deepbook-reject-rate
+        labels:
+          severity: P2
+        isPaused: false
+
+      # The log writer drops lines when its bounded queue is full (the agent is
+      # down or slower than the applications). The processes keep running; what
+      # is lost is the record of what they did.
+      - uid: deepbook-log-dropped
+        title: Application log lines are being dropped
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: {from: 60, to: 0}
+            datasourceUid: victorialogs
+            model:
+              editorMode: code
+              expr: 'event:"log.dropped" | stats count() as dropped'
+              queryType: stats
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: {params: [0], type: gt}
+                  operator: {type: and}
+                  query: {params: [A]}
+                  reducer: {params: [], type: last}
+                  type: query
+              datasource: {type: __expr__, uid: __expr__}
+              expression: ""
+              refId: C
+              type: classic_conditions
+        noDataState: OK
+        execErrState: Error
+        for: 1m
+        annotations:
+          summary: A log writer's queue is full and lines are being dropped.
+          runbook_url: https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#deepbook-log-dropped
+        labels:
+          severity: P2
+        isPaused: false

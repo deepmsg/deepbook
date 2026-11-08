@@ -19,16 +19,33 @@
 # - the logs panels missing, or reading the wrong components;
 # - the provider YAML not naming the `deepbook` folder and its own directory.
 #
+# And the six alert rules of `grafana/alerting/deepbook-rules.yaml`:
+#
+# - the file not parsing, or not exactly the six rules this repository ships;
+# - a rule without the classic condition C, a P1/P2/P3 severity, a runbook
+#   anchor that exists in `runbook.md`, or with a dashboard variable in it;
+# - a rule naming a series the deployment does not publish (the same whitelist
+#   as the dashboard, so a rule cannot promise an alert nothing produces);
+# - the dropped-log rule not reading VictoriaLogs, or not counting
+#   `event:"log.dropped"`.
+#
 # Run: python3 deploy/observability/check.py
 import json
 import pathlib
 import re
 import sys
 
+import yaml
+
 ROOT = pathlib.Path(__file__).resolve().parent
 GRAFANA = ROOT / "grafana"
 DASHBOARDS = GRAFANA / "dashboards"
 PROVIDER = GRAFANA / "provisioning" / "dashboards" / "deepbook.yaml"
+RULES = GRAFANA / "alerting" / "deepbook-rules.yaml"
+RUNBOOK = ROOT / "runbook.md"
+RUNBOOK_URL = (
+    "https://github.com/deepmsg/deepbook/blob/main/deploy/observability/runbook.md#"
+)
 
 # Every series the page may name. A dashboard that asks for something else is
 # a lie about what the deployment publishes, and it fails here rather than on
@@ -51,11 +68,36 @@ METRICS = {
     "deepbook_gateway_rejects_total",
     # Read from the agents' own counters, not from the application.
     "deepmsg_cluster_is_leader",
+    "deepmsg_cluster_commit_position",
     "deepmsg_driver_up",
 }
 DATASOURCES = {"victoriametrics", "victorialogs"}
 METRIC_TOKEN = re.compile(r"\bdeep(?:book|msg)_[a-z0-9_]+\b")
 VARIABLE = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
+
+# uid -> (severity, fragments its query must contain). The set is the six
+# rules the deployment promises; a removed or renamed rule fails here rather
+# than becoming a page that never fires.
+EXPECTED_RULES = {
+    "deepbook-engine-count": ("P1", ("count(deepbook_engine_up)",)),
+    "deepbook-no-leader": ("P1", ("max(deepmsg_cluster_is_leader)",)),
+    "deepbook-commit-stalled": (
+        "P1",
+        (
+            "count(deepbook_engine_up) == 3",
+            "rate(deepbook_gateway_orders_total[2m])",
+            "increase(deepmsg_cluster_commit_position[2m])",
+        ),
+    ),
+    "deepbook-gateway-lost": (
+        "P1",
+        ("absent(deepbook_gateway_sessions)", "== bool 0"),
+    ),
+    "deepbook-reject-rate": ("P2", ("rate(deepbook_gateway_rejects_total[5m])",)),
+    "deepbook-log-dropped": ("P2", ('event:"log.dropped"',)),
+}
+# Anchors the drills link to, whether or not a rule fires on them.
+DRILL_ANCHORS = ("drill-kill-leader", "drill-agent-off", "drill-gateway-kill")
 
 failures: list[str] = []
 
@@ -170,6 +212,122 @@ def check_dashboard(path: pathlib.Path, seen_uids: set[str]) -> None:
     )
 
 
+def alert_entry(rule: dict, ref: str) -> dict:
+    return next(
+        (entry for entry in (rule.get("data") or []) if entry.get("refId") == ref), {}
+    )
+
+
+def check_rules() -> int:
+    check(RULES.is_file(), f"{RULES}: the alert rules file is missing")
+    if not RULES.is_file():
+        return 0
+    try:
+        config = yaml.safe_load(RULES.read_text()) or {}
+    except yaml.YAMLError as error:
+        failures.append(f"{RULES.name}: not YAML ({error})")
+        return 0
+
+    groups = config.get("groups") or []
+    check(len(groups) == 1, f"{RULES.name}: {len(groups)} alert groups, expected 1")
+    if not groups:
+        return 0
+    group = groups[0]
+    check(group.get("folder") == "deepbook", f"{RULES.name}: folder {group.get('folder')!r}")
+    check(group.get("name") == "deepbook", f"{RULES.name}: group name {group.get('name')!r}")
+    check(group.get("orgId") == 1, f"{RULES.name}: orgId {group.get('orgId')!r}")
+    check(
+        isinstance(group.get("interval"), str) and group["interval"] != "",
+        f"{RULES.name}: no group interval",
+    )
+
+    runbook_ok = RUNBOOK.is_file()
+    check(runbook_ok, f"{RUNBOOK.name}: the runbook is missing")
+    runbook = RUNBOOK.read_text() if runbook_ok else ""
+    for anchor in DRILL_ANCHORS:
+        check(
+            f'id="{anchor}"' in runbook,
+            f"{RUNBOOK.name}: no anchor for the {anchor} drill",
+        )
+
+    rules = group.get("rules") or []
+    uids = [rule.get("uid", "") for rule in rules]
+    check(len(rules) == len(EXPECTED_RULES), f"{RULES.name}: {len(rules)} rules, expected {len(EXPECTED_RULES)}")
+    check(len(set(uids)) == len(uids), f"{RULES.name}: a uid is used twice: {uids}")
+    missing = set(EXPECTED_RULES) - set(uids)
+    unexpected = set(uids) - set(EXPECTED_RULES)
+    check(not missing, f"{RULES.name}: rules are missing: {sorted(missing)}")
+    check(not unexpected, f"{RULES.name}: unexpected rules: {sorted(unexpected)}")
+
+    for rule in rules:
+        uid = rule.get("uid", "")
+        severity, fragments = EXPECTED_RULES.get(uid, ("", ()))
+        check(rule.get("condition") == "C", f"{RULES.name}/{uid}: condition is not C")
+        check(
+            (rule.get("labels") or {}).get("severity") == severity,
+            f"{RULES.name}/{uid}: severity is {(rule.get('labels') or {}).get('severity')!r}, expected {severity!r}",
+        )
+        check(rule.get("for") not in (None, ""), f"{RULES.name}/{uid}: no 'for'")
+        check(rule.get("isPaused") is False, f"{RULES.name}/{uid}: isPaused is not false")
+        check(
+            rule.get("noDataState") in {"OK", "Alerting"},
+            f"{RULES.name}/{uid}: noDataState {rule.get('noDataState')!r}",
+        )
+        check(rule.get("execErrState") == "Error", f"{RULES.name}/{uid}: execErrState")
+
+        url = str((rule.get("annotations") or {}).get("runbook_url", "") or "")
+        check(url == RUNBOOK_URL + uid, f"{RULES.name}/{uid}: runbook_url is {url!r}")
+        check(f'id="{uid}"' in runbook, f"{RUNBOOK.name}: no anchor for {uid}")
+
+        query = alert_entry(rule, "A")
+        model = query.get("model") or {}
+        expr = str(model.get("expr") or "")
+        datasource = query.get("datasourceUid")
+        check(datasource in DATASOURCES, f"{RULES.name}/{uid}: datasource {datasource!r}")
+        if datasource != "victorialogs":
+            check(model.get("instant") is True, f"{RULES.name}/{uid}: query A is not instant")
+        for fragment in fragments:
+            check(
+                fragment in expr,
+                f"{RULES.name}/{uid}: the query does not say {fragment!r}: {expr!r}",
+            )
+        for metric in METRIC_TOKEN.findall(expr):
+            check(
+                metric in METRICS,
+                f"{RULES.name}/{uid}: {metric} is not a series the deployment publishes",
+            )
+        for variable in VARIABLE.findall(expr):
+            check(
+                False,
+                f"{RULES.name}/{uid}: ${variable} is a dashboard variable; "
+                "an alert rule is evaluated without a dashboard",
+            )
+
+        condition = alert_entry(rule, "C")
+        check(
+            condition.get("datasourceUid") == "__expr__",
+            f"{RULES.name}/{uid}: condition is not the expression engine",
+        )
+        check(
+            bool((condition.get("model") or {}).get("conditions")),
+            f"{RULES.name}/{uid}: the classic condition has no conditions",
+        )
+
+    logs_rules = [
+        rule
+        for rule in rules
+        if alert_entry(rule, "A").get("datasourceUid") == "victorialogs"
+    ]
+    check(len(logs_rules) == 1, f"{RULES.name}: {len(logs_rules)} log rules, expected 1")
+    if logs_rules:
+        model = alert_entry(logs_rules[0], "A").get("model") or {}
+        check(
+            model.get("queryType") == "stats",
+            f"{RULES.name}/{logs_rules[0].get('uid')}: the log query is not stats",
+        )
+    return len(rules)
+
+
 def check_provider() -> None:
     check(PROVIDER.is_file(), f"{PROVIDER.name}: the provider file is missing")
     if not PROVIDER.is_file():
@@ -191,6 +349,7 @@ def main() -> int:
     for path in paths:
         check_dashboard(path, seen_uids)
     check_provider()
+    rule_count = check_rules()
 
     if failures:
         for failure in failures:
@@ -198,7 +357,8 @@ def main() -> int:
         return 1
     print(
         f"check: {len(paths)} dashboard(s), "
-        f"{sum(len(panels_of(json.loads(path.read_text()))) for path in paths)} panels, ok"
+        f"{sum(len(panels_of(json.loads(path.read_text()))) for path in paths)} panels, "
+        f"{rule_count} alert rule(s), ok"
     )
     return 0
 

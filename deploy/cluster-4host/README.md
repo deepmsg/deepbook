@@ -141,11 +141,24 @@ checkouts are at `CLUSTER_DEEPMSG_DIR`, whose `deploy/observability/e2e/
 fetch-tools.sh` downloads and SHA-verifies `otelcol-contrib`, `victoria-logs`,
 `victoria-metrics` and `vmauth`.
 
-Three things worth knowing:
+Things worth knowing:
 
 - **The log directory is outside the run root** (`CLUSTER_LOG_DIR`,
   `/var/log/deepmsg`), because `up` removes the run root. `observability down`
   stops processes and keeps the logs and the backends' data.
+- **`/var/log/deepmsg` is owned by `deepmsg`**: the applications run as root
+  and write there, but the error-log exporter runs as `deepmsg` and writes
+  `tool-<node>.json` beside them. A root-owned directory makes that unit exit
+  with EACCES and restart forever; the installer chowns it.
+- **The driver runs `SHARED`**: the combined
+  `deepmsg-archiving-media-driver` runs the driver and the archive on one
+  thread and refuses `DEDICATED` — the member's driver exits before publishing
+  its CnC file. `hosts.env` defaults to `SHARED` for that reason.
+- **The CPU pins are topology-dependent**: `hosts.env`'s defaults fit the old
+  sixteen-core machines. On a host whose SMT numbering interleaves siblings
+  (CPU0/1 = core0, CPU2/3 = core1, ...), pinning `2` and `3` puts two driver
+  threads on one physical core. Read `lscpu -e` and override the pins — the new
+  rig's client uses 1/3/5 for the driver, 7 for the gateway and 9 for the bench.
 - **`deepmsg-app-agent` replaces `deepmsg-log-agent`**, not adds to it: they
   share a state directory, and two collectors would each keep their own file
   offsets. All four application hosts expose a `/metrics` endpoint (D3), so the

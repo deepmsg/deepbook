@@ -185,6 +185,11 @@ install_app_host() { # <host> <member|client>
         mkdir -p /etc/deepmsg /var/lib/deepmsg-otelcol /var/log/deepmsg
         chown deepmsg:deepmsg /var/lib/deepmsg-otelcol
         chmod 0750 /var/lib/deepmsg-otelcol
+        # ★ The error-log exporter runs as deepmsg and writes tool-<node>.json
+        # beside the applications' files; the applications themselves run as
+        # root and still write here. A root-owned directory makes the exporter
+        # exit with EACCES and its unit restart forever.
+        chown deepmsg:deepmsg /var/log/deepmsg
         chmod 0755 /var/log/deepmsg" || _die "$host: users or directories"
 
     _deepmsg_dir_check "$host"
@@ -385,8 +390,8 @@ status_app_host() { # <host> <member|client>
         test -s /etc/deepmsg/observability.env || { echo 'no /etc/deepmsg/observability.env'; exit 1; }
         test -d /var/log/deepmsg || { echo 'no /var/log/deepmsg'; exit 1; }
         ss -ltn 2>/dev/null | grep -q '127.0.0.1:9101' || { echo 'nothing listens on 9101'; exit 1; }
-        ss -ltn 2>/dev/null | grep -q \"127.0.0.1:\$port\" || {
-            echo \"nothing listens on \$port (the application is down?)\"; exit 1; }
+        ss -ltn 2>/dev/null | grep -q \"127.0.0.1:$port\" || {
+            echo \"nothing listens on $port (the application is down?)\"; exit 1; }
         echo 'ok'"; then
         fails=1
     fi

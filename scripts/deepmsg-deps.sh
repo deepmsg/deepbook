@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Build and verify the deepmsg binaries that deepbook's process tests run.
+# Build and verify the deepmsg binaries that deepbook's process tests and the
+# cluster deployment run.
 #
 #   scripts/deepmsg-deps.sh pin     print the revision Cargo.toml pins
 #   scripts/deepmsg-deps.sh check   fail unless the binaries are from that revision
 #   scripts/deepmsg-deps.sh build   build them and write the stamp `check` reads
 #
 # deepmsg is a git dependency pinned to a revision (docs/deps.md). The binaries
-# the cluster e2e, the spike and `bench.sh` start come from a checkout, not from
-# cargo, so nothing forces them to be the pinned revision. `build` writes
+# the cluster e2e, the spike, `bench.sh` and the four-host scripts run come
+# from a checkout, not from cargo, so nothing forces them to be the pinned
+# revision. `build` writes
 # `target/<profile>/deepbook-deps.txt` with the revision and the SHA-256 of each
 # binary; `check` compares that stamp with the pin, which is what makes a local
 # measurement reproducible.
@@ -30,6 +32,7 @@ BINARIES=(
     "deepmsg-cluster:deepmsg-cluster-node"
     "deepmsg-cluster-service:deepmsg-clustered-service-container"
     "deepmsg-cluster-tool:deepmsg-cluster-tool"
+    "deepmsg-tools:cnc-dump"
     "deepmsg-tools:deepmsg-counters-exporter"
     "deepmsg-tools:deepmsg-errorlog-exporter"
 )

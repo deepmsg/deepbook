@@ -41,7 +41,7 @@ behavioural divergence it records is a row in deepmsg's `docs/compat.md`.
 The bump from `b4844ca` takes eight deepmsg changes, the first one that also
 adds a crate: `deepmsg-log` is now in `[workspace.dependencies]` (nothing uses it
 yet; the application-side events arrive in a later change). `cargo check
---workspace` passes unchanged. The stamp now covers six binaries instead of
+--workspace` passes unchanged. That bump's stamp covered six binaries instead of
 four: the two exporters joined `scripts/deepmsg-deps.sh`. The four that were
 already there no longer hash the same as at `b4844ca`, because the cluster error
 rescue and the CnC/driver read side the exporters need change code underneath
@@ -131,16 +131,20 @@ just deps          # scripts/deepmsg-deps.sh build
 just deps-check    # scripts/deepmsg-deps.sh check
 ```
 
-`deps` builds the six binaries (`deepmsg-archiving-media-driver`,
+`deps` builds the seven binaries (`deepmsg-archiving-media-driver`,
 `deepmsg-cluster-node`, `deepmsg-clustered-service-container`,
-`deepmsg-cluster-tool`, and the two observability exporters
+`deepmsg-cluster-tool`, `cnc-dump`, and the two observability exporters
 `deepmsg-counters-exporter` / `deepmsg-errorlog-exporter`) in
 `DEEPBOOK_DEEPMSG_DIR` at `DEEPMSG_PROFILE`
 (`release` by default) and writes `target/<profile>/deepbook-deps.txt`: the
-revision, the profile, the compiler and the SHA-256 of each binary. The two
-exporters are not started by deepbook's tests; they are the processes the
-cluster deployment installs next to the agents, and they are in the stamp so
-that all four hosts can be checked against the same revision. `check`
+revision, the profile, the compiler and the SHA-256 of each binary. Three of
+them are not started by deepbook's tests: the two exporters are the processes
+the cluster deployment installs next to the agents, and `cnc-dump` is what
+`run-cluster.sh counters` and a `restart`'s catch-up read the CnC with — a host
+without it fails the counters command, and makes `restart <member> --keep`
+wait out its five-minute catch-up loop against an empty position and then
+report `commit-pos ?`. All three are in the stamp so that all four hosts can be
+checked against the same revision. `check`
 fails when the stamp is missing, names another revision, or a binary no longer
 matches its hash — that is what makes a benchmark number reproducible rather
 than "whatever was last built". `bench.sh` and `just engine-e2e` run it by

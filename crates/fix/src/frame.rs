@@ -41,10 +41,24 @@ impl std::error::Error for FrameError {
 }
 
 /// A stream decoder.
+///
+/// Consumed bytes are not shifted out of the buffer per frame: [`next_frame`]
+/// advances `start`, and the buffer is compacted only when the consumed prefix
+/// is both large and at least half the buffer. A per-frame `drain` made a
+/// 64 KiB read quadratic in the frames it carried — the bench reads ~400
+/// reports per read, and the same decoder parses the gateway's inbound orders.
+///
+/// [`next_frame`]: FrameDecoder::next_frame
 #[derive(Debug, Default)]
 pub struct FrameDecoder {
     buffer: Vec<u8>,
+    /// How many bytes at the front of `buffer` have been consumed.
+    start: usize,
 }
+
+/// Compact once this many bytes have been consumed (and at least half the
+/// buffer), so the unconsumed tail is moved rarely rather than per frame.
+const COMPACT_AFTER: usize = 32 * 1024;
 
 impl FrameDecoder {
     /// An empty decoder.
@@ -56,12 +70,20 @@ impl FrameDecoder {
     /// Append bytes read from the socket.
     pub fn push(&mut self, bytes: &[u8]) {
         self.buffer.extend_from_slice(bytes);
+        self.compact_if_due();
     }
 
-    /// How many bytes are buffered.
+    /// How many bytes are buffered (not yet consumed).
     #[must_use]
     pub fn buffered(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len() - self.start
+    }
+
+    fn compact_if_due(&mut self) {
+        if self.start >= COMPACT_AFTER && self.start >= self.buffer.len() / 2 {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
     }
 
     /// The next complete message, or `None` when more bytes are needed.
@@ -71,71 +93,101 @@ impl FrameDecoder {
     /// The stream is not FIX, a length is impossible, or the codec refused the
     /// complete frame.
     pub fn next_frame(&mut self) -> Option<Result<ParsedMessage, FrameError>> {
-        if self.buffer.is_empty() {
+        if self.start >= self.buffer.len() {
+            if !self.buffer.is_empty() {
+                self.buffer.clear();
+            }
+            self.start = 0;
             return None;
         }
 
-        let start = match find_start(&self.buffer) {
-            Some(start) => start,
-            None => {
-                // Keep a possible partial marker; drop everything else.
-                let keep = START_MARKER.len().saturating_sub(1);
-                let excess = self.buffer.len().saturating_sub(keep);
-                if excess > 0 {
-                    self.buffer.drain(..excess);
-                }
-                return None;
+        let relative = {
+            let rest = &self.buffer[self.start..];
+            find_start(rest)
+        };
+        let Some(relative) = relative else {
+            // Keep a possible partial marker; drop everything else.
+            let unconsumed = self.buffer.len() - self.start;
+            let keep = START_MARKER.len().saturating_sub(1);
+            let excess = unconsumed.saturating_sub(keep);
+            if excess > 0 {
+                self.start += excess;
             }
-        };
-        if start > 0 {
-            self.buffer.drain(..start);
-        }
-
-        let first_soh = self.buffer.iter().position(|byte| *byte == 0x01)?;
-        let second_soh = self.buffer[first_soh + 1..]
-            .iter()
-            .position(|byte| *byte == 0x01)
-            .map(|position| position + first_soh + 1)?;
-        if !self.buffer[first_soh + 1..].starts_with(b"9=") {
-            return Some(Err(FrameError::Length(
-                "the second field is not BodyLength".to_owned(),
-            )));
-        }
-        let declared = match parse_u32(&self.buffer[first_soh + 3..second_soh]) {
-            Ok(value) => value,
-            Err(detail) => return Some(Err(FrameError::Length(detail))),
-        };
-        let body_start = second_soh + 1;
-        let total = match usize::try_from(declared)
-            .ok()
-            .and_then(|length| length.checked_add(body_start))
-            .and_then(|length| length.checked_add(CHECKSUM_LENGTH))
-        {
-            Some(total) => total,
-            None => {
-                return Some(Err(FrameError::Length(
-                    "BodyLength overflows the buffer".to_owned(),
-                )));
-            }
-        };
-        if total > MAX_MESSAGE_LENGTH {
-            return Some(Err(FrameError::Length(format!(
-                "BodyLength={declared} exceeds {MAX_MESSAGE_LENGTH}"
-            ))));
-        }
-        if self.buffer.len() < total {
+            self.compact_if_due();
             return None;
+        };
+        if relative > 0 {
+            self.start += relative;
         }
 
-        let frame = self.buffer[..total].to_vec();
-        match parse(&frame) {
+        let parsed = {
+            let rest = &self.buffer[self.start..];
+            parse_frame(rest)
+        };
+        let Some((total, result)) = parsed else {
+            self.compact_if_due();
+            return None;
+        };
+        match result {
             Ok(message) => {
-                self.buffer.drain(..total);
+                self.start += total;
+                self.compact_if_due();
                 Some(Ok(message))
             }
-            Err(error) => Some(Err(FrameError::Codec(error))),
+            Err(error) => Some(Err(error)),
         }
     }
+}
+
+/// The first frame at the front of `buffer` (which starts at the marker):
+/// its total length, and the parse outcome. `None` means "more bytes needed".
+fn parse_frame(buffer: &[u8]) -> Option<(usize, Result<ParsedMessage, FrameError>)> {
+    let first_soh = buffer.iter().position(|byte| *byte == 0x01)?;
+    let second_soh = buffer[first_soh + 1..]
+        .iter()
+        .position(|byte| *byte == 0x01)
+        .map(|position| position + first_soh + 1)?;
+    if !buffer[first_soh + 1..].starts_with(b"9=") {
+        return Some((
+            0,
+            Err(FrameError::Length(
+                "the second field is not BodyLength".to_owned(),
+            )),
+        ));
+    }
+    let declared = match parse_u32(&buffer[first_soh + 3..second_soh]) {
+        Ok(value) => value,
+        Err(detail) => return Some((0, Err(FrameError::Length(detail)))),
+    };
+    let body_start = second_soh + 1;
+    let total = match usize::try_from(declared)
+        .ok()
+        .and_then(|length| length.checked_add(body_start))
+        .and_then(|length| length.checked_add(CHECKSUM_LENGTH))
+    {
+        Some(total) => total,
+        None => {
+            return Some((
+                0,
+                Err(FrameError::Length(
+                    "BodyLength overflows the buffer".to_owned(),
+                )),
+            ));
+        }
+    };
+    if total > MAX_MESSAGE_LENGTH {
+        return Some((
+            0,
+            Err(FrameError::Length(format!(
+                "BodyLength={declared} exceeds {MAX_MESSAGE_LENGTH}"
+            ))),
+        ));
+    }
+    if buffer.len() < total {
+        return None;
+    }
+    let frame = buffer[..total].to_vec();
+    Some((total, parse(&frame).map_err(FrameError::Codec)))
 }
 
 fn find_start(buffer: &[u8]) -> Option<usize> {

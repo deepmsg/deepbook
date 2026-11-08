@@ -18,8 +18,17 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-3dc783d
+5ed87c1
 ```
+
+The bump from `3dc783d` takes the first live four-host session's observability
+fixes (#172, #173): the app-agent unit drops a condition systemd evaluates
+before `EnvironmentFile=`, the overlay's memory limiter is 128 MiB, vmauth's
+example route table gains `/select/logsql/hits` and
+`/api/v1/label/node_id/values`, and the disk rule computes `used/(used+free)`
+because the collector no longer publishes `system.filesystem.utilization`. No
+crate source changes: the binaries are the same code; the deploy assets are
+what moved.
 
 The bump from `6bde4f7` takes one deepmsg change, in the cluster client:
 `fix: a redirect is answered by the leader it names` (#171). A connect names

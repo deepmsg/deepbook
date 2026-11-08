@@ -396,6 +396,7 @@ cmd_list() {
     echo "  ingress channel aeron:udp?term-length=128k (the endpoint is substituted per leader)"
     echo "  egress        aeron:udp?endpoint=$(_client_ip):0"
     echo "run root        $CLUSTER_RUN_ROOT (on each host)"
+    echo "observability   ${CLUSTER_OBS_SSH:-not deployed (CLUSTER_OBS_SSH is empty)}"
     echo "binaries        $CLUSTER_DEEPMSG_DIR/target/release, $CLUSTER_DEEPBOOK_DIR/target/release"
     echo "timing          heartbeat $CLUSTER_HEARTBEAT, election $CLUSTER_ELECTION_TIMEOUT, gateway new-leader $CLUSTER_GATEWAY_NEW_LEADER_MS ms"
     echo "leader          ${CLUSTER_APPOINTED_LEADER:-elected}${CLUSTER_APPOINTED_LEADER:+ (appointed; empty = elected)}"

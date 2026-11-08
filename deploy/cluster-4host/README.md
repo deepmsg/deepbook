@@ -1,9 +1,12 @@
 # cluster-4host
 
 Three cluster members on three machines, the FIX gateway and the load client on
-a fourth. This is the same topology as `crates/spike`'s `failover` run, with
-`localhost` replaced by each member's own address and the processes placed on
-different hosts.
+a fourth, and — when the observability stack is deployed — a fifth machine that
+runs VictoriaLogs, VictoriaMetrics, vmauth and Grafana. The fifth is neither a
+member nor the client, so the log store's compactions are outside the cores the
+cluster is measured on. This is the same topology as `crates/spike`'s
+`failover` run, with `localhost` replaced by each member's own address and the
+processes placed on different hosts.
 
 ```
 deploy/cluster-4host/run-cluster.sh up
@@ -17,9 +20,10 @@ deploy/cluster-4host/run-cluster.sh observability up|status|down
 deploy/cluster-4host/run-cluster.sh down
 ```
 
-The four hosts and every tunable live in `hosts.env` (all overridable from the
-environment). `run-cluster.sh list` prints the topology it would stand up —
-read it before the first `up`.
+The hosts and every tunable live in `hosts.env` (all overridable from the
+environment). `run-cluster.sh list` prints the topology it would stand up,
+including whether an observability host is configured — read it before the
+first `up`.
 
 ## What runs where
 
@@ -27,6 +31,7 @@ read it before the first `up`.
 |---|---|
 | node0 / node1 / node2 | `deepmsg-archiving-media-driver`, `deepmsg-cluster-node`, `engine-container` |
 | client | its own `deepmsg-archiving-media-driver`, `fix-gateway`, `fix-bench` |
+| `CLUSTER_OBS_SSH` (the fifth, optional) | `victoria-logs`, `victoria-metrics`, `vmauth`, `grafana`; the four app hosts' agents ship to it |
 
 `member-node.sh` is the per-member half and the only file that is copied to the
 members. It reads `member.properties` (written by `run-cluster.sh`) and starts,

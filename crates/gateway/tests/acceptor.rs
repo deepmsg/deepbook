@@ -101,6 +101,30 @@ fn logout(seq: u64) -> Vec<u8> {
     .build()
 }
 
+fn execution_report_event(session: SessionKey) -> SessionEvent {
+    SessionEvent {
+        session,
+        message: ApplicationMessage::ExecutionReport(ExecutionReport {
+            exec_id: "1-0".to_owned(),
+            order_id: "1".to_owned(),
+            cl_ord_id: "C-1".to_owned(),
+            exec_type: ExecType::New,
+            ord_status: OrdStatus::New,
+            symbol: "AAPL".to_owned(),
+            side: deepbook_types::Side::Buy,
+            order_qty: 100,
+            last_qty: None,
+            last_px: None,
+            leaves_qty: 100,
+            cum_qty: 0,
+            avg_px: 0,
+            account: None,
+            transact_time: Some("20261025-12:34:56.001".to_owned()),
+            text: None,
+        }),
+    }
+}
+
 fn read_frame(stream: &mut TcpStream) -> ParsedMessage {
     let mut decoder = FrameDecoder::new();
     let mut buffer = [0_u8; 1024];
@@ -351,27 +375,10 @@ fn a_report_for_a_disconnected_session_is_sent_after_reconnect() {
     std::thread::sleep(Duration::from_millis(200));
 
     // The engine commits a report while the FIX session is away.
-    events.lock().expect("events").push_back(SessionEvent {
-        session: key,
-        message: ApplicationMessage::ExecutionReport(ExecutionReport {
-            exec_id: "1-0".to_owned(),
-            order_id: "1".to_owned(),
-            cl_ord_id: "C-1".to_owned(),
-            exec_type: ExecType::New,
-            ord_status: OrdStatus::New,
-            symbol: "AAPL".to_owned(),
-            side: deepbook_types::Side::Buy,
-            order_qty: 100,
-            last_qty: None,
-            last_px: None,
-            leaves_qty: 100,
-            cum_qty: 0,
-            avg_px: 0,
-            account: None,
-            transact_time: Some("20261025-12:34:56.001".to_owned()),
-            text: None,
-        }),
-    });
+    events
+        .lock()
+        .expect("events")
+        .push_back(execution_report_event(key));
     std::thread::sleep(Duration::from_millis(200));
 
     // Reconnect and resume the same FIX session (the client's next
@@ -418,6 +425,63 @@ fn a_report_for_a_disconnected_session_is_sent_after_reconnect() {
         }
         other => panic!("expected an ExecutionReport, got {other:?}"),
     }
+
+    drop(stream);
+    handle.join().expect("gateway thread");
+    std::fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn a_full_outbound_queue_stops_reading_the_peer() {
+    let directory = temporary_directory("outbound-high-water");
+    let events = Arc::new(Mutex::new(VecDeque::new()));
+    let metrics = Arc::new(deepbook_gateway::GatewayMetrics::default());
+    let key = SessionKey::new("DEEPBOOK", "CLIENT");
+    let mut config = GatewayConfig::new(
+        "127.0.0.1:0".parse().expect("address"),
+        &directory,
+        "DEEPBOOK",
+        "CLIENT",
+    );
+    config.tick = Duration::from_millis(10);
+    config.max_outbound_bytes = 1;
+    let mut gateway = Gateway::bind_with_metrics(
+        config,
+        ScriptedEngine {
+            events: Arc::clone(&events),
+        },
+        Arc::clone(&metrics),
+    )
+    .expect("bind");
+    let address = gateway.local_addr().expect("local address");
+    let handle = std::thread::spawn(move || {
+        gateway
+            .run_until(Instant::now() + Duration::from_secs(2))
+            .expect("gateway");
+    });
+
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    stream.write_all(&logon(1)).expect("logon");
+    let reply = read_frame(&mut stream);
+    assert_eq!(MsgType::Logon, reply.msg_type().expect("type"));
+
+    events
+        .lock()
+        .expect("events")
+        .push_back(execution_report_event(key));
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while metrics.outbound_blocked_total() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the high-water mark did not stop the read side"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(metrics.outbound_high_water_bytes() >= 1);
 
     drop(stream);
     handle.join().expect("gateway thread");

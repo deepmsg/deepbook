@@ -59,13 +59,17 @@ pub struct GatewayConfig {
     /// The journal and sequence-file durability policy. M1's promise is
     /// [`SyncPolicy::Each`]; M5 measures the batching policies.
     pub journal_sync: SyncPolicy,
+    /// Stop reading a peer's orders when its outbound report queue reaches
+    /// this many bytes; resume below half. Reports are never dropped.
+    pub max_outbound_bytes: usize,
     /// The I/O backend.
     pub backend: BackendKind,
 }
 
 impl GatewayConfig {
     /// A configuration with the design's defaults: heartbeat 30 s, journal
-    /// 4096, a 100 ms tick, a 10 s logon timeout and epoll.
+    /// 4096, a 100 ms tick, a 10 s logon timeout, a 16 MiB outbound
+    /// high-water mark and epoll.
     #[must_use]
     pub fn new(
         bind: SocketAddr,
@@ -83,6 +87,7 @@ impl GatewayConfig {
             tick: Duration::from_millis(100),
             logon_timeout_millis: 10_000,
             journal_sync: SyncPolicy::Each,
+            max_outbound_bytes: MAX_OUTBOUND_BYTES,
             backend: BackendKind::Epoll,
         }
     }
@@ -94,25 +99,110 @@ struct Connection {
     peer: SocketAddr,
     decoder: FrameDecoder,
     session: Session<FileJournal, FileSequenceStore>,
-    outbound: VecDeque<Vec<u8>>,
-    /// The bytes currently submitted to the backend, and how many of them it
-    /// has written. Reports are coalesced into this chunk at submit time, so a
-    /// connection's reports do not cost one backend submission and completion
-    /// each.
-    write_chunk: Option<(Vec<u8>, usize)>,
+    outbound: Outbound,
     writing: bool,
     close_after_flush: bool,
+    /// Whether the outbound high-water mark stopped the read side.
+    read_paused: bool,
     /// Whether the facade was told this session logged on, so the close is
     /// announced exactly once and never without an open.
     announced_open: bool,
 }
 
+/// The reports waiting for one connection, in order.
+///
+/// One contiguous buffer, not one `Vec` per report. `start` is the first byte
+/// not yet submitted; `chunk` is the range currently handed to the backend
+/// (it may be partially written). The bytes stay in `bytes` until the chunk
+/// completes, so a partial write can resubmit its remainder.
+#[derive(Debug, Default)]
+struct Outbound {
+    bytes: Vec<u8>,
+    start: usize,
+    chunk: Option<(usize, usize)>,
+}
+
+impl Outbound {
+    fn append(&mut self, raw: &[u8]) {
+        self.bytes.extend_from_slice(raw);
+    }
+
+    /// Bytes queued, including the part of the in-flight chunk not yet written.
+    fn queued(&self) -> usize {
+        let unsent = self.bytes.len().saturating_sub(self.start);
+        let in_flight = self
+            .chunk
+            .map_or(0, |(start, end)| end.saturating_sub(start));
+        unsent.saturating_add(in_flight)
+    }
+
+    fn has_unsent(&self) -> bool {
+        self.start < self.bytes.len()
+    }
+
+    fn chunk(&self) -> Option<(usize, usize)> {
+        self.chunk
+    }
+
+    /// Start the next chunk of at most `max` bytes; returns its range.
+    ///
+    /// Only called when no chunk is in flight (or its completion cleared it).
+    fn begin_chunk(&mut self, max: usize) -> Option<(usize, usize)> {
+        self.chunk = None;
+        self.compact();
+        if !self.has_unsent() {
+            return None;
+        }
+        let start = self.start;
+        let end = start.saturating_add(max).min(self.bytes.len());
+        if end <= start {
+            return None;
+        }
+        self.start = end;
+        self.chunk = Some((start, end));
+        Some((start, end))
+    }
+
+    /// Account for `count` written bytes; true when the chunk is complete.
+    fn written(&mut self, count: usize) -> bool {
+        let Some((start, end)) = &mut self.chunk else {
+            return true;
+        };
+        let advance = count.min(end.saturating_sub(*start));
+        *start += advance;
+        if *start >= *end {
+            self.chunk = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finished(&self) -> bool {
+        self.chunk.is_none() && !self.has_unsent()
+    }
+
+    fn compact(&mut self) {
+        if self.chunk.is_some() {
+            return;
+        }
+        if self.start >= self.bytes.len() {
+            self.bytes.clear();
+            self.start = 0;
+        } else if self.start >= 64 * 1024 {
+            self.bytes.drain(..self.start);
+            self.start = 0;
+        }
+    }
+}
+
 impl Connection {
     fn finished(&self) -> bool {
-        self.close_after_flush
-            && self.outbound.is_empty()
-            && self.write_chunk.is_none()
-            && !self.writing
+        self.close_after_flush && self.outbound.finished() && !self.writing
+    }
+
+    fn queued_bytes(&self) -> usize {
+        self.outbound.queued()
     }
 }
 
@@ -143,6 +233,9 @@ const MAX_PENDING_REPORTS: usize = 4_096;
 /// this is a few hundred reports per submission; the epoll/uring backends copy
 /// the bytes, and one 64 KiB copy replaces hundreds of report-sized ones.
 const MAX_WRITE_BYTES: usize = 64 * 1024;
+
+/// The default outbound high-water mark per connection: 16 MiB.
+const MAX_OUTBOUND_BYTES: usize = 16 * 1024 * 1024;
 
 impl<E: Engine> Gateway<E> {
     /// Bind and arm the first accept.
@@ -235,6 +328,7 @@ impl<E: Engine> Gateway<E> {
         work += self.flush_pending_reports();
         work += self.drain_engine_events()?;
         self.flush_writes();
+        self.update_all_read_pauses();
         self.metrics.set_outbound_bytes(self.outbound_bytes());
         self.metrics
             .set_pending_commands(self.engine.pending_commands());
@@ -312,10 +406,10 @@ impl<E: Engine> Gateway<E> {
                 peer,
                 decoder: FrameDecoder::new(),
                 session,
-                outbound: VecDeque::new(),
-                write_chunk: None,
+                outbound: Outbound::default(),
                 writing: false,
                 close_after_flush: false,
+                read_paused: false,
                 announced_open: false,
             },
         );
@@ -459,10 +553,11 @@ impl<E: Engine> Gateway<E> {
                 break;
             }
         }
+        self.update_read_pause(id);
         if self
             .connections
             .get(&id)
-            .is_some_and(|connection| !connection.close_after_flush)
+            .is_some_and(|connection| !connection.close_after_flush && !connection.read_paused)
             && self.io.start_read(id).is_err()
         {
             self.drop_connection(id);
@@ -477,17 +572,14 @@ impl<E: Engine> Gateway<E> {
                 self.drop_connection(id);
             }
             Ok(count) => {
+                self.metrics
+                    .note_fix_bytes_written(u64::try_from(count).unwrap_or(u64::MAX));
                 if let Some(connection) = self.connections.get_mut(&id) {
-                    if let Some((chunk, offset)) = &mut connection.write_chunk {
-                        let advance = count.min(chunk.len() - *offset);
-                        *offset += advance;
-                        if *offset >= chunk.len() {
-                            connection.write_chunk = None;
-                        }
-                    }
+                    connection.outbound.written(count);
                     connection.writing = false;
                 }
                 self.submit_next_write(id);
+                self.update_read_pause(id);
             }
             Err(_) => {
                 self.drop_connection(id);
@@ -500,24 +592,24 @@ impl<E: Engine> Gateway<E> {
     ///
     /// A partially written chunk continues where the backend stopped — the
     /// backend copies what it is given, so the remainder is submitted again.
-    /// Otherwise the front reports are coalesced into one chunk of at most
-    /// [`MAX_WRITE_BYTES`]. Submissions happen at the end of a poll cycle, not
-    /// per report, so the reports a cycle produced travel together.
+    /// Otherwise the next [`MAX_WRITE_BYTES`]-sized slice of the contiguous
+    /// outbound buffer is submitted. Submissions happen at the end of a poll
+    /// cycle, not per report, so the reports a cycle produced travel together.
     fn submit_next_write(&mut self, id: u64) {
         let Some(connection) = self.connections.get(&id) else {
             return;
         };
         if connection.writing {
-            if !connection.outbound.is_empty() {
+            if connection.outbound.has_unsent() {
                 self.metrics.note_write_backpressure();
             }
             return;
         }
 
-        if let Some((chunk, offset)) = &connection.write_chunk {
-            if *offset < chunk.len() {
-                let remainder = chunk[*offset..].to_vec();
-                match self.io.submit_write(id, &remainder) {
+        if let Some((start, end)) = connection.outbound.chunk() {
+            if start < end {
+                let bytes = &connection.outbound.bytes[start..end];
+                match self.io.submit_write(id, bytes) {
                     Ok(()) => {
                         if let Some(connection) = self.connections.get_mut(&id) {
                             connection.writing = true;
@@ -529,30 +621,22 @@ impl<E: Engine> Gateway<E> {
             }
         }
 
-        let mut chunk = Vec::new();
-        {
-            let Some(connection) = self.connections.get_mut(&id) else {
-                return;
-            };
-            connection.write_chunk = None;
-            while let Some(front) = connection.outbound.front() {
-                if !chunk.is_empty() && chunk.len() + front.len() > MAX_WRITE_BYTES {
-                    break;
-                }
-                chunk.extend_from_slice(front);
-                connection.outbound.pop_front();
-                if chunk.len() >= MAX_WRITE_BYTES {
-                    break;
-                }
-            }
-        }
-        if chunk.is_empty() {
+        let Some((start, end)) = self
+            .connections
+            .get_mut(&id)
+            .and_then(|connection| connection.outbound.begin_chunk(MAX_WRITE_BYTES))
+        else {
             return;
-        }
-        match self.io.submit_write(id, &chunk) {
+        };
+        let bytes = &self
+            .connections
+            .get(&id)
+            .expect("the connection was just present")
+            .outbound
+            .bytes[start..end];
+        match self.io.submit_write(id, bytes) {
             Ok(()) => {
                 if let Some(connection) = self.connections.get_mut(&id) {
-                    connection.write_chunk = Some((chunk, 0));
                     connection.writing = true;
                 }
             }
@@ -569,18 +653,43 @@ impl<E: Engine> Gateway<E> {
         }
     }
 
+    /// Stop arming reads on a connection whose report queue is at its
+    /// high-water mark, and resume below half. Reports are never dropped.
+    fn update_read_pause(&mut self, id: u64) {
+        let Some(connection) = self.connections.get(&id) else {
+            return;
+        };
+        let high = self.config.max_outbound_bytes;
+        if high == 0 {
+            return;
+        }
+        let queued = connection.queued_bytes();
+        if !connection.read_paused && queued >= high {
+            if let Some(connection) = self.connections.get_mut(&id) {
+                connection.read_paused = true;
+            }
+            let _ = self.io.stop_read(id);
+            self.metrics.note_outbound_blocked();
+        } else if connection.read_paused && queued <= high / 2 {
+            if let Some(connection) = self.connections.get_mut(&id) {
+                connection.read_paused = false;
+            }
+            let _ = self.io.start_read(id);
+        }
+    }
+
+    fn update_all_read_pauses(&mut self) {
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        for id in ids {
+            self.update_read_pause(id);
+        }
+    }
+
     /// Bytes queued for FIX peers, including the chunk in flight.
     fn outbound_bytes(&self) -> u64 {
         self.connections
             .values()
-            .map(|connection| {
-                let queued: usize = connection.outbound.iter().map(Vec::len).sum();
-                let in_flight = connection
-                    .write_chunk
-                    .as_ref()
-                    .map_or(0, |(chunk, offset)| chunk.len().saturating_sub(*offset));
-                u64::try_from(queued.saturating_add(in_flight)).unwrap_or(u64::MAX)
-            })
+            .map(|connection| u64::try_from(connection.queued_bytes()).unwrap_or(u64::MAX))
             .sum()
     }
 
@@ -612,7 +721,7 @@ impl<E: Engine> Gateway<E> {
             match action {
                 Action::Send { raw, .. } => {
                     if let Some(connection) = self.connections.get_mut(&id) {
-                        connection.outbound.push_back(raw);
+                        connection.outbound.append(&raw);
                     }
                 }
                 Action::Deliver(message) => {
@@ -735,5 +844,46 @@ mod tests {
         );
         assert_eq!(BackendKind::Epoll, config.backend);
         assert_eq!(SyncPolicy::Each, config.journal_sync);
+        assert_eq!(16 * 1024 * 1024, config.max_outbound_bytes);
+    }
+
+    #[test]
+    fn the_outbound_buffer_chunks_without_per_report_vectors() {
+        let mut outbound = Outbound::default();
+        outbound.append(&[1; 3]);
+        outbound.append(&[2; 5]);
+        assert_eq!(8, outbound.queued());
+
+        let (start, end) = outbound.begin_chunk(6).expect("a chunk");
+        assert_eq!((0, 6), (start, end));
+        assert_eq!(8, outbound.queued(), "6 in flight + 2 unsent");
+
+        assert!(!outbound.written(2));
+        assert_eq!((2, 6), outbound.chunk().expect("still in flight"));
+        assert_eq!(6, outbound.queued(), "2 unsent + 4 in flight");
+
+        assert!(outbound.written(4));
+        assert_eq!(2, outbound.queued(), "2 unsent");
+
+        let (start, end) = outbound.begin_chunk(6).expect("the rest");
+        assert_eq!((6, 8), (start, end));
+        assert!(outbound.written(2));
+        assert!(outbound.finished());
+        assert_eq!(0, outbound.queued());
+    }
+
+    #[test]
+    fn a_partial_chunk_keeps_the_remainder() {
+        let mut outbound = Outbound::default();
+        outbound.append(&[7; 10]);
+        assert_eq!((0, 4), outbound.begin_chunk(4).expect("chunk"));
+
+        // A one-byte write leaves the same chunk, starting at the next byte.
+        assert!(!outbound.written(1));
+        assert_eq!((1, 4), outbound.chunk().expect("remainder"));
+        assert_eq!(9, outbound.queued());
+
+        assert!(outbound.written(3));
+        assert_eq!(6, outbound.queued());
     }
 }

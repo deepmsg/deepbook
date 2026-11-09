@@ -90,6 +90,17 @@ pub trait EventLoop: Send {
     /// The read could not be armed.
     fn start_read(&mut self, id: u64) -> io::Result<()>;
 
+    /// Stop arming reads for `id`; the connection stays open for writes.
+    ///
+    /// The gateway uses this to stop accepting orders when a peer's outbound
+    /// report queue reaches its high-water mark. An already armed read may
+    /// still complete; the caller simply must not arm the next one.
+    ///
+    /// # Errors
+    ///
+    /// The interest could not be changed.
+    fn stop_read(&mut self, id: u64) -> io::Result<()>;
+
     /// Submit `bytes` for `id`. The bytes are copied.
     ///
     /// # Errors
@@ -214,6 +225,13 @@ impl EventLoop for EpollLoop {
     fn start_read(&mut self, id: u64) -> io::Result<()> {
         if let Some(connection) = self.connections.get_mut(&id) {
             connection.reading = true;
+        }
+        self.update_interest(id)
+    }
+
+    fn stop_read(&mut self, id: u64) -> io::Result<()> {
+        if let Some(connection) = self.connections.get_mut(&id) {
+            connection.reading = false;
         }
         self.update_interest(id)
     }

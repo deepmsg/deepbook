@@ -28,6 +28,13 @@ pub struct GatewayMetrics {
     fix_orders_decoded_total: AtomicU64,
     /// Bytes queued for FIX peers or submitted but not yet written.
     outbound_bytes: AtomicU64,
+    /// The highest `outbound_bytes` seen since the gateway started.
+    outbound_high_water_bytes: AtomicU64,
+    /// Bytes actually handed to the sockets.
+    fix_bytes_written_total: AtomicU64,
+    /// Poll cycles that stopped reading because the outbound queue hit its
+    /// high-water mark.
+    outbound_blocked_total: AtomicU64,
     /// Poll cycles that found queued reports behind an in-flight write.
     write_backpressure_total: AtomicU64,
     /// Commands waiting for the cluster.
@@ -83,6 +90,24 @@ impl GatewayMetrics {
     #[must_use]
     pub fn outbound_bytes(&self) -> u64 {
         self.outbound_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The highest `outbound_bytes` since the gateway started.
+    #[must_use]
+    pub fn outbound_high_water_bytes(&self) -> u64 {
+        self.outbound_high_water_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes actually handed to the sockets.
+    #[must_use]
+    pub fn fix_bytes_written_total(&self) -> u64 {
+        self.fix_bytes_written_total.load(Ordering::Relaxed)
+    }
+
+    /// Poll cycles that stopped reading on the outbound high-water mark.
+    #[must_use]
+    pub fn outbound_blocked_total(&self) -> u64 {
+        self.outbound_blocked_total.load(Ordering::Relaxed)
     }
 
     /// Poll cycles that found queued reports behind an in-flight write.
@@ -145,6 +170,17 @@ impl GatewayMetrics {
 
     pub(crate) fn set_outbound_bytes(&self, bytes: u64) {
         self.outbound_bytes.store(bytes, Ordering::Relaxed);
+        self.outbound_high_water_bytes
+            .fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_fix_bytes_written(&self, bytes: u64) {
+        self.fix_bytes_written_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_outbound_blocked(&self) {
+        self.outbound_blocked_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_write_backpressure(&self) {
@@ -205,6 +241,21 @@ pub fn prometheus(metrics: &GatewayMetrics) -> String {
         "deepbook_gateway_outbound_bytes",
         metrics.outbound_bytes(),
     );
+    push_gauge(
+        &mut out,
+        "deepbook_gateway_outbound_high_water_bytes",
+        metrics.outbound_high_water_bytes(),
+    );
+    push_counter(
+        &mut out,
+        "deepbook_gateway_fix_bytes_written_total",
+        metrics.fix_bytes_written_total(),
+    );
+    push_counter(
+        &mut out,
+        "deepbook_gateway_outbound_blocked_total",
+        metrics.outbound_blocked_total(),
+    );
     push_counter(
         &mut out,
         "deepbook_gateway_write_backpressure_total",
@@ -258,6 +309,9 @@ mod tests {
         metrics.note_fix_bytes(1234);
         metrics.note_fix_order_decoded();
         metrics.set_outbound_bytes(567);
+        metrics.set_outbound_bytes(89);
+        metrics.note_fix_bytes_written(456);
+        metrics.note_outbound_blocked();
         metrics.note_write_backpressure();
         metrics.set_pending_commands(7);
         metrics.set_cluster_orders_len(9);
@@ -280,7 +334,19 @@ mod tests {
             "{page}"
         );
         assert!(
-            page.contains("deepbook_gateway_outbound_bytes 567"),
+            page.contains("deepbook_gateway_outbound_bytes 89"),
+            "{page}"
+        );
+        assert!(
+            page.contains("deepbook_gateway_outbound_high_water_bytes 567"),
+            "{page}"
+        );
+        assert!(
+            page.contains("deepbook_gateway_fix_bytes_written_total 456"),
+            "{page}"
+        );
+        assert!(
+            page.contains("deepbook_gateway_outbound_blocked_total 1"),
             "{page}"
         );
         assert!(

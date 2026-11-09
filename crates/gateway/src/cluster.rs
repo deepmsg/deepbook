@@ -674,7 +674,6 @@ impl ClusterEngine {
         self.commands.push_back(PendingCommand {
             payload: encode_command(command),
         });
-        self.pump();
         true
     }
 
@@ -826,6 +825,10 @@ impl CommandSink for ClusterEngine {
 
     fn orders_len(&self) -> usize {
         self.mapping.orders.len()
+    }
+
+    fn flush(&mut self) {
+        self.pump();
     }
 }
 

@@ -17,6 +17,14 @@ pub trait CommandSink {
     /// publishes reports through [`EventSource`], not by returning them.
     fn deliver(&mut self, session: &SessionKey, message: ApplicationMessage);
 
+    /// Let the sink move queued commands on, once per poll cycle.
+    ///
+    /// The acceptor calls this after all inbound messages and timers of a
+    /// cycle. A sink that forwards each command in `deliver` inherits a no-op;
+    /// a sink that queues (the cluster adapter) pumps once here instead of
+    /// once per order.
+    fn flush(&mut self) {}
+
     /// Commands waiting for the cluster, if the sink queues them.
     ///
     /// The `/metrics` page exposes this so a probe can tell "the gateway is

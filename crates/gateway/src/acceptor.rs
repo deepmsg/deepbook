@@ -330,6 +330,7 @@ impl<E: Engine> Gateway<E> {
         // per order.
         self.engine.flush();
         work += self.drain_engine_events()?;
+        self.flush_sessions();
         self.flush_writes();
         self.update_all_read_pauses();
         self.metrics.set_outbound_bytes(self.outbound_bytes());
@@ -644,6 +645,22 @@ impl<E: Engine> Gateway<E> {
                 }
             }
             Err(_) => self.drop_connection(id),
+        }
+    }
+
+    /// Write the journal records this cycle produced before their messages
+    /// reach the sockets. A failure closes the connection instead of sending a
+    /// message the journal does not hold.
+    fn flush_sessions(&mut self) {
+        let ids: Vec<u64> = self.connections.keys().copied().collect();
+        for id in ids {
+            let failed = self
+                .connections
+                .get_mut(&id)
+                .is_some_and(|connection| connection.session.flush_outbound().is_err());
+            if failed {
+                self.drop_connection(id);
+            }
         }
     }
 

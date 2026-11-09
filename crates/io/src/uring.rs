@@ -43,6 +43,8 @@ struct UringConnection {
     write_buffer: Vec<u8>,
     read_inflight: bool,
     write_inflight: bool,
+    /// A high-water pause: do not arm another read when this one completes.
+    read_paused: bool,
     closing: bool,
 }
 
@@ -130,7 +132,7 @@ impl UringLoop {
                 "no such connection",
             ));
         };
-        if connection.read_inflight || connection.closing {
+        if connection.read_inflight || connection.closing || connection.read_paused {
             return Ok(());
         }
         let entry = opcode::Read::new(
@@ -182,6 +184,7 @@ impl UringLoop {
                         write_buffer: Vec::new(),
                         read_inflight: false,
                         write_inflight: false,
+                        read_paused: false,
                         closing: false,
                     },
                 );
@@ -238,7 +241,17 @@ impl EventLoop for UringLoop {
     }
 
     fn start_read(&mut self, id: u64) -> io::Result<()> {
+        if let Some(connection) = self.connections.get_mut(&id) {
+            connection.read_paused = false;
+        }
         self.arm_read(id)
+    }
+
+    fn stop_read(&mut self, id: u64) -> io::Result<()> {
+        if let Some(connection) = self.connections.get_mut(&id) {
+            connection.read_paused = true;
+        }
+        Ok(())
     }
 
     fn submit_write(&mut self, id: u64, bytes: &[u8]) -> io::Result<()> {

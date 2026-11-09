@@ -235,6 +235,11 @@ impl<E: Engine> Gateway<E> {
         work += self.flush_pending_reports();
         work += self.drain_engine_events()?;
         self.flush_writes();
+        self.metrics.set_outbound_bytes(self.outbound_bytes());
+        self.metrics
+            .set_pending_commands(self.engine.pending_commands());
+        self.metrics
+            .set_cluster_orders_len(self.engine.orders_len());
         self.close_finished();
         Ok(work)
     }
@@ -406,6 +411,7 @@ impl<E: Engine> Gateway<E> {
             }
         };
         let bytes = self.io.read_data(id).get(..count).unwrap_or(&[]).to_vec();
+        self.metrics.note_fix_bytes(count);
         let Some(connection) = self.connections.get_mut(&id) else {
             return 1;
         };
@@ -425,6 +431,9 @@ impl<E: Engine> Gateway<E> {
                 self.drop_connection(id);
                 return work;
             };
+            if matches!(message.msg_type(), Ok(kind) if !kind.is_admin()) {
+                self.metrics.note_fix_order_decoded();
+            }
             let result = self
                 .connections
                 .get_mut(&id)
@@ -499,6 +508,9 @@ impl<E: Engine> Gateway<E> {
             return;
         };
         if connection.writing {
+            if !connection.outbound.is_empty() {
+                self.metrics.note_write_backpressure();
+            }
             return;
         }
 
@@ -555,6 +567,21 @@ impl<E: Engine> Gateway<E> {
         for id in ids {
             self.submit_next_write(id);
         }
+    }
+
+    /// Bytes queued for FIX peers, including the chunk in flight.
+    fn outbound_bytes(&self) -> u64 {
+        self.connections
+            .values()
+            .map(|connection| {
+                let queued: usize = connection.outbound.iter().map(Vec::len).sum();
+                let in_flight = connection
+                    .write_chunk
+                    .as_ref()
+                    .map_or(0, |(chunk, offset)| chunk.len().saturating_sub(*offset));
+                u64::try_from(queued.saturating_add(in_flight)).unwrap_or(u64::MAX)
+            })
+            .sum()
     }
 
     fn tick_sessions(&mut self) -> usize {

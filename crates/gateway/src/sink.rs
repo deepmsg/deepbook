@@ -16,6 +16,20 @@ pub trait CommandSink {
     /// The sink owns the decision of what an accepted order becomes. It
     /// publishes reports through [`EventSource`], not by returning them.
     fn deliver(&mut self, session: &SessionKey, message: ApplicationMessage);
+
+    /// Commands waiting for the cluster, if the sink queues them.
+    ///
+    /// The `/metrics` page exposes this so a probe can tell "the gateway is
+    /// busy" from "the ingress is full". A sink that does not queue inherits
+    /// zero.
+    fn pending_commands(&self) -> usize {
+        0
+    }
+
+    /// Entries in the sink's local order projection, if it has one.
+    fn orders_len(&self) -> usize {
+        0
+    }
 }
 
 /// One report on its way back to a FIX session.

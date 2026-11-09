@@ -819,6 +819,14 @@ impl CommandSink for ClusterEngine {
             ApplicationMessage::ExecutionReport(_) | ApplicationMessage::OrderCancelReject(_) => {}
         }
     }
+
+    fn pending_commands(&self) -> usize {
+        self.commands.len()
+    }
+
+    fn orders_len(&self) -> usize {
+        self.mapping.orders.len()
+    }
 }
 
 impl EventSource for ClusterEngine {

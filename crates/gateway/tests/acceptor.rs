@@ -206,6 +206,61 @@ fn a_client_logs_on_sends_an_order_and_logs_out() {
 }
 
 #[test]
+fn the_metrics_count_what_the_fix_side_read_and_decoded() {
+    let directory = temporary_directory("metrics");
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let metrics = Arc::new(deepbook_gateway::GatewayMetrics::default());
+    let config = GatewayConfig::new(
+        "127.0.0.1:0".parse().expect("address"),
+        &directory,
+        "DEEPBOOK",
+        "CLIENT",
+    );
+    let mut gateway = Gateway::bind_with_metrics(
+        config,
+        RecordingSink {
+            messages: Arc::clone(&messages),
+        },
+        Arc::clone(&metrics),
+    )
+    .expect("bind");
+    let address = gateway.local_addr().expect("local address");
+    let handle = std::thread::spawn(move || {
+        gateway
+            .run_until(Instant::now() + Duration::from_secs(2))
+            .expect("gateway");
+    });
+
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("read timeout");
+    stream.write_all(&logon(1)).expect("logon");
+    let reply = read_frame(&mut stream);
+    assert_eq!(MsgType::Logon, reply.msg_type().expect("type"));
+
+    stream.write_all(&new_order(2)).expect("order");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while messages.lock().expect("sink").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the order did not reach the sink"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(stream);
+    handle.join().expect("gateway thread");
+
+    assert!(metrics.fix_bytes_read_total() > 0);
+    assert_eq!(1, metrics.fix_orders_decoded_total());
+    assert_eq!(1, metrics.orders_total());
+    assert_eq!(0, metrics.rejects_total());
+    assert_eq!(0, metrics.pending_commands());
+    assert_eq!(0, metrics.cluster_orders_len());
+    std::fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn an_unlogged_connection_is_closed_at_the_logon_timeout() {
     // The timeout is a session property, so this drives the same gateway with
     // a short one and expects the server to close without a FIX message.

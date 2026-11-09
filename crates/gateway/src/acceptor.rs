@@ -326,6 +326,9 @@ impl<E: Engine> Gateway<E> {
 
         work += self.tick_sessions();
         work += self.flush_pending_reports();
+        // R3: the commands this cycle queued reach the cluster once, not once
+        // per order.
+        self.engine.flush();
         work += self.drain_engine_events()?;
         self.flush_writes();
         self.update_all_read_pauses();

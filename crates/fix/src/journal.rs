@@ -121,6 +121,21 @@ pub trait Journal {
     /// A storage error, or a sequence that is not after the last one.
     fn append(&mut self, entry: JournalEntry) -> Result<(), JournalError>;
 
+    /// Write buffered records to the journal file, without forcing them to
+    /// stable storage.
+    ///
+    /// A batching journal may defer the file write; the gateway calls this
+    /// once per poll cycle, before it writes the records' messages to the
+    /// socket, so a message the peer sees is already in the file. The default
+    /// is a no-op for an in-memory journal.
+    ///
+    /// # Errors
+    ///
+    /// A storage error.
+    fn flush(&mut self) -> Result<(), JournalError> {
+        Ok(())
+    }
+
     /// The entry for `seq`, if the window still holds it.
     fn get(&self, seq: u64) -> Option<&JournalEntry>;
 
@@ -247,6 +262,8 @@ const HEADER_LENGTH: usize = 4 + 1 + 8 + 2 + 1 + 4;
 pub struct FileJournal {
     path: PathBuf,
     file: File,
+    /// Encoded records appended since the last file write.
+    pending: Vec<u8>,
     memory: MemoryJournal,
     sync: SyncPolicy,
     unsynced: u32,
@@ -315,6 +332,7 @@ impl FileJournal {
         Ok(Self {
             path,
             file,
+            pending: Vec::new(),
             memory: MemoryJournal::from_parts(capacity, entries, last_seq),
             sync,
             unsynced: 0,
@@ -338,19 +356,32 @@ impl Journal for FileJournal {
                 expected,
             });
         }
-        let record = encode_record(&entry);
-        self.file
-            .write_all(&record)
-            .map_err(|error| io_error(&self.path, error))?;
+        self.pending.extend_from_slice(&encode_record(&entry));
         self.unsynced = self.unsynced.saturating_add(1);
-        if self.sync.is_due(self.unsynced, self.last_sync.elapsed()) {
+        // M1's promise is one sync per append. A batching policy may keep the
+        // record in `pending` until the session flushes the poll cycle, but
+        // that flush always happens before the message reaches the socket.
+        if self.sync == SyncPolicy::Each {
+            self.flush()?;
+        }
+        self.memory.append(entry)
+    }
+
+    fn flush(&mut self) -> Result<(), JournalError> {
+        if !self.pending.is_empty() {
+            self.file
+                .write_all(&self.pending)
+                .map_err(|error| io_error(&self.path, error))?;
+            self.pending.clear();
+        }
+        if self.unsynced > 0 && self.sync.is_due(self.unsynced, self.last_sync.elapsed()) {
             self.file
                 .sync_data()
                 .map_err(|error| io_error(&self.path, error))?;
             self.unsynced = 0;
             self.last_sync = Instant::now();
         }
-        self.memory.append(entry)
+        Ok(())
     }
 
     fn get(&self, seq: u64) -> Option<&JournalEntry> {
@@ -370,6 +401,7 @@ impl Journal for FileJournal {
     }
 
     fn clear(&mut self) -> Result<(), JournalError> {
+        self.pending.clear();
         self.file
             .set_len(0)
             .map_err(|error| io_error(&self.path, error))?;
@@ -385,6 +417,7 @@ impl Journal for FileJournal {
     }
 
     fn sync(&mut self) -> Result<(), JournalError> {
+        self.flush()?;
         if self.unsynced > 0 {
             self.file
                 .sync_data()
@@ -393,6 +426,15 @@ impl Journal for FileJournal {
             self.last_sync = Instant::now();
         }
         Ok(())
+    }
+}
+
+impl Drop for FileJournal {
+    fn drop(&mut self) {
+        // A caller that owns a journal directly must not lose its buffered
+        // records. The session's Drop calls `sync` too; this is the same
+        // promise for a bare journal.
+        let _ = self.sync();
     }
 }
 
@@ -788,6 +830,23 @@ mod tests {
     }
 
     #[test]
+    fn a_batched_journal_does_not_write_until_flush() {
+        let directory = temporary_directory("journal-pending");
+        let path = directory.join("journal.bin");
+        let mut journal =
+            FileJournal::open_with_sync(&path, 16, SyncPolicy::Every(8)).expect("open");
+        journal.append(entry(1, MsgType::Logon)).expect("append");
+        assert_eq!(
+            0,
+            std::fs::metadata(&path).expect("metadata").len(),
+            "the record is buffered until the cycle's flush"
+        );
+        journal.flush().expect("flush");
+        assert!(std::fs::metadata(&path).expect("metadata").len() > 0);
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+
+    #[test]
     fn a_batched_journal_recovers_every_append() {
         let directory = temporary_directory("journal-batched");
         let path = directory.join("journal.bin");
@@ -798,8 +857,8 @@ mod tests {
             journal
                 .append(entry(2, MsgType::NewOrderSingle))
                 .expect("2");
-            // Dropped without an explicit sync: the write is already in the
-            // file, and the session's Drop closes the durability window.
+            // Dropped without an explicit sync: the journal's Drop flushes the
+            // buffered records into the file.
         }
         let journal = FileJournal::open(&path, 16).expect("reopen");
         assert_eq!(3, journal.next_seq());

@@ -221,6 +221,21 @@ impl<J: Journal, S: SequenceStore> Session<J, S> {
         Ok(())
     }
 
+    /// Write the journal records this cycle produced, without forcing them to
+    /// stable storage.
+    ///
+    /// The gateway calls this once per poll cycle, before it writes those
+    /// records' messages to the socket. The batching [`SyncPolicy`] still owns
+    /// the fsync window; the message the peer sees is in the file.
+    ///
+    /// # Errors
+    ///
+    /// A storage error.
+    pub fn flush_outbound(&mut self) -> Result<(), SessionError> {
+        self.journal.flush()?;
+        Ok(())
+    }
+
     /// The session state.
     #[must_use]
     pub const fn state(&self) -> SessionState {

@@ -111,7 +111,12 @@ pub trait EventLoop: Send {
     /// The bytes of the last completed read for `id`.
     fn read_data(&self, id: u64) -> &[u8];
 
-    /// Close `id`. An io_uring close waits for outstanding operations.
+    /// Close `id`.
+    ///
+    /// The io_uring backend cancels the connection's outstanding read and
+    /// write, so the descriptor and its buffers are released when the kernel
+    /// posts their completions; a peer that has gone quiet without closing
+    /// must not pin them. The epoll backend forgets the connection at once.
     fn close(&mut self, id: u64);
 
     /// Wait for completions, appending them to `events`.
@@ -509,5 +514,66 @@ mod tests {
     #[test]
     fn uring_round_trips_or_is_unavailable() {
         round_trip(BackendKind::Uring);
+    }
+
+    #[test]
+    fn uring_closing_a_quiet_connection_cancels_its_read_or_is_unavailable() {
+        // A read armed against a peer that keeps the connection open but
+        // sends nothing has no completion of its own. Closing must cancel it,
+        // otherwise the descriptor and the read buffer never come back.
+        let mut io = match open(BackendKind::Uring, "127.0.0.1:0".parse().expect("address")) {
+            Ok(io) => io,
+            Err(error) => {
+                eprintln!("SKIPPED {:?}: {error}", BackendKind::Uring);
+                return;
+            }
+        };
+        io.start_accept().expect("accept");
+        let address = io.local_addr().expect("address");
+        // Held for the whole test so the peer stays connected and quiet.
+        let _client = TcpStream::connect(address).expect("connect");
+
+        let mut events = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut id = None;
+        while std::time::Instant::now() < deadline && id.is_none() {
+            events.clear();
+            io.wait(Duration::from_millis(100), &mut events)
+                .expect("wait");
+            for event in &events {
+                if let Event::Accepted { id: accepted, .. } = event {
+                    id = Some(*accepted);
+                }
+            }
+        }
+        let id = id.expect("accepted");
+        io.start_read(id).expect("read");
+        io.close(id);
+
+        let mut cancelled = false;
+        while std::time::Instant::now() < deadline && !cancelled {
+            events.clear();
+            io.wait(Duration::from_millis(100), &mut events)
+                .expect("wait");
+            for event in &events {
+                if let Event::Read {
+                    id: event_id,
+                    result,
+                } = event
+                {
+                    assert_eq!(id, *event_id);
+                    assert!(result.is_err(), "a cancelled read is an error");
+                    cancelled = true;
+                }
+            }
+        }
+        assert!(
+            cancelled,
+            "closing a quiet connection did not cancel its read"
+        );
+        assert!(
+            io.read_data(id).is_empty(),
+            "the closed connection kept its buffer"
+        );
     }
 }

@@ -84,3 +84,21 @@ could cancel a different order. M2 also has to settle the matching rules, the
   `ExecutionReport(ExecType=Rejected)` or `OrderCancelReject`; it never
   truncates them. Widening the field needs a new schema version and a
   wire/snapshot migration (ADR 0005; `schemas/README.md`).
+- **2026-11-20:** The id window's table is sized so the window itself can never
+  fill it (at least one spare slot; a power-of-two window runs at load ≤ 0.5),
+  a reused tombstone stops being counted as a tombstone, and a rebuild sorts
+  into a pre-allocated spare table. Rolling the window over is therefore
+  allocation-free — before, the tombstone count drifted and a rebuild
+  allocated twice — and the M2 counting test now crosses the window and uses a
+  power-of-two window so a regression shows as a failure.
+- **2026-11-20:** The 8-bit generation wraps after 254 reuses of one slab
+  slot. The `(account, ClOrdID)` window is the authoritative index — every
+  terminal transition rewrites it — so a cancel keyed by `ClOrdID` cannot
+  reach a wrapped id; `Book::find` keeps the generation as the second check.
+  Widening `OrderId` needs a new schema version (ADR 0005), so the bound is
+  recorded here rather than removed.
+- **2026-11-20:** `OrderHot` measures 64 bytes with 16-byte alignment (the
+  `i128` notional sets the alignment), so a slab element is not guaranteed to
+  sit inside one cache line. Moving `notional` to the cold table would make it
+  48 bytes and 8-byte aligned, which straddles about three elements in four —
+  a layout change needs either ≤ 32 bytes or a 64-byte-aligned slab.

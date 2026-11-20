@@ -1,9 +1,9 @@
 //! The counted-allocation check from M2's acceptance.
 //!
-//! After warmup, matching against an existing price level and canceling a
-//! resting order must not allocate. The allocator counts only the test
-//! thread; the test harness runs on that thread, but the measured loops touch
-//! no `Vec` or map that grows.
+//! After warmup, matching against an existing price level, canceling a
+//! resting order and rolling the `(account, ClOrdID)` window over must not
+//! allocate. The allocator counts only the test thread; the test harness runs
+//! on that thread, but the measured loops touch no `Vec` or map that grows.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -96,7 +96,10 @@ fn order(account: AccountId, cl: ClientOrderId, side: Side, price: Price, qty: Q
 #[test]
 fn matching_and_canceling_do_not_allocate_after_warmup() {
     const RESTING: u64 = 5_000;
-    const MATCHES: u64 = 5_000;
+    // More matches than `recent_order_window`, so the measured loop evicts
+    // the oldest client ids (and rebuilds the window table) as it goes. A
+    // window that never rolls over would hide an allocating rebuild.
+    const MATCHES: u64 = 40_000;
 
     let mut engine = Engine::new(EngineConfig {
         symbol: 1,
@@ -125,6 +128,7 @@ fn matching_and_canceling_do_not_allocate_after_warmup() {
     ALLOCATIONS.with(|allocations| allocations.set(0));
 
     // Matching at the existing ask level: each buy takes one lot and leaves.
+    // Past the first 20 000 orders this also evicts the oldest client id.
     for index in 0..MATCHES {
         engine.on_command(
             &order(3, client_order_id(20_000 + index), Side::Buy, 100, 1),
@@ -149,4 +153,48 @@ fn matching_and_canceling_do_not_allocate_after_warmup() {
     let allocations = ALLOCATIONS.with(std::cell::Cell::get);
     TRACKING.with(|tracking| tracking.set(false));
     assert_eq!(0, allocations, "the warm paths allocated");
+}
+
+#[test]
+fn a_power_of_two_window_rolls_over_without_allocating() {
+    // A window that is a power of two used to size its table to exactly the
+    // window, leaving no spare slot: once full, every insert evicted and
+    // rebuilt the table, allocating twice per order.
+    const FILLS: u64 = 20_000;
+
+    let mut engine = Engine::new(EngineConfig {
+        symbol: 1,
+        max_orders: 30_000,
+        recent_order_window: 1_024,
+        risk: RiskConfig::disabled(),
+    });
+    let mut sink = NullSink;
+
+    // Warmup: the resting sell the fills take liquidity from.
+    engine.on_command(
+        &order(
+            1,
+            client_order_id(0),
+            Side::Sell,
+            100,
+            i64::try_from(FILLS).expect("fits"),
+        ),
+        1,
+        &mut sink,
+    );
+
+    TRACKING.with(|tracking| tracking.set(true));
+    ALLOCATIONS.with(|allocations| allocations.set(0));
+
+    for index in 0..FILLS {
+        engine.on_command(
+            &order(3, client_order_id(index + 10), Side::Buy, 100, 1),
+            index as i64 + 2,
+            &mut sink,
+        );
+    }
+
+    let allocations = ALLOCATIONS.with(std::cell::Cell::get);
+    TRACKING.with(|tracking| tracking.set(false));
+    assert_eq!(0, allocations, "rolling the window over allocated");
 }

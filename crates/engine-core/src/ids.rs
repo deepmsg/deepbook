@@ -9,6 +9,10 @@
 //! makes the duplicate-ClOrdID check allocation-free after construction: an
 //! insert either finds an occupied slot, a tombstone or an empty one. When the
 //! window is full the oldest key is evicted.
+//!
+//! The table is sized so the window can never fill it (at least one spare
+//! slot), and a rebuild sorts into a pre-allocated spare table. Rolling the
+//! window over therefore allocates nothing; only [`IdMap::new`] allocates.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -236,7 +240,12 @@ struct Slot {
 /// The bounded `(account, ClOrdID)` window.
 pub struct IdMap {
     slots: Vec<Slot>,
+    /// The table a rebuild sorts into. Allocated at construction so a rebuild
+    /// swaps tables instead of allocating; the two swap roles.
+    spare: Vec<Slot>,
     order: VecDeque<Key>,
+    /// The queue a rebuild sorts into; the counterpart of `spare`.
+    spare_order: VecDeque<Key>,
     len: usize,
     tombstones: usize,
     max_entries: usize,
@@ -247,10 +256,15 @@ impl IdMap {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         let capacity = capacity.max(2);
-        let slots_len = capacity.next_power_of_two();
+        // One slot more than the window, rounded up, so the window itself
+        // can never fill the table. A power-of-two window would otherwise
+        // sit at load 1.0 and rebuild on every insert once full.
+        let slots_len = capacity.saturating_add(1).next_power_of_two();
         Self {
             slots: vec![Slot::default(); slots_len],
+            spare: Vec::with_capacity(slots_len),
             order: VecDeque::with_capacity(capacity),
+            spare_order: VecDeque::with_capacity(capacity),
             len: 0,
             tombstones: 0,
             max_entries: capacity,
@@ -303,6 +317,12 @@ impl IdMap {
             index = fresh;
         }
 
+        if self.slots[index].tombstone {
+            // The slot stops being a tombstone the moment it takes the key;
+            // leaving it counted would make the table look fuller than it is
+            // and drive a rebuild every time the window rolls over.
+            self.tombstones -= 1;
+        }
         self.slots[index] = Slot {
             key: Some(key),
             seen,
@@ -384,8 +404,11 @@ impl IdMap {
 
     fn rehash(&mut self) {
         let old = std::mem::take(&mut self.slots);
-        let mut fresh = vec![Slot::default(); old.len()];
-        let mut live = VecDeque::with_capacity(self.max_entries);
+        let mut fresh = std::mem::take(&mut self.spare);
+        fresh.clear();
+        fresh.resize(old.len(), Slot::default());
+        let mut live = std::mem::take(&mut self.spare_order);
+        live.clear();
         let mut count = 0;
         for key in self.order.drain(..) {
             let (found, _) = probe(&old, &key);
@@ -404,7 +427,8 @@ impl IdMap {
             count += 1;
         }
         self.slots = fresh;
-        self.order = live;
+        self.spare = old;
+        self.spare_order = std::mem::replace(&mut self.order, live);
         self.len = count;
         self.tombstones = 0;
     }
@@ -539,5 +563,47 @@ mod tests {
         assert!(map.get(1, cl("A")).is_none());
         assert!(map.get(1, cl("B")).is_some());
         assert!(map.get(1, cl("C")).is_some());
+    }
+
+    #[test]
+    fn a_reused_tombstone_is_no_longer_counted() {
+        let mut map = IdMap::new(8);
+        let key = (2, cl("REUSED"));
+        let index = hash(&key) & (map.slots.len() - 1);
+        // Plant a tombstone exactly where the key's probe starts, so the
+        // insert must take it rather than an empty slot.
+        map.slots[index] = Slot {
+            key: None,
+            seen: Seen::default(),
+            occupied: false,
+            tombstone: true,
+        };
+        map.tombstones = 1;
+
+        map.insert(key.0, key.1, Seen::default());
+
+        assert!(map.slots[index].occupied, "the tombstone took the key");
+        assert_eq!(0, map.tombstones, "the reused tombstone is still counted");
+    }
+
+    #[test]
+    fn a_rebuild_swaps_in_the_preallocated_spare() {
+        let mut map = IdMap::new(3);
+        for index in 0..3 {
+            map.insert(1, cl(&format!("K-{index}")), Seen::default());
+        }
+        map.insert(1, cl("K-3"), Seen::default()); // evicts K-0
+
+        let slots = map.slots.as_ptr();
+        let spare = map.spare.as_ptr();
+        assert!(map.spare.capacity() >= map.slots.len());
+
+        map.rehash();
+
+        assert_eq!(slots, map.spare.as_ptr(), "the old table becomes the spare");
+        assert_eq!(spare, map.slots.as_ptr(), "the spare becomes the table");
+        assert_eq!(3, map.len());
+        assert_eq!(3, map.order.len());
+        assert_eq!(0, map.tombstones);
     }
 }

@@ -61,6 +61,13 @@ epoll reports readiness, io_uring reports completion.
   tuning step; the trait does not change when they are added.
 - The epoll backend is the control arm, not the old code path: its readiness
   is converted to the same completion API, so the FIX logic is measured once.
+- **2026-11-20:** `close` on an io_uring connection cancels its outstanding
+  read and write (`AsyncCancel`). Without the cancel, a peer that kept the
+  connection open but went quiet pinned the descriptor and its 64 KiB read
+  buffer indefinitely — and the gateway has normally armed the next read
+  before it decides to close. The cancelled operation's own completion carries
+  `-ECANCELED` and clears the in-flight flag; the cancel's completion is
+  recognised and ignored.
 - Each connection costs a 64 KiB read buffer in both backends.
 - The ABBA run takes about a minute because of the session-timeout wait
   between arms; that is a correctness cost of measuring a restarted client

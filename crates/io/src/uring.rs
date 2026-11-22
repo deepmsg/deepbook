@@ -36,6 +36,9 @@ const KIND_READ: u64 = 1;
 const KIND_WRITE: u64 = 2;
 const KIND_TIMEOUT: u64 = 3;
 const KIND_TIMEOUT_REMOVE: u64 = 4;
+/// The completion of an `AsyncCancel` operation, not of the operation it
+/// cancelled. Ignored in `on_completion`.
+const KIND_CANCEL: u64 = 5;
 
 struct UringConnection {
     stream: TcpStream,
@@ -212,6 +215,22 @@ impl UringLoop {
         }
     }
 
+    /// Ask the kernel to cancel the connection's outstanding operation of
+    /// `kind`. The operation's own completion still arrives, with
+    /// `-ECANCELED`; it is what clears the in-flight flag and lets `cleanup`
+    /// release the connection. The cancel's completion carries
+    /// `KIND_CANCEL` so it never looks like an operation result.
+    ///
+    /// A ring that cannot take the cancel leaves the connection waiting for
+    /// its operation to finish, which is what happened before this existed;
+    /// `close` has no result to report it through.
+    fn cancel_in_flight(&mut self, id: u64, kind: u64) {
+        let entry = opcode::AsyncCancel::new(operation(id, kind))
+            .build()
+            .user_data(operation(id, KIND_CANCEL));
+        let _ = self.push(entry);
+    }
+
     fn cleanup(&mut self) {
         self.connections.retain(|_, connection| {
             !(connection.closing && !connection.read_inflight && !connection.write_inflight)
@@ -288,8 +307,18 @@ impl EventLoop for UringLoop {
     }
 
     fn close(&mut self, id: u64) {
-        if let Some(connection) = self.connections.get_mut(&id) {
-            connection.closing = true;
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return;
+        };
+        connection.closing = true;
+        // A read armed against a peer that has gone quiet never completes on
+        // its own, and would pin the descriptor and its buffer forever.
+        let (cancel_read, cancel_write) = (connection.read_inflight, connection.write_inflight);
+        if cancel_read {
+            self.cancel_in_flight(id, KIND_READ);
+        }
+        if cancel_write {
+            self.cancel_in_flight(id, KIND_WRITE);
         }
         self.cleanup();
     }

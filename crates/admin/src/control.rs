@@ -41,7 +41,7 @@ use deepbook_engine_core::{Command, encode_command};
 use deepbook_types::AccountId;
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
 /// How many commands may wait for the worker before the endpoint refuses one.
@@ -288,7 +288,7 @@ struct Worker {
     requests: Receiver<Command>,
     shared: Arc<Mutex<Shared>>,
     client: Option<Client>,
-    session: Option<AeronCluster>,
+    session: Option<ClusterClient>,
     egress: Rc<RefCell<u64>>,
     queue: VecDeque<Command>,
     last_keep_alive: Instant,
@@ -351,7 +351,7 @@ impl Worker {
         if self.session.is_some() || Instant::now() < self.retry_at {
             return;
         }
-        let context = AeronClusterContext::new()
+        let context = ClusterClientContext::new()
             .ingress_channel(Some(&self.config.ingress_channel))
             .ingress_stream_id(self.config.ingress_stream_id)
             .egress_channel(Some(&self.config.egress_channel))
@@ -359,7 +359,7 @@ impl Worker {
             .message_timeout_ns(self.config.message_timeout_ns)
             .client_name("deepbook-admin")
             .egress_listener(Box::new(DiscardEgress(Rc::clone(&self.egress))));
-        match AeronCluster::connect(context, client) {
+        match ClusterClient::connect(context, client) {
             Ok(session) => {
                 eprintln!(
                     "deepbook-admin: control: cluster session {}",

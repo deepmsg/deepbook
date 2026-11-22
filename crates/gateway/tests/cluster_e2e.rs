@@ -41,7 +41,7 @@ use deepbook_fix::message::{ApplicationMessage, ExecType, OrdStatus, decode_appl
 use deepbook_gateway::frame::FrameDecoder;
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_cluster_common::counters::{
     CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, find_cluster_counter,
 };
@@ -668,7 +668,7 @@ impl EgressListener for RawListener {
 
 struct RawClient {
     client: Client,
-    session: AeronCluster,
+    session: ClusterClient,
     egress: Rc<RefCell<VecDeque<Vec<u8>>>>,
     last_keep_alive: Instant,
 }
@@ -677,13 +677,13 @@ impl RawClient {
     fn connect(aeron: &Path) -> Result<Self, String> {
         let mut client = Client::connect(aeron).map_err(|error| error.to_string())?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
-        let context = AeronClusterContext::new()
+        let context = ClusterClientContext::new()
             .ingress_channel(Some("aeron:ipc"))
             .egress_channel(Some("aeron:ipc"))
             .client_name("deepbook-engine-e2e")
             .egress_listener(Box::new(RawListener(Rc::clone(&egress))));
         let session =
-            AeronCluster::connect(context, &mut client).map_err(|error| error.to_string())?;
+            ClusterClient::connect(context, &mut client).map_err(|error| error.to_string())?;
         Ok(Self {
             client,
             session,

@@ -12,7 +12,7 @@
 //!
 //! The engine's own records are the ones `engine-core::wire` defines; this
 //! module never invents a second encoding. The cluster session survives a
-//! leader change inside `AeronCluster::poll_egress`; a closed session is
+//! leader change inside `ClusterClient::poll_egress`; a closed session is
 //! reconnected with a fresh connect. Commands that cannot be offered yet stay
 //! queued in order, which is the design's "M4 queues while the cluster is
 //! away" answer.
@@ -57,7 +57,7 @@ use deepbook_fix::{
 use deepbook_types::{AccountId, EMPTY_ORDER_ID, OrderId, OrderState, Price, Qty, Side, SymbolId};
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
 use crate::metrics::GatewayMetrics;
@@ -97,7 +97,7 @@ impl std::error::Error for ClusterEngineError {}
 #[derive(Clone, Debug)]
 pub struct ClusterEngineConfig {
     /// The aeron directory of the driver the cluster node uses.
-    pub aeron_dir: PathBuf,
+    pub driver_dir: PathBuf,
     /// `aeron.cluster.ingress.channel`.
     pub ingress_channel: String,
     /// `<memberId>=<endpoint>,…` for a multi-member cluster whose members own
@@ -142,9 +142,9 @@ impl ClusterEngineConfig {
     /// The single-node defaults: IPC both ways, stream 101/102, symbol 1
     /// known as `AAPL`.
     #[must_use]
-    pub fn new(aeron_dir: impl Into<PathBuf>, session: SessionKey) -> Self {
+    pub fn new(driver_dir: impl Into<PathBuf>, session: SessionKey) -> Self {
         Self {
-            aeron_dir: aeron_dir.into(),
+            driver_dir: driver_dir.into(),
             ingress_channel: "aeron:ipc".to_owned(),
             ingress_endpoints: None,
             ingress_stream_id: 101,
@@ -426,7 +426,7 @@ struct PendingCommand {
 pub struct ClusterEngine {
     config: ClusterEngineConfig,
     client: Client,
-    session: Option<AeronCluster>,
+    session: Option<ClusterClient>,
     egress: Rc<RefCell<VecDeque<EgressRecord>>>,
     events: VecDeque<SessionEvent>,
     commands: VecDeque<PendingCommand>,
@@ -479,7 +479,7 @@ impl ClusterEngine {
         config: ClusterEngineConfig,
         metrics: Arc<GatewayMetrics>,
     ) -> Result<Self, ClusterEngineError> {
-        let mut client = Client::connect(&config.aeron_dir)
+        let mut client = Client::connect(&config.driver_dir)
             .map_err(|error| ClusterEngineError::Driver(error.to_string()))?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
         let attempts = config.connect_attempts.max(1);
@@ -518,7 +518,7 @@ impl ClusterEngine {
     /// The cluster-assigned session id, while connected.
     #[must_use]
     pub fn cluster_session_id(&self) -> Option<i64> {
-        self.session.as_ref().map(AeronCluster::cluster_session_id)
+        self.session.as_ref().map(ClusterClient::cluster_session_id)
     }
 
     /// How many commands are waiting for ingress.
@@ -847,9 +847,9 @@ fn open_session(
     egress_offset: u16,
     egress: &Rc<RefCell<VecDeque<EgressRecord>>>,
     client: &mut Client,
-) -> Result<AeronCluster, ClusterEngineError> {
+) -> Result<ClusterClient, ClusterEngineError> {
     let egress_channel = egress_channel_for(&config.egress_channel, egress_offset);
-    let context = AeronClusterContext::new()
+    let context = ClusterClientContext::new()
         .ingress_channel(Some(&config.ingress_channel))
         .ingress_endpoints(config.ingress_endpoints.as_deref())
         .ingress_stream_id(config.ingress_stream_id)
@@ -859,7 +859,7 @@ fn open_session(
         .new_leader_timeout_ns(config.new_leader_timeout_ns)
         .client_name("deepbook-fix-gateway")
         .egress_listener(Box::new(EgressQueue(Rc::clone(egress))));
-    AeronCluster::connect(context, client)
+    ClusterClient::connect(context, client)
         .map_err(|error| ClusterEngineError::Connect(error.to_string()))
 }
 

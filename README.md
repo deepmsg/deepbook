@@ -137,7 +137,7 @@ cargo run -p deepbook-engine-cluster --bin engine-container -- \
 
 cargo run -p deepbook-gateway --bin fix-gateway -- \
   --bind 127.0.0.1:9876 --session-dir target/fix-sessions \
-  --cluster --aeron-dir /dev/shm/aeron
+  --cluster --driver-dir /dev/shm/aeron
 ```
 
 FIX `Account` is the engine's numeric account id (a missing account is `0`);

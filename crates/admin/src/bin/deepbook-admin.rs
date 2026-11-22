@@ -1,7 +1,7 @@
 //! `deepbook-admin`: the M5 dashboard host.
 //!
 //! ```text
-//! deepbook-admin --aeron-dir /dev/shm/aeron [--listen 127.0.0.1:8080]
+//! deepbook-admin --driver-dir /dev/shm/aeron [--listen 127.0.0.1:8080]
 //!                [--symbol 1] [--ui-dir crates/ui]
 //!                [--cluster-id 7] [--bench-metrics target/bench/last.prom]
 //!                [--incremental-channel URI] [--incremental-stream-id N]
@@ -63,7 +63,7 @@ fn run() -> Result<(), String> {
     println!(
         "deepbook-admin listening on http://{address} ui={} aeron={} control={}",
         options.ui_dir.display(),
-        options.aeron_dir.display(),
+        options.driver_dir.display(),
         if options.control_token.is_some() {
             "token"
         } else {
@@ -74,7 +74,7 @@ fn run() -> Result<(), String> {
     let context = Arc::new(Context {
         view,
         ui_dir: options.ui_dir,
-        aeron_dir: options.aeron_dir,
+        driver_dir: options.driver_dir,
         cluster_id: options.cluster_id,
         bench_metrics: options.bench_metrics,
         control,
@@ -114,7 +114,7 @@ fn run() -> Result<(), String> {
 struct Context {
     view: deepbook_admin::SharedView,
     ui_dir: PathBuf,
-    aeron_dir: PathBuf,
+    driver_dir: PathBuf,
     cluster_id: i32,
     bench_metrics: Option<PathBuf>,
     control: Control,
@@ -137,7 +137,7 @@ fn handle(mut stream: TcpStream, context: &Context) {
         "/ws" => websocket(stream, &request, context),
         "/metrics" => {
             let bench = read_bench(context);
-            let cluster = metrics::read_cluster(&context.aeron_dir, context.cluster_id);
+            let cluster = metrics::read_cluster(&context.driver_dir, context.cluster_id);
             let body = context
                 .view
                 .lock()
@@ -340,7 +340,7 @@ fn websocket(mut stream: TcpStream, request: &http::Request, context: &Context) 
 
 struct Options {
     listen: SocketAddr,
-    aeron_dir: PathBuf,
+    driver_dir: PathBuf,
     symbol: SymbolId,
     ui_dir: PathBuf,
     cluster_id: i32,
@@ -355,7 +355,7 @@ impl Options {
         let mut listen: SocketAddr = "127.0.0.1:8080"
             .parse()
             .expect("the default address parses");
-        let mut aeron_dir: Option<PathBuf> = None;
+        let mut driver_dir: Option<PathBuf> = None;
         let mut symbol: SymbolId = 1;
         let mut ui_dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../ui"));
         let mut cluster_id = 7;
@@ -388,7 +388,7 @@ impl Options {
                         .parse()
                         .map_err(|_| "--listen must be IP:PORT".to_owned())?;
                 }
-                "--aeron-dir" => aeron_dir = Some(value("--aeron-dir")?.into()),
+                "--driver-dir" => driver_dir = Some(value("--driver-dir")?.into()),
                 "--symbol" => {
                     symbol = value("--symbol")?
                         .parse()
@@ -433,11 +433,11 @@ impl Options {
                 other => return Err(format!("unknown option {other}")),
             }
         }
-        let Some(aeron_dir) = aeron_dir else {
-            return Err("--aeron-dir is required".to_owned());
+        let Some(driver_dir) = driver_dir else {
+            return Err("--driver-dir is required".to_owned());
         };
         let mut market_data = DeepmsgConfig::new(
-            &aeron_dir,
+            &driver_dir,
             incremental.clone(),
             &incremental,
             recovery.clone(),
@@ -448,16 +448,16 @@ impl Options {
         market_data.incremental_stream_id = incremental_stream_id;
         market_data.recovery_stream_id = recovery_stream_id;
         let control = ControlConfig {
-            aeron_dir: aeron_dir.clone(),
+            driver_dir: driver_dir.clone(),
             ingress_channel,
             ingress_stream_id,
             egress_channel,
             egress_stream_id,
-            ..ControlConfig::new(&aeron_dir)
+            ..ControlConfig::new(&driver_dir)
         };
         Ok(Self {
             listen,
-            aeron_dir,
+            driver_dir,
             symbol,
             ui_dir,
             cluster_id,
@@ -471,7 +471,7 @@ impl Options {
 
 fn print_usage() {
     println!(
-        "usage: deepbook-admin --aeron-dir PATH [--listen IP:PORT]\n\
+        "usage: deepbook-admin --driver-dir PATH [--listen IP:PORT]\n\
          \x20                    [--symbol N] [--ui-dir PATH] [--cluster-id N]\n\
          \x20                    [--bench-metrics PATH]\n\
          \x20                    [--incremental-channel URI] [--incremental-stream-id N]\n\

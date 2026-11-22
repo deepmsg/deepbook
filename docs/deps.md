@@ -18,8 +18,22 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-5ed87c1
+654ece4
 ```
+
+The bump from `5ed87c1` takes five deepmsg batches (#176–#180) and one
+**public name change** deepbook follows in this change. In the cluster
+client, `AeronCluster` and `AeronClusterContext` are now `ClusterClient` and
+`ClusterClientContext` (#179): the reference's class name was the last public
+type in the workspace carrying the `Aeron` brand, and deepmsg's ADR-0005 now
+says a mirrored class name drops it. The compile break is the whole of it —
+no wire or configuration name moves (`aeron.dir`, `aeron.cluster.*`,
+`aeron:ipc` are the driver's and the protocol's names, not deepmsg's).
+
+The rest of the batch is behaviour and tests: the full receive blackout work
+(#178, cluster-only), the route's client closes (#177), the bench batch
+(#176) and the fuzz suite's nine boundary fixes (#180). `cargo check
+--workspace` is clean with the rename.
 
 The bump from `3dc783d` takes the first live four-host session's observability
 fixes (#172, #173): the app-agent unit drops a condition systemd evaluates

@@ -41,7 +41,7 @@ use deepbook_fix::message::{ApplicationMessage, ExecType, OrdStatus, decode_appl
 use deepbook_gateway::frame::FrameDecoder;
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_cluster_common::counters::{
     CLUSTER_CONSENSUS_MODULE_STATE_TYPE_ID, CLUSTER_SNAPSHOT_COUNTER_TYPE_ID, find_cluster_counter,
 };
@@ -120,7 +120,7 @@ fn recovered_book(backend: &str, default_base: u16) {
     }
 
     // The engine's own view of the book, through a second cluster session.
-    let mut raw = RawClient::connect(&harness.aeron).expect("raw cluster client");
+    let mut raw = RawClient::connect(&harness.driver_dir).expect("raw cluster client");
     let before = raw.snapshot().expect("snapshot before the restart");
 
     // A cluster snapshot gives the restarted container a recovery point.
@@ -149,8 +149,8 @@ fn recovered_book(backend: &str, default_base: u16) {
 
     // A fresh observer session: the old module's sessions died with it. What
     // the recovery check compares is the engine state, not a session.
-    let mut recovered =
-        RawClient::connect_with_retry(&harness.aeron, READY_TIMEOUT).expect("raw client again");
+    let mut recovered = RawClient::connect_with_retry(&harness.driver_dir, READY_TIMEOUT)
+        .expect("raw client again");
     let after = recovered.snapshot().expect("snapshot after the restart");
     assert_eq!(
         before.book_hash, after.book_hash,
@@ -204,7 +204,7 @@ fn recovered_book(backend: &str, default_base: u16) {
 
 struct Harness {
     root: PathBuf,
-    aeron: PathBuf,
+    driver_dir: PathBuf,
     cluster: PathBuf,
     logs: PathBuf,
     node_args: Vec<String>,
@@ -258,12 +258,12 @@ impl Harness {
             PathBuf::from,
         );
         let _ = std::fs::remove_dir_all(&root);
-        let aeron = root.join("aeron-0");
+        let driver_dir = root.join("aeron-0");
         let archive = root.join("archive");
         let cluster = root.join("cluster");
         let logs = root.join("logs");
         for directory in [
-            &aeron,
+            &driver_dir,
             &archive,
             &cluster,
             &logs,
@@ -280,14 +280,18 @@ impl Harness {
         );
 
         let driver_log = logs.join("driver.log");
-        let mut driver =
-            spawn(&driver, &driver_args(&aeron, &archive, base), &driver_log).expect("driver");
-        wait_for_driver(&aeron, &driver_log, &mut driver).expect("driver ready");
+        let mut driver = spawn(
+            &driver,
+            &driver_args(&driver_dir, &archive, base),
+            &driver_log,
+        )
+        .expect("driver");
+        wait_for_driver(&driver_dir, &driver_log, &mut driver).expect("driver ready");
 
-        let node_args = cluster_args(&aeron, &cluster, &members);
+        let node_args = cluster_args(&driver_dir, &cluster, &members);
 
         let mut harness = Self {
-            aeron,
+            driver_dir,
             cluster,
             logs,
             node_args,
@@ -385,8 +389,8 @@ impl Harness {
             "--session-dir".to_owned(),
             self.root.join("fix-sessions").display().to_string(),
             "--cluster".to_owned(),
-            "--aeron-dir".to_owned(),
-            self.aeron.display().to_string(),
+            "--driver-dir".to_owned(),
+            self.driver_dir.display().to_string(),
             "--symbol".to_owned(),
             "AAPL".to_owned(),
             "--symbol-id".to_owned(),
@@ -430,7 +434,7 @@ impl Harness {
     }
 
     fn counter(&self, type_id: i32) -> Option<i64> {
-        let cnc = CncFile::open(&self.aeron, Duration::from_secs(1)).ok()?;
+        let cnc = CncFile::open(&self.driver_dir, Duration::from_secs(1)).ok()?;
         let counters = cnc.counters()?;
         let id = find_cluster_counter(&counters, type_id, CLUSTER_ID)?;
         counters.value(id)
@@ -471,7 +475,7 @@ impl Harness {
             .join(&profile)
             .join("deepmsg-cluster-tool");
         let output = Process::new(&tool)
-            .arg(format!("-Daeron.dir={}", self.aeron.display()))
+            .arg(format!("-Daeron.dir={}", self.driver_dir.display()))
             .arg(format!("-Daeron.cluster.dir={}", self.cluster.display()))
             .arg(&self.cluster)
             .arg("snapshot")
@@ -541,10 +545,10 @@ fn engine_container_binary() -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-fn driver_args(aeron: &Path, archive: &Path, base: u16) -> Vec<String> {
+fn driver_args(driver_dir: &Path, archive: &Path, base: u16) -> Vec<String> {
     vec![
-        format!("-Ddeepmsg.dir={}", aeron.display()),
-        format!("-Daeron.dir={}", aeron.display()),
+        format!("-Ddeepmsg.dir={}", driver_dir.display()),
+        format!("-Daeron.dir={}", driver_dir.display()),
         "-Ddeepmsg.dir.delete.on.start=false".to_owned(),
         "-Daeron.dir.delete.on.start=false".to_owned(),
         "-Ddeepmsg.dir.delete.on.shutdown=false".to_owned(),
@@ -565,9 +569,9 @@ fn driver_args(aeron: &Path, archive: &Path, base: u16) -> Vec<String> {
     ]
 }
 
-fn cluster_args(aeron: &Path, cluster: &Path, members: &str) -> Vec<String> {
+fn cluster_args(driver_dir: &Path, cluster: &Path, members: &str) -> Vec<String> {
     vec![
-        format!("-Daeron.dir={}", aeron.display()),
+        format!("-Daeron.dir={}", driver_dir.display()),
         format!("-Daeron.cluster.dir={}", cluster.display()),
         format!("-Daeron.cluster.id={CLUSTER_ID}"),
         "-Daeron.cluster.member.id=0".to_owned(),
@@ -618,8 +622,8 @@ fn spawn(binary: &Path, args: &[String], log: &Path) -> Result<Child, String> {
         .map_err(|error| format!("{}: {error}", binary.display()))
 }
 
-fn wait_for_driver(aeron: &Path, log: &Path, driver: &mut Child) -> Result<(), String> {
-    let cnc = aeron.join("cnc.dat");
+fn wait_for_driver(driver_dir: &Path, log: &Path, driver: &mut Child) -> Result<(), String> {
+    let cnc = driver_dir.join("cnc.dat");
     let deadline = Instant::now() + READY_TIMEOUT;
     while Instant::now() < deadline {
         if let Some(status) = driver.try_wait().map_err(|error| error.to_string())? {
@@ -668,22 +672,22 @@ impl EgressListener for RawListener {
 
 struct RawClient {
     client: Client,
-    session: AeronCluster,
+    session: ClusterClient,
     egress: Rc<RefCell<VecDeque<Vec<u8>>>>,
     last_keep_alive: Instant,
 }
 
 impl RawClient {
-    fn connect(aeron: &Path) -> Result<Self, String> {
-        let mut client = Client::connect(aeron).map_err(|error| error.to_string())?;
+    fn connect(driver_dir: &Path) -> Result<Self, String> {
+        let mut client = Client::connect(driver_dir).map_err(|error| error.to_string())?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
-        let context = AeronClusterContext::new()
+        let context = ClusterClientContext::new()
             .ingress_channel(Some("aeron:ipc"))
             .egress_channel(Some("aeron:ipc"))
             .client_name("deepbook-engine-e2e")
             .egress_listener(Box::new(RawListener(Rc::clone(&egress))));
         let session =
-            AeronCluster::connect(context, &mut client).map_err(|error| error.to_string())?;
+            ClusterClient::connect(context, &mut client).map_err(|error| error.to_string())?;
         Ok(Self {
             client,
             session,
@@ -692,10 +696,10 @@ impl RawClient {
         })
     }
 
-    fn connect_with_retry(aeron: &Path, timeout: Duration) -> Result<Self, String> {
+    fn connect_with_retry(driver_dir: &Path, timeout: Duration) -> Result<Self, String> {
         let deadline = Instant::now() + timeout;
         loop {
-            match Self::connect(aeron) {
+            match Self::connect(driver_dir) {
                 Ok(client) => return Ok(client),
                 Err(error) => {
                     if Instant::now() >= deadline {

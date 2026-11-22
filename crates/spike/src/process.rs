@@ -67,8 +67,8 @@ impl Processes {
 
     /// The aeron directory the client should connect to.
     #[must_use]
-    pub fn aeron_dir(&self) -> PathBuf {
-        self.paths.aeron(self.generation)
+    pub fn driver_dir(&self) -> PathBuf {
+        self.paths.driver_dir(self.generation)
     }
 
     /// The cluster directory, for `deepmsg-cluster-tool`.
@@ -91,7 +91,7 @@ impl Processes {
     pub fn snapshot(&self) -> Result<(), String> {
         let tool = self.config.binary("deepmsg-cluster-tool");
         let output = Command::new(&tool)
-            .arg(d("aeron.dir", self.aeron_dir().display()))
+            .arg(d("aeron.dir", self.driver_dir().display()))
             .arg(d("aeron.cluster.dir", self.cluster_dir().display()))
             .arg(self.cluster_dir())
             .arg("snapshot")
@@ -113,7 +113,7 @@ impl Processes {
     /// toggle asked for has been taken.
     #[must_use]
     pub fn snapshot_count(&self) -> Option<i64> {
-        let cnc = CncFile::open(&self.aeron_dir(), Duration::from_secs(5)).ok()?;
+        let cnc = CncFile::open(&self.driver_dir(), Duration::from_secs(5)).ok()?;
         let counters = cnc.counters()?;
         let id = find_cluster_counter(
             &counters,
@@ -174,19 +174,19 @@ impl Processes {
     }
 
     fn start_all(&mut self) -> Result<(), String> {
-        let aeron = self.aeron_dir();
-        std::fs::create_dir_all(&aeron)
-            .map_err(|error| format!("create {}: {error}", aeron.display()))?;
+        let driver_dir = self.driver_dir();
+        std::fs::create_dir_all(&driver_dir)
+            .map_err(|error| format!("create {}: {error}", driver_dir.display()))?;
 
         let driver_log = self.logs().join(format!("driver-{}.log", self.generation));
         let driver = self.config.binary("deepmsg-archiving-media-driver");
-        let driver = spawn(&driver, &self.driver_args(&aeron), &driver_log)?;
+        let driver = spawn(&driver, &self.driver_args(&driver_dir), &driver_log)?;
         self.driver = Some(driver);
-        self.wait_for_driver(&aeron, &driver_log)?;
+        self.wait_for_driver(&driver_dir, &driver_log)?;
 
         let node_log = self.logs().join(format!("node-{}.log", self.generation));
         let node = self.config.binary("deepmsg-cluster-node");
-        let node = spawn(&node, &self.node_args(&aeron), &node_log)?;
+        let node = spawn(&node, &self.node_args(&driver_dir), &node_log)?;
         self.node = Some(node);
         std::thread::sleep(Duration::from_millis(200));
 
@@ -194,7 +194,11 @@ impl Processes {
             .logs()
             .join(format!("container-{}.log", self.generation));
         let container = self.config.binary("deepmsg-clustered-service-container");
-        let container = spawn(&container, &self.container_args(&aeron), &container_log)?;
+        let container = spawn(
+            &container,
+            &self.container_args(&driver_dir),
+            &container_log,
+        )?;
         self.container = Some(container);
 
         self.ensure_children_alive(&node_log, &container_log)
@@ -228,26 +232,26 @@ impl Processes {
         Ok(())
     }
 
-    fn wait_for_driver(&mut self, aeron: &Path, log: &Path) -> Result<(), String> {
+    fn wait_for_driver(&mut self, driver_dir: &Path, log: &Path) -> Result<(), String> {
         let driver = self
             .driver
             .as_mut()
             .ok_or_else(|| "the driver was not started".to_owned())?;
-        wait_for_driver_ready(aeron, log, driver)
+        wait_for_driver_ready(driver_dir, log, driver)
     }
 
     fn logs(&self) -> &Path {
         &self.paths.logs
     }
 
-    fn driver_args(&self, aeron: &Path) -> Vec<String> {
+    fn driver_args(&self, driver_dir: &Path) -> Vec<String> {
         let mut args = vec![
             // The driver's native name is `deepmsg.dir`; `aeron.dir` is the
             // reference's alias. Pass both, and never inherit the environment:
             // `DEEPMSG_DIR` beats a `-D`, and a leaked value once pointed the
             // driver at a source checkout.
-            d("deepmsg.dir", aeron.display()),
-            d("aeron.dir", aeron.display()),
+            d("deepmsg.dir", driver_dir.display()),
+            d("aeron.dir", driver_dir.display()),
             d("deepmsg.dir.delete.on.start", false),
             d("aeron.dir.delete.on.start", false),
             d("deepmsg.dir.delete.on.shutdown", false),
@@ -276,9 +280,9 @@ impl Processes {
         args
     }
 
-    fn node_args(&self, aeron: &Path) -> Vec<String> {
+    fn node_args(&self, driver_dir: &Path) -> Vec<String> {
         vec![
-            d("aeron.dir", aeron.display()),
+            d("aeron.dir", driver_dir.display()),
             d("aeron.cluster.dir", self.cluster_dir().display()),
             d("aeron.cluster.id", self.config.cluster_id),
             d("aeron.cluster.member.id", 0),
@@ -321,8 +325,8 @@ impl Processes {
         ]
     }
 
-    fn container_args(&self, aeron: &Path) -> Vec<String> {
-        let mut args = self.node_args(aeron);
+    fn container_args(&self, driver_dir: &Path) -> Vec<String> {
+        let mut args = self.node_args(driver_dir);
         args.push(d("deepmsg.cluster.service", "basic-auction"));
         args
     }
@@ -404,11 +408,11 @@ pub(crate) fn tail(path: &Path) -> String {
 /// from a previous generation, so waiting for it would let a restart look
 /// ready before the new archive had served anything.
 pub(crate) fn wait_for_driver_ready(
-    aeron: &Path,
+    driver_dir: &Path,
     log: &Path,
     driver: &mut Child,
 ) -> Result<(), String> {
-    let cnc = aeron.join("cnc.dat");
+    let cnc = driver_dir.join("cnc.dat");
     let deadline = Instant::now() + READY_TIMEOUT;
 
     while Instant::now() < deadline {

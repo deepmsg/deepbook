@@ -115,7 +115,7 @@ end of this ADR. All four gates now pass.
 
 ### Implementation note for the gateway
 
-`AeronCluster::offer` returns `Some(Appended::EndOfLog)` when the ingress
+`ClusterClient::offer` returns `Some(Appended::EndOfLog)` when the ingress
 publication rotates its term. A caller that treats any `Some` as success loses
 one command per term: the first spike run lost 15 of 21,000 at 128 KiB and 30
 of 21,000 at 64 KiB. The gateway must retry unless the result is

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
 use crate::config::Ports;
@@ -202,7 +202,7 @@ pub struct Connected {
     /// The media client.
     pub client: Client,
     /// The cluster session.
-    pub session: AeronCluster,
+    pub session: ClusterClient,
     /// What the egress listener saw.
     pub arrivals: Rc<RefCell<Arrivals>>,
 }
@@ -404,14 +404,14 @@ fn bid_payload(correlation_id: u64, customer_id: u64, price: i64) -> [u8; 24] {
     payload
 }
 
-/// Connect a `Client` and an `AeronCluster` session over IPC, retrying while
+/// Connect a `Client` and an `ClusterClient` session over IPC, retrying while
 /// the module and the container come up.
 ///
 /// # Errors
 ///
 /// The last connect error when the deadline passes.
-pub fn connect(aeron_dir: &Path, timeout: Duration) -> Result<Connected, String> {
-    connect_with(aeron_dir, &Channels::ipc(), timeout)
+pub fn connect(driver_dir: &Path, timeout: Duration) -> Result<Connected, String> {
+    connect_with(driver_dir, &Channels::ipc(), timeout)
 }
 
 /// [`connect`] over the channels the caller names.
@@ -424,7 +424,7 @@ pub fn connect(aeron_dir: &Path, timeout: Duration) -> Result<Connected, String>
 ///
 /// The last connect error when the deadline passes.
 pub fn connect_with(
-    aeron_dir: &Path,
+    driver_dir: &Path,
     channels: &Channels,
     timeout: Duration,
 ) -> Result<Connected, String> {
@@ -434,7 +434,7 @@ pub fn connect_with(
     let mut last = String::new();
 
     loop {
-        let mut client = match Client::connect(aeron_dir) {
+        let mut client = match Client::connect(driver_dir) {
             Ok(client) => client,
             Err(error) => {
                 last = format!("media client: {error}");
@@ -446,7 +446,7 @@ pub fn connect_with(
             }
         };
 
-        let context = AeronClusterContext::default()
+        let context = ClusterClientContext::default()
             .ingress_channel(Some(&channels.ingress))
             .ingress_endpoints(channels.ingress_endpoints.as_deref())
             .egress_channel(Some(&channels.egress))
@@ -455,7 +455,7 @@ pub fn connect_with(
             .message_timeout_ns(5_000_000_000)
             .egress_listener(Box::new(Listener(Rc::clone(&arrivals))));
 
-        match AeronCluster::connect(context, &mut client) {
+        match ClusterClient::connect(context, &mut client) {
             Ok(session) => {
                 return Ok(Connected {
                     client,

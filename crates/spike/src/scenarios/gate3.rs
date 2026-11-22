@@ -33,8 +33,8 @@ pub fn run(config: Config, bids: usize) -> Result<(), String> {
     config.durable = true;
 
     let mut processes = Processes::start(config)?;
-    let aeron = processes.aeron_dir();
-    let mut connected = client::connect(&aeron, connect_timeout())?;
+    let driver_dir = processes.driver_dir();
+    let mut connected = client::connect(&driver_dir, connect_timeout())?;
 
     let mut before = None;
     for i in 0..bids {
@@ -67,8 +67,8 @@ pub fn run(config: Config, bids: usize) -> Result<(), String> {
     drop(connected);
     processes.restart()?;
 
-    let aeron = processes.aeron_dir();
-    let mut connected = client::connect(&aeron, connect_timeout())?;
+    let driver_dir = processes.driver_dir();
+    let mut connected = client::connect(&driver_dir, connect_timeout())?;
 
     let correlation = u64::try_from(bids).map_err(|_| "bids".to_owned())? + 1_000_000;
     connected.bid(correlation, 9_999, 1)?;

@@ -95,7 +95,7 @@ const SERVICE_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The four directories one member (or the client) owns.
 struct DirSet {
-    aeron: PathBuf,
+    driver_dir: PathBuf,
     archive: PathBuf,
     cluster: PathBuf,
     logs: PathBuf,
@@ -104,12 +104,12 @@ struct DirSet {
 impl DirSet {
     fn create(root: &Path) -> Result<Self, String> {
         let dirs = Self {
-            aeron: root.join("aeron"),
+            driver_dir: root.join("aeron"),
             archive: root.join("archive"),
             cluster: root.join("cluster"),
             logs: root.join("logs"),
         };
-        for directory in [&dirs.aeron, &dirs.archive, &dirs.cluster, &dirs.logs] {
+        for directory in [&dirs.driver_dir, &dirs.archive, &dirs.cluster, &dirs.logs] {
             std::fs::create_dir_all(directory)
                 .map_err(|error| format!("create {}: {error}", directory.display()))?;
         }
@@ -255,8 +255,8 @@ impl ClusterNodes {
 
     /// The aeron directory of the client's own driver.
     #[must_use]
-    pub fn client_aeron_dir(&self) -> PathBuf {
-        self.client_dirs.aeron.clone()
+    pub fn client_driver_dir(&self) -> PathBuf {
+        self.client_dirs.driver_dir.clone()
     }
 
     /// The port block, for the client's channels.
@@ -332,7 +332,7 @@ impl ClusterNodes {
             &arguments,
             &log,
         )?;
-        wait_for_driver_ready(&self.client_dirs.aeron, &log, &mut driver)?;
+        wait_for_driver_ready(&self.client_dirs.driver_dir, &log, &mut driver)?;
         self.client_driver = Some(driver);
         Ok(())
     }
@@ -353,7 +353,7 @@ impl ClusterNodes {
                 &arguments,
                 &log,
             )?;
-            wait_for_driver_ready(&node.dirs.aeron, &log, &mut driver)?;
+            wait_for_driver_ready(&node.dirs.driver_dir, &log, &mut driver)?;
             node.driver = Some(driver);
         }
 
@@ -461,7 +461,7 @@ impl ClusterNodes {
     /// One cluster counter of a live member, by type id.
     fn counter(&self, id: usize, type_id: i32) -> Option<i64> {
         let node = self.nodes.get(id)?;
-        let cnc = CncFile::open(&node.dirs.aeron, COUNTER_TIMEOUT).ok()?;
+        let cnc = CncFile::open(&node.dirs.driver_dir, COUNTER_TIMEOUT).ok()?;
         let counters = cnc.counters()?;
         let counter_id = find_cluster_counter(&counters, type_id, self.config.cluster_id)?;
         counters.value(counter_id)
@@ -476,7 +476,7 @@ impl ClusterNodes {
     #[must_use]
     pub fn session_ids(&self, id: usize) -> Option<Vec<i64>> {
         let node = self.nodes.get(id)?;
-        let cnc = CncFile::open(&node.dirs.aeron, COUNTER_TIMEOUT).ok()?;
+        let cnc = CncFile::open(&node.dirs.driver_dir, COUNTER_TIMEOUT).ok()?;
         let counters = cnc.counters()?;
         let cluster_id = self.config.cluster_id as u32;
         let mut ids = Vec::new();
@@ -583,8 +583,8 @@ fn driver_args(
         // reference's alias. Pass both, and never inherit the environment:
         // `DEEPMSG_DIR` beats a `-D`, and a leaked value once pointed the
         // driver at a source checkout.
-        d("deepmsg.dir", dirs.aeron.display()),
-        d("aeron.dir", dirs.aeron.display()),
+        d("deepmsg.dir", dirs.driver_dir.display()),
+        d("aeron.dir", dirs.driver_dir.display()),
         d("deepmsg.dir.delete.on.start", false),
         d("aeron.dir.delete.on.start", false),
         d("deepmsg.dir.delete.on.shutdown", false),
@@ -626,7 +626,7 @@ fn module_args(
     member_id: usize,
 ) -> Vec<String> {
     vec![
-        d("aeron.dir", dirs.aeron.display()),
+        d("aeron.dir", dirs.driver_dir.display()),
         d("aeron.cluster.dir", dirs.cluster.display()),
         d("aeron.cluster.id", config.cluster_id),
         d("aeron.cluster.member.id", member_id),

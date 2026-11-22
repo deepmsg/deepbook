@@ -41,7 +41,7 @@ use deepbook_engine_core::{Command, encode_command};
 use deepbook_types::AccountId;
 use deepmsg_client::client::Client;
 use deepmsg_client::fragment_assembler::MessageHeader;
-use deepmsg_cluster_client::{AeronCluster, AeronClusterContext, EgressListener};
+use deepmsg_cluster_client::{ClusterClient, ClusterClientContext, EgressListener};
 use deepmsg_core::logbuffer::append::Appended;
 
 /// How many commands may wait for the worker before the endpoint refuses one.
@@ -57,7 +57,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[derive(Clone, Debug)]
 pub struct ControlConfig {
     /// The aeron directory of the driver the cluster node uses.
-    pub aeron_dir: PathBuf,
+    pub driver_dir: PathBuf,
     /// `aeron.cluster.ingress.channel`.
     pub ingress_channel: String,
     /// `aeron.cluster.ingress.stream.id`.
@@ -74,9 +74,9 @@ impl ControlConfig {
     /// The single-node defaults: IPC both ways, streams 101/102 (the gateway's
     /// defaults, so one cluster serves both).
     #[must_use]
-    pub fn new(aeron_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(driver_dir: impl Into<PathBuf>) -> Self {
         Self {
-            aeron_dir: aeron_dir.into(),
+            driver_dir: driver_dir.into(),
             ingress_channel: "aeron:ipc".to_owned(),
             ingress_stream_id: 101,
             egress_channel: "aeron:ipc".to_owned(),
@@ -288,7 +288,7 @@ struct Worker {
     requests: Receiver<Command>,
     shared: Arc<Mutex<Shared>>,
     client: Option<Client>,
-    session: Option<AeronCluster>,
+    session: Option<ClusterClient>,
     egress: Rc<RefCell<u64>>,
     queue: VecDeque<Command>,
     last_keep_alive: Instant,
@@ -335,7 +335,7 @@ impl Worker {
         if self.client.is_some() || Instant::now() < self.retry_at {
             return;
         }
-        match Client::connect(&self.config.aeron_dir) {
+        match Client::connect(&self.config.driver_dir) {
             Ok(client) => self.client = Some(client),
             Err(error) => {
                 eprintln!("deepbook-admin: control: media driver: {error}");
@@ -351,7 +351,7 @@ impl Worker {
         if self.session.is_some() || Instant::now() < self.retry_at {
             return;
         }
-        let context = AeronClusterContext::new()
+        let context = ClusterClientContext::new()
             .ingress_channel(Some(&self.config.ingress_channel))
             .ingress_stream_id(self.config.ingress_stream_id)
             .egress_channel(Some(&self.config.egress_channel))
@@ -359,7 +359,7 @@ impl Worker {
             .message_timeout_ns(self.config.message_timeout_ns)
             .client_name("deepbook-admin")
             .egress_listener(Box::new(DiscardEgress(Rc::clone(&self.egress))));
-        match AeronCluster::connect(context, client) {
+        match ClusterClient::connect(context, client) {
             Ok(session) => {
                 eprintln!(
                     "deepbook-admin: control: cluster session {}",

@@ -68,12 +68,14 @@ fn run() -> Result<(), String> {
     };
 
     if options.cluster {
-        let aeron_dir = options
-            .aeron_dir
+        let driver_dir = options
+            .driver_dir
             .clone()
             .ok_or_else(|| "--cluster needs --aeron-dir".to_owned())?;
-        let mut cluster_config =
-            ClusterEngineConfig::new(aeron_dir, SessionKey::new(&options.sender, &options.target));
+        let mut cluster_config = ClusterEngineConfig::new(
+            driver_dir,
+            SessionKey::new(&options.sender, &options.target),
+        );
         cluster_config.ingress_channel = options.ingress_channel.clone();
         cluster_config.ingress_endpoints = options.ingress_endpoints.clone();
         cluster_config.ingress_stream_id = options.ingress_stream_id;
@@ -94,7 +96,7 @@ fn run() -> Result<(), String> {
                 .cluster_session_id()
                 .map_or_else(|| "none".to_owned(), |id| id.to_string()),
             options
-                .aeron_dir
+                .driver_dir
                 .as_ref()
                 .map_or_else(String::new, |path| path.display().to_string())
         );
@@ -145,7 +147,7 @@ struct Options {
     journal_sync_batch: bool,
     journal_batch: u32,
     cluster: bool,
-    aeron_dir: Option<PathBuf>,
+    driver_dir: Option<PathBuf>,
     ingress_channel: String,
     ingress_endpoints: Option<String>,
     ingress_stream_id: i32,
@@ -179,7 +181,7 @@ impl Options {
             journal_sync_batch: false,
             journal_batch: 64,
             cluster: false,
-            aeron_dir: None,
+            driver_dir: None,
             ingress_channel: "aeron:ipc".to_owned(),
             ingress_endpoints: None,
             ingress_stream_id: 101,
@@ -261,7 +263,7 @@ impl Options {
                         .map_err(|_| "--journal-batch must be a number".to_owned())?;
                 }
                 "--cluster" => options.cluster = true,
-                "--aeron-dir" => options.aeron_dir = Some(value("--aeron-dir")?.into()),
+                "--aeron-dir" => options.driver_dir = Some(value("--aeron-dir")?.into()),
                 "--ingress-channel" => options.ingress_channel = value("--ingress-channel")?,
                 "--ingress-endpoints" => {
                     options.ingress_endpoints = Some(value("--ingress-endpoints")?);

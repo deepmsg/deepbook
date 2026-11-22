@@ -26,7 +26,7 @@ const DROP_EVERY: u32 = 4;
 struct Driver {
     child: Child,
     root: PathBuf,
-    aeron: PathBuf,
+    driver_dir: PathBuf,
     base_port: u16,
 }
 
@@ -74,10 +74,10 @@ fn start_driver() -> Option<Driver> {
         "deepbook-marketdata-{}-{nonce}",
         std::process::id()
     ));
-    let aeron = root.join("aeron");
+    let driver_dir = root.join("aeron");
     let archive = root.join("archive");
     let logs = root.join("logs");
-    for path in [&aeron, &archive, &logs] {
+    for path in [&driver_dir, &archive, &logs] {
         std::fs::create_dir_all(path).expect("run directory");
     }
     let log_path = logs.join("driver.log");
@@ -88,8 +88,8 @@ fn start_driver() -> Option<Driver> {
     let mut command = Command::new(&binary);
     command
         .args([
-            format!("-Ddeepmsg.dir={}", aeron.display()),
-            format!("-Daeron.dir={}", aeron.display()),
+            format!("-Ddeepmsg.dir={}", driver_dir.display()),
+            format!("-Daeron.dir={}", driver_dir.display()),
             "-Ddeepmsg.dir.delete.on.start=false".to_owned(),
             "-Daeron.dir.delete.on.start=false".to_owned(),
             "-Ddeepmsg.dir.delete.on.shutdown=false".to_owned(),
@@ -127,11 +127,11 @@ fn start_driver() -> Option<Driver> {
         }
         let archive_running =
             std::fs::read_to_string(&log_path).is_ok_and(|text| text.contains("archive running"));
-        if aeron.join("cnc.dat").is_file() && archive_running {
+        if driver_dir.join("cnc.dat").is_file() && archive_running {
             return Some(Driver {
                 child,
                 root,
-                aeron,
+                driver_dir,
                 base_port,
             });
         }
@@ -172,7 +172,7 @@ fn a_lossy_stream_recovers_through_the_recovery_channel() {
     let response_lossy = format!("{response}|reliable=false");
 
     let config = DeepmsgConfig::new(
-        &driver.aeron,
+        &driver.driver_dir,
         incremental.clone(),
         &incremental_lossy,
         &request,

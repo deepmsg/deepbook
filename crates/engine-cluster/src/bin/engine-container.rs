@@ -122,7 +122,10 @@ fn run() -> Result<(), String> {
     let engine_config = engine_config(&properties)?;
     println!("{NAME}: {}", describe_risk(&engine_config.risk));
     let service = if property(&properties, "deepbook.marketdata.enabled", true)? {
-        let deepmsg = market_data_config(&properties, &config.aeron_dir)?;
+        // deepmsg's own `ServiceContainerConfig` still calls it `aeron_dir`;
+        // the name is the dependency's, not this tree's.
+        let driver_dir = config.aeron_dir.clone();
+        let deepmsg = market_data_config(&properties, &driver_dir)?;
         let market = MarketDataConfig {
             deepmsg: deepmsg.clone(),
             recent_capacity: property(&properties, "deepbook.marketdata.recent-capacity", 10_000)?,
@@ -365,7 +368,7 @@ fn property_string(properties: &Properties, name: &str, default: &str) -> String
     properties.get(name).unwrap_or(default).to_owned()
 }
 
-fn market_data_config(properties: &Properties, aeron_dir: &Path) -> Result<DeepmsgConfig, String> {
+fn market_data_config(properties: &Properties, driver_dir: &Path) -> Result<DeepmsgConfig, String> {
     let incremental = property_string(
         properties,
         "deepbook.marketdata.incremental.channel",
@@ -396,11 +399,11 @@ fn market_data_config(properties: &Properties, aeron_dir: &Path) -> Result<Deepm
         "deepbook.marketdata.recovery.response.subscription.channel",
         &response,
     );
-    let aeron = properties
+    let driver_dir = properties
         .get("deepbook.marketdata.aeron.dir")
-        .map_or_else(|| aeron_dir.to_path_buf(), PathBuf::from);
+        .map_or_else(|| driver_dir.to_path_buf(), PathBuf::from);
     let mut config = DeepmsgConfig::new(
-        aeron,
+        driver_dir,
         incremental,
         incremental_subscription,
         request,

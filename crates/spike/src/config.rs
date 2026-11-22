@@ -156,7 +156,7 @@ impl Paths {
 
     /// The aeron directory for a driver generation.
     #[must_use]
-    pub fn aeron(&self, generation: u32) -> PathBuf {
+    pub fn driver_dir(&self, generation: u32) -> PathBuf {
         self.root.join(format!("aeron-{generation}"))
     }
 }

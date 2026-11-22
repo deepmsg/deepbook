@@ -97,7 +97,7 @@ impl std::error::Error for ClusterEngineError {}
 #[derive(Clone, Debug)]
 pub struct ClusterEngineConfig {
     /// The aeron directory of the driver the cluster node uses.
-    pub aeron_dir: PathBuf,
+    pub driver_dir: PathBuf,
     /// `aeron.cluster.ingress.channel`.
     pub ingress_channel: String,
     /// `<memberId>=<endpoint>,…` for a multi-member cluster whose members own
@@ -142,9 +142,9 @@ impl ClusterEngineConfig {
     /// The single-node defaults: IPC both ways, stream 101/102, symbol 1
     /// known as `AAPL`.
     #[must_use]
-    pub fn new(aeron_dir: impl Into<PathBuf>, session: SessionKey) -> Self {
+    pub fn new(driver_dir: impl Into<PathBuf>, session: SessionKey) -> Self {
         Self {
-            aeron_dir: aeron_dir.into(),
+            driver_dir: driver_dir.into(),
             ingress_channel: "aeron:ipc".to_owned(),
             ingress_endpoints: None,
             ingress_stream_id: 101,
@@ -479,7 +479,7 @@ impl ClusterEngine {
         config: ClusterEngineConfig,
         metrics: Arc<GatewayMetrics>,
     ) -> Result<Self, ClusterEngineError> {
-        let mut client = Client::connect(&config.aeron_dir)
+        let mut client = Client::connect(&config.driver_dir)
             .map_err(|error| ClusterEngineError::Driver(error.to_string()))?;
         let egress = Rc::new(RefCell::new(VecDeque::new()));
         let attempts = config.connect_attempts.max(1);

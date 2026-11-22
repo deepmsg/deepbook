@@ -16,7 +16,7 @@ cluster egress back to FIX reports, and recovers after the engine host is
 killed.
 
 The deepmsg client's shape constrains the design. It is caller-driven
-(`Client::poll`, `AeronCluster::poll_egress`), it is not `Send`, and its
+(`Client::poll`, `ClusterClient::poll_egress`), it is not `Send`, and its
 egress listener is a boxed callback on the context. The acceptor is one
 thread, which matches.
 
@@ -104,7 +104,7 @@ thread, which matches.
   report that reached a live session, and the client can resend its order with
   the same `ClOrdID` (the engine replays the original acknowledgement).
 - A reconnect drives the client on the acceptor thread, so the FIX loop is
-  not polling while `AeronCluster::connect` runs (bounded by the message
+  not polling while `ClusterClient::connect` runs (bounded by the message
   timeout). Moving the connect off the acceptor thread changes the seam and
   is deliberately left out of M4.
 - The pinned deepmsg client can lose the `NewLeaderEvent` (deepmsg's own

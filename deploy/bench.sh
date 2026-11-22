@@ -117,13 +117,13 @@ if [ "$BUILD" -eq 1 ]; then
         -p deepbook-admin --bin deepbook-admin )
 fi
 
-AERON=$RUN_DIR/aeron
+DRIVER_DIR=$RUN_DIR/aeron
 ARCHIVE=$RUN_DIR/archive
 CLUSTER=$RUN_DIR/cluster
 LOGS=$RUN_DIR/logs
 SESSIONS=$RUN_DIR/fix-sessions
 rm -rf "$RUN_DIR"
-mkdir -p "$AERON" "$ARCHIVE" "$CLUSTER" "$LOGS" "$SESSIONS"
+mkdir -p "$DRIVER_DIR" "$ARCHIVE" "$CLUSTER" "$LOGS" "$SESSIONS"
 
 MEMBERS="0,localhost:$BASE_PORT,localhost:$((BASE_PORT + 10)),localhost:$((BASE_PORT + 20)),localhost:0,localhost:$((BASE_PORT + 40))"
 FIX_PORT=$((BASE_PORT + 50))
@@ -161,7 +161,7 @@ while IFS= read -r name; do
 done < <(env | grep -E '^(DEEPMSG_|AERON_)' | cut -d= -f1 | grep -Ev "$LOG_NAMES" || true)
 
 DRIVER_ARGS=(
-    "-Ddeepmsg.dir=$AERON" "-Daeron.dir=$AERON"
+    "-Ddeepmsg.dir=$DRIVER_DIR" "-Daeron.dir=$DRIVER_DIR"
     -Ddeepmsg.dir.delete.on.start=false -Daeron.dir.delete.on.start=false
     -Ddeepmsg.dir.delete.on.shutdown=false -Daeron.dir.delete.on.shutdown=false
     "-Daeron.archive.dir=$ARCHIVE"
@@ -176,7 +176,7 @@ DRIVER_ARGS=(
 )
 
 CLUSTER_ARGS=(
-    "-Daeron.dir=$AERON"
+    "-Daeron.dir=$DRIVER_DIR"
     "-Daeron.cluster.dir=$CLUSTER"
     "-Daeron.cluster.id=$CLUSTER_ID"
     -Daeron.cluster.member.id=0
@@ -241,7 +241,7 @@ echo
 echo "== start =="
 start "$LOGS/driver.log" "$(deepmsg_bin deepmsg-archiving-media-driver)" "${DRIVER_ARGS[@]}"
 for _ in $(seq 1 2000); do
-    [ -f "$AERON/cnc.dat" ] && grep -q "archive running" "$LOGS/driver.log" && break
+    [ -f "$DRIVER_DIR/cnc.dat" ] && grep -q "archive running" "$LOGS/driver.log" && break
     sleep 0.01
 done
 if ! grep -q "archive running" "$LOGS/driver.log"; then
@@ -261,7 +261,7 @@ wait_for_line "$LOGS/container.log" "STARTED service=deepbook-engine" 20
 if [ "$ADMIN" -eq 1 ]; then
     start "$LOGS/admin.log" "$(deepbook_bin deepbook-admin)" \
         --listen "$ADMIN_HOST:$ADMIN_PORT" \
-        --aeron-dir "$AERON" \
+        --aeron-dir "$DRIVER_DIR" \
         --ui-dir "$ROOT/crates/ui" \
         --cluster-id "$CLUSTER_ID" \
         --bench-metrics "$BENCH_METRICS"
@@ -287,7 +287,7 @@ start_gateway() {
         start "$log" "$(deepbook_bin fix-gateway)" \
             --bind "127.0.0.1:$port" \
             --session-dir "$session_dir" \
-            --cluster --aeron-dir "$AERON" \
+            --cluster --aeron-dir "$DRIVER_DIR" \
             --tick-us "$TICK_US" \
             --backend "$backend" \
             --journal-sync "$JOURNAL_SYNC" --journal-batch "$JOURNAL_BATCH" \

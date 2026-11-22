@@ -19,8 +19,8 @@ pub fn run(config: Config, rate: u64, samples: usize, warmup: usize) -> Result<(
     }
 
     let processes = Processes::start(config)?;
-    let aeron = processes.aeron_dir();
-    let mut connected = client::connect(&aeron, connect_timeout())?;
+    let driver_dir = processes.driver_dir();
+    let mut connected = client::connect(&driver_dir, connect_timeout())?;
 
     let total = warmup
         .checked_add(samples)

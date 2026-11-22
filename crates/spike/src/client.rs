@@ -410,8 +410,8 @@ fn bid_payload(correlation_id: u64, customer_id: u64, price: i64) -> [u8; 24] {
 /// # Errors
 ///
 /// The last connect error when the deadline passes.
-pub fn connect(aeron_dir: &Path, timeout: Duration) -> Result<Connected, String> {
-    connect_with(aeron_dir, &Channels::ipc(), timeout)
+pub fn connect(driver_dir: &Path, timeout: Duration) -> Result<Connected, String> {
+    connect_with(driver_dir, &Channels::ipc(), timeout)
 }
 
 /// [`connect`] over the channels the caller names.
@@ -424,7 +424,7 @@ pub fn connect(aeron_dir: &Path, timeout: Duration) -> Result<Connected, String>
 ///
 /// The last connect error when the deadline passes.
 pub fn connect_with(
-    aeron_dir: &Path,
+    driver_dir: &Path,
     channels: &Channels,
     timeout: Duration,
 ) -> Result<Connected, String> {
@@ -434,7 +434,7 @@ pub fn connect_with(
     let mut last = String::new();
 
     loop {
-        let mut client = match Client::connect(aeron_dir) {
+        let mut client = match Client::connect(driver_dir) {
             Ok(client) => client,
             Err(error) => {
                 last = format!("media client: {error}");

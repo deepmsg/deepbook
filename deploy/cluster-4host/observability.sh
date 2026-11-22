@@ -172,9 +172,9 @@ _install_binary() { # <host> <source> <name>
 # --- the four application hosts ---------------------------------------------
 
 install_app_host() { # <host> <member|client>
-    local host=$1 which=$2 node aeron cluster endpoint units unit
+    local host=$1 which=$2 node driver_dir cluster endpoint units unit
     node=$(_node_id "$which")
-    aeron=$(_adir "$which")
+    driver_dir=$(_adir "$which")
     cluster=$(_cluster_dir "$which")
     endpoint=$(_app_endpoint "$which")
 

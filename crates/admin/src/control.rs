@@ -57,7 +57,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(1);
 #[derive(Clone, Debug)]
 pub struct ControlConfig {
     /// The aeron directory of the driver the cluster node uses.
-    pub aeron_dir: PathBuf,
+    pub driver_dir: PathBuf,
     /// `aeron.cluster.ingress.channel`.
     pub ingress_channel: String,
     /// `aeron.cluster.ingress.stream.id`.
@@ -74,9 +74,9 @@ impl ControlConfig {
     /// The single-node defaults: IPC both ways, streams 101/102 (the gateway's
     /// defaults, so one cluster serves both).
     #[must_use]
-    pub fn new(aeron_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(driver_dir: impl Into<PathBuf>) -> Self {
         Self {
-            aeron_dir: aeron_dir.into(),
+            driver_dir: driver_dir.into(),
             ingress_channel: "aeron:ipc".to_owned(),
             ingress_stream_id: 101,
             egress_channel: "aeron:ipc".to_owned(),
@@ -335,7 +335,7 @@ impl Worker {
         if self.client.is_some() || Instant::now() < self.retry_at {
             return;
         }
-        match Client::connect(&self.config.aeron_dir) {
+        match Client::connect(&self.config.driver_dir) {
             Ok(client) => self.client = Some(client),
             Err(error) => {
                 eprintln!("deepbook-admin: control: media driver: {error}");

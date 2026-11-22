@@ -24,7 +24,7 @@ use crate::wire::{WireMessage, decode, encode};
 #[derive(Clone, Debug)]
 pub struct DeepmsgConfig {
     /// The driver's aeron directory.
-    pub aeron_dir: PathBuf,
+    pub driver_dir: PathBuf,
     /// Publication channel for incrementals.
     pub incremental_channel: String,
     /// Subscription channel for incrementals (may add `reliable=false`).
@@ -55,7 +55,7 @@ impl DeepmsgConfig {
     #[allow(clippy::too_many_arguments)] // one per channel endpoint
     #[must_use]
     pub fn new(
-        aeron_dir: impl Into<PathBuf>,
+        driver_dir: impl Into<PathBuf>,
         incremental_channel: impl Into<String>,
         incremental_subscription_channel: impl Into<String>,
         recovery_request_channel: impl Into<String>,
@@ -64,7 +64,7 @@ impl DeepmsgConfig {
         recovery_response_subscription_channel: impl Into<String>,
     ) -> Self {
         Self {
-            aeron_dir: aeron_dir.into(),
+            driver_dir: driver_dir.into(),
             incremental_channel: incremental_channel.into(),
             incremental_subscription_channel: incremental_subscription_channel.into(),
             incremental_stream_id: 2001,
@@ -121,7 +121,7 @@ impl DeepmsgPublisher {
     ///
     /// The client or a command failed.
     pub fn connect(config: &DeepmsgConfig) -> Result<Self, DeepmsgError> {
-        let mut client = Client::connect(&config.aeron_dir)
+        let mut client = Client::connect(&config.driver_dir)
             .map_err(|error| DeepmsgError::Connect(error.to_string()))?;
         let incremental_publication = client
             .add_publication(
@@ -295,7 +295,7 @@ impl DeepmsgIncrementalPublisher {
     ///
     /// The client or the publication failed.
     pub fn connect(config: &DeepmsgConfig) -> Result<Self, DeepmsgError> {
-        let mut client = Client::connect(&config.aeron_dir)
+        let mut client = Client::connect(&config.driver_dir)
             .map_err(|error| DeepmsgError::Connect(error.to_string()))?;
         let publication = client
             .add_publication(
@@ -375,7 +375,7 @@ impl DeepmsgRecoveryResponder {
     ///
     /// The client or a command failed.
     pub fn connect(config: &DeepmsgConfig) -> Result<Self, DeepmsgError> {
-        let mut client = Client::connect(&config.aeron_dir)
+        let mut client = Client::connect(&config.driver_dir)
             .map_err(|error| DeepmsgError::Connect(error.to_string()))?;
         let request_subscription = client
             .add_subscription(
@@ -459,7 +459,7 @@ impl DeepmsgSubscriber {
     ///
     /// The client or a command failed.
     pub fn connect(config: &DeepmsgConfig) -> Result<Self, DeepmsgError> {
-        let mut client = Client::connect(&config.aeron_dir)
+        let mut client = Client::connect(&config.driver_dir)
             .map_err(|error| DeepmsgError::Connect(error.to_string()))?;
         let incremental_subscription = client
             .add_subscription(

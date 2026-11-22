@@ -29,8 +29,8 @@ pub struct ClusterCounters {
 
 /// Read the three counters from the media driver's CnC file.
 #[must_use]
-pub fn read_cluster(aeron_dir: &Path, cluster_id: i32) -> ClusterCounters {
-    let Ok(cnc) = CncFile::open(aeron_dir, Duration::from_millis(200)) else {
+pub fn read_cluster(driver_dir: &Path, cluster_id: i32) -> ClusterCounters {
+    let Ok(cnc) = CncFile::open(driver_dir, Duration::from_millis(200)) else {
         return ClusterCounters::default();
     };
     let Some(counters) = cnc.counters() else {

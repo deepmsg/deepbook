@@ -14,8 +14,8 @@ use crate::process::{Processes, connect_timeout};
 /// decode.
 pub fn run(config: Config) -> Result<(), String> {
     let processes = Processes::start(config)?;
-    let aeron = processes.aeron_dir();
-    let mut connected = client::connect(&aeron, connect_timeout())?;
+    let driver_dir = processes.driver_dir();
+    let mut connected = client::connect(&driver_dir, connect_timeout())?;
 
     connected.bid(1, 7, 100)?;
     let egress = connected.wait_for(1, Duration::from_secs(10))?;

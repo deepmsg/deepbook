@@ -56,7 +56,7 @@ _mdir() { printf '%s/member%s' "$CLUSTER_RUN_ROOT" "$1"; }
 # archive and cluster directories stay with the run root because they have to
 # survive the run.
 _adir() { printf '%s/member%s/aeron' "$CLUSTER_AERON_ROOT" "$1"; }
-_client_aeron() { printf '%s/client/aeron' "$CLUSTER_AERON_ROOT"; }
+_client_driver_dir() { printf '%s/client/aeron' "$CLUSTER_AERON_ROOT"; }
 _client_dir() { printf '%s/client' "$CLUSTER_RUN_ROOT"; }
 
 # A command on a host. The controller *is* node0, and node0 may or may not be
@@ -266,7 +266,7 @@ _client_driver_start() {
     local cdir
     cdir=$(_client_dir)
     local args=(
-        "-Ddeepmsg.dir=$(_client_aeron)" "-Daeron.dir=$(_client_aeron)"
+        "-Ddeepmsg.dir=$(_client_driver_dir)" "-Daeron.dir=$(_client_driver_dir)"
         -Ddeepmsg.dir.delete.on.start=false -Daeron.dir.delete.on.start=false
         "-Daeron.archive.dir=$cdir/archive"
         "-Daeron.archive.control.channel=aeron:udp?endpoint=$(_client_ip):$((BASE + 43))"
@@ -284,10 +284,10 @@ _client_driver_start() {
         "${args[@]}"
     _client_start "$cdir/driver.sh" "$cdir/driver.log" "$cdir/driver.pid"
     for _ in $(seq 1 200); do
-        _on "$(_client_host)" "test -f '$(_client_aeron)/cnc.dat'" 2>/dev/null && break
+        _on "$(_client_host)" "test -f '$(_client_driver_dir)/cnc.dat'" 2>/dev/null && break
         sleep 0.1
     done
-    _on "$(_client_host)" "test -f '$(_client_aeron)/cnc.dat'" || {
+    _on "$(_client_host)" "test -f '$(_client_driver_dir)/cnc.dat'" || {
         echo "the client's driver never published its CnC file" >&2
         _on "$(_client_host)" "tail -20 '$cdir/driver.log'" >&2 || true
         return 1
@@ -301,7 +301,7 @@ _gateway_start() {
         --bind "0.0.0.0:$FIX_PORT"
         --session-dir "$cdir/sessions"
         --cluster
-        --aeron-dir "$(_client_aeron)"
+        --aeron-dir "$(_client_driver_dir)"
         --ingress-channel "aeron:udp?term-length=128k"
         --ingress-endpoints "$(_ingress_endpoints)"
         --egress-channel "aeron:udp?endpoint=$(_client_ip):0"
@@ -430,7 +430,7 @@ cmd_up() {
     for ((i = 0; i < MEMBERS; i++)); do _member_stop "$i"; done
     _client_kill gateway
     _client_kill driver
-    _on "$(_client_host)" "rm -rf '$(_client_aeron)'" || true
+    _on "$(_client_host)" "rm -rf '$(_client_driver_dir)'" || true
 
     echo "== members"
     for ((i = 0; i < MEMBERS; i++)); do _member_start "$i"; done

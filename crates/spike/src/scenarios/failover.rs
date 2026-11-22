@@ -84,7 +84,7 @@ pub fn run(config: Config) -> Result<(), String> {
 
     let gateway = Gateway::start(
         cluster.run_dir(),
-        &cluster.client_aeron_dir(),
+        &cluster.client_driver_dir(),
         ports,
         members,
     )?;
@@ -284,7 +284,7 @@ struct Gateway {
 }
 
 impl Gateway {
-    fn start(root: &Path, aeron_dir: &Path, ports: Ports, members: usize) -> Result<Self, String> {
+    fn start(root: &Path, driver_dir: &Path, ports: Ports, members: usize) -> Result<Self, String> {
         let binary = gateway_binary()?;
         let address: SocketAddr = format!("127.0.0.1:{}", ports.base + 50)
             .parse()
@@ -305,7 +305,7 @@ impl Gateway {
             root.join("gateway-sessions").display().to_string(),
             "--cluster".to_owned(),
             "--aeron-dir".to_owned(),
-            aeron_dir.display().to_string(),
+            driver_dir.display().to_string(),
             "--ingress-channel".to_owned(),
             "aeron:udp?term-length=128k".to_owned(),
             "--ingress-endpoints".to_owned(),

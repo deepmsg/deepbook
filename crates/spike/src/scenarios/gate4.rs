@@ -88,7 +88,7 @@ pub fn run(config: Config, bids: usize) -> Result<(), String> {
 
     let channels = Channels::udp(ports, members);
     let mut connected =
-        client::connect_with(&cluster.client_aeron_dir(), &channels, connect_timeout())?;
+        client::connect_with(&cluster.client_driver_dir(), &channels, connect_timeout())?;
     // Every session's egress listener. A reconnect keeps the old one in this
     // list so the duplicate accounting covers both sessions.
     let mut listeners: Vec<Rc<RefCell<Arrivals>>> = vec![Rc::clone(&connected.arrivals)];
@@ -200,7 +200,7 @@ pub fn run(config: Config, bids: usize) -> Result<(), String> {
             );
             let fresh_channels = Channels::udp_with_egress_offset(ports, members, 1);
             connected = client::connect_with(
-                &cluster.client_aeron_dir(),
+                &cluster.client_driver_dir(),
                 &fresh_channels,
                 Duration::from_secs(5),
             )

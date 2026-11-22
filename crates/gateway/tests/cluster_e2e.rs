@@ -389,7 +389,7 @@ impl Harness {
             "--session-dir".to_owned(),
             self.root.join("fix-sessions").display().to_string(),
             "--cluster".to_owned(),
-            "--aeron-dir".to_owned(),
+            "--driver-dir".to_owned(),
             self.driver_dir.display().to_string(),
             "--symbol".to_owned(),
             "AAPL".to_owned(),

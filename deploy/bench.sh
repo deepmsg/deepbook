@@ -261,7 +261,7 @@ wait_for_line "$LOGS/container.log" "STARTED service=deepbook-engine" 20
 if [ "$ADMIN" -eq 1 ]; then
     start "$LOGS/admin.log" "$(deepbook_bin deepbook-admin)" \
         --listen "$ADMIN_HOST:$ADMIN_PORT" \
-        --aeron-dir "$DRIVER_DIR" \
+        --driver-dir "$DRIVER_DIR" \
         --ui-dir "$ROOT/crates/ui" \
         --cluster-id "$CLUSTER_ID" \
         --bench-metrics "$BENCH_METRICS"
@@ -287,7 +287,7 @@ start_gateway() {
         start "$log" "$(deepbook_bin fix-gateway)" \
             --bind "127.0.0.1:$port" \
             --session-dir "$session_dir" \
-            --cluster --aeron-dir "$DRIVER_DIR" \
+            --cluster --driver-dir "$DRIVER_DIR" \
             --tick-us "$TICK_US" \
             --backend "$backend" \
             --journal-sync "$JOURNAL_SYNC" --journal-batch "$JOURNAL_BATCH" \

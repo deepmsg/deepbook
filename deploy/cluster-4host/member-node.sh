@@ -53,7 +53,7 @@ _load() {
         printf -v "$key" '%s' "$value"
     done <"$props"
     _need member_id; _need members; _need host; _need cluster_id
-    _need aeron_dir; _need archive_dir; _need cluster_dir
+    _need driver_dir; _need archive_dir; _need cluster_dir
     _need driver; _need cluster_node; _need container
     _need archive_control; _need ingress_channel; _need consensus_channel
     _need threading_mode
@@ -97,8 +97,8 @@ _await_line() { # <path> <pattern> <what> [tenths]
 
 _driver_args() {
     printf '%s\n' \
-        "-Ddeepmsg.dir=$aeron_dir" \
-        "-Daeron.dir=$aeron_dir" \
+        "-Ddeepmsg.dir=$driver_dir" \
+        "-Daeron.dir=$driver_dir" \
         "-Ddeepmsg.dir.delete.on.start=false" \
         "-Daeron.dir.delete.on.start=false" \
         "-Daeron.archive.dir=$archive_dir" \
@@ -134,7 +134,7 @@ _driver_args() {
 # `module_args`, with the member's own address in the endpoints.
 _cluster_args() {
     printf '%s\n' \
-        "-Daeron.dir=$aeron_dir" \
+        "-Daeron.dir=$driver_dir" \
         "-Daeron.cluster.dir=$cluster_dir" \
         "-Daeron.cluster.id=$cluster_id" \
         "-Daeron.cluster.member.id=$member_id" \
@@ -194,9 +194,9 @@ _start() {
     # `--keep` keeps all three, which is the only shape in which "recover from
     # the snapshot" is a question at all.
     if [ "$keep" -eq 0 ]; then
-        rm -rf "$aeron_dir" "$archive_dir" "$cluster_dir"
+        rm -rf "$driver_dir" "$archive_dir" "$cluster_dir"
     fi
-    mkdir -p "$aeron_dir" "$archive_dir" "$cluster_dir"
+    mkdir -p "$driver_dir" "$archive_dir" "$cluster_dir"
 
     # The application logs are a deployment concern, not a run artifact: the
     # directory is outside the run root (see hosts.env) and the collector reads
@@ -217,7 +217,7 @@ _start() {
     while IFS= read -r line; do args+=("$line"); done < <(_driver_args)
     "${args[@]}" >"$dir/driver.log" 2>&1 &
     PIDS+=("$!"); echo "$!" >>"$CELL_PIDS_FILE"
-    _await_file "$aeron_dir/cnc.dat" "the driver's CnC file" || { tail -20 "$dir/driver.log" >&2 || true; return 1; }
+    _await_file "$driver_dir/cnc.dat" "the driver's CnC file" || { tail -20 "$dir/driver.log" >&2 || true; return 1; }
     _await_line "$dir/driver.log" "archive running" "the archive in the driver" 200 || { tail -20 "$dir/driver.log" >&2 || true; return 1; }
 
     args=()
@@ -302,7 +302,7 @@ action_counters() {
         echo "member ${member_id:-?}: no executable 'cnc_dump' in $props" >&2
         return 1
     fi
-    "$cnc_dump" --all "$aeron_dir" >"$out" 2>&1 || {
+    "$cnc_dump" --all "$driver_dir" >"$out" 2>&1 || {
         echo "member ${member_id:-?}: cnc-dump failed (see $out)" >&2
         return 1
     }

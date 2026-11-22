@@ -75,10 +75,10 @@ _node_id() {
 }
 
 # The driver's aeron directory, exactly what `run-cluster.sh` gives the driver.
-_adir() {
+_driver_dir() {
     case "$1" in
-        client) printf '%s/client/aeron' "$CLUSTER_AERON_ROOT" ;;
-        *) printf '%s/member%s/aeron' "$CLUSTER_AERON_ROOT" "$1" ;;
+        client) printf '%s/client/aeron' "$CLUSTER_DRIVER_ROOT" ;;
+        *) printf '%s/member%s/aeron' "$CLUSTER_DRIVER_ROOT" "$1" ;;
     esac
 }
 
@@ -174,7 +174,7 @@ _install_binary() { # <host> <source> <name>
 install_app_host() { # <host> <member|client>
     local host=$1 which=$2 node driver_dir cluster endpoint units unit
     node=$(_node_id "$which")
-    driver_dir=$(_adir "$which")
+    driver_dir=$(_driver_dir "$which")
     cluster=$(_cluster_dir "$which")
     endpoint=$(_app_endpoint "$which")
 

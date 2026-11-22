@@ -39,7 +39,7 @@ stops and checks the three processes; `counters` is `cnc-dump --all` against the
 member's own aeron directory, taken **before** anything is stopped.
 
 The driver's term buffers and its CnC are memory-mapped files, so they live in
-`CLUSTER_AERON_ROOT` — a tmpfs, `/dev/shm/deepbook` by default. The run root is
+`CLUSTER_DRIVER_ROOT` — a tmpfs, `/dev/shm/deepbook` by default. The run root is
 on the ESSD, and a memory-mapped file there puts a page fault in whatever path
 touches it, which for this workload is the measured path. The archive and the
 cluster directory stay with the run root: those have to survive the run.

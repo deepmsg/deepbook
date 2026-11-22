@@ -55,8 +55,8 @@ _mdir() { printf '%s/member%s' "$CLUSTER_RUN_ROOT" "$1"; }
 # path touches it. `CLUSTER_RUN_ROOT` is on the ESSD; this is on a tmpfs. The
 # archive and cluster directories stay with the run root because they have to
 # survive the run.
-_adir() { printf '%s/member%s/aeron' "$CLUSTER_AERON_ROOT" "$1"; }
-_client_driver_dir() { printf '%s/client/aeron' "$CLUSTER_AERON_ROOT"; }
+_driver_dir() { printf '%s/member%s/aeron' "$CLUSTER_DRIVER_ROOT" "$1"; }
+_client_driver_dir() { printf '%s/client/aeron' "$CLUSTER_DRIVER_ROOT"; }
 _client_dir() { printf '%s/client' "$CLUSTER_RUN_ROOT"; }
 
 # A command on a host. The controller *is* node0, and node0 may or may not be
@@ -109,7 +109,7 @@ _member_properties() { # <member> <file>
         echo "host=$h"
         echo "cluster_id=$CLUSTER_ID"
         echo "members=$(_members_string)"
-        echo "aeron_dir=$(_adir "$i")"
+        echo "driver_dir=$(_driver_dir "$i")"
         echo "archive_dir=$(_mdir "$i")/archive"
         echo "cluster_dir=$(_mdir "$i")/cluster"
         echo "driver=$CLUSTER_DEEPMSG_DIR/target/release/deepmsg-archiving-media-driver"
@@ -143,7 +143,7 @@ _member_properties() { # <member> <file>
 _is_leader() { # <member> -> 0 leader, 1 not, other failure
     local i=$1
     _on "$(_host "$i")" \
-        "'$CLUSTER_DEEPMSG_DIR/target/release/deepmsg-cluster-tool' -Daeron.dir='$(_adir "$i")' '$(_mdir "$i")/cluster' is-leader >/dev/null 2>&1"
+        "'$CLUSTER_DEEPMSG_DIR/target/release/deepmsg-cluster-tool' -Daeron.dir='$(_driver_dir "$i")' '$(_mdir "$i")/cluster' is-leader >/dev/null 2>&1"
 }
 
 _member_alive() { # <member> -> 0 when every pid in its own pid file is still there
@@ -223,7 +223,7 @@ _member_restart() { # <member> [--keep]
 _member_commit_pos() { # <member> -> the position it has applied, or empty
     local i=$1
     _on "$(_host "$i")" \
-        "'$CLUSTER_DEEPMSG_DIR/target/release/cnc-dump' --all '$(_adir "$i")' 2>/dev/null | awk '/Cluster commit-pos/ {print \$3; exit}'"
+        "'$CLUSTER_DEEPMSG_DIR/target/release/cnc-dump' --all '$(_driver_dir "$i")' 2>/dev/null | awk '/Cluster commit-pos/ {print \$3; exit}'"
 }
 
 _member_wait_up() { # <member> <seconds>
@@ -301,7 +301,7 @@ _gateway_start() {
         --bind "0.0.0.0:$FIX_PORT"
         --session-dir "$cdir/sessions"
         --cluster
-        --aeron-dir "$(_client_driver_dir)"
+        --driver-dir "$(_client_driver_dir)"
         --ingress-channel "aeron:udp?term-length=128k"
         --ingress-endpoints "$(_ingress_endpoints)"
         --egress-channel "aeron:udp?endpoint=$(_client_ip):0"

@@ -1,7 +1,7 @@
 //! `deepbook-admin`: the M5 dashboard host.
 //!
 //! ```text
-//! deepbook-admin --aeron-dir /dev/shm/aeron [--listen 127.0.0.1:8080]
+//! deepbook-admin --driver-dir /dev/shm/aeron [--listen 127.0.0.1:8080]
 //!                [--symbol 1] [--ui-dir crates/ui]
 //!                [--cluster-id 7] [--bench-metrics target/bench/last.prom]
 //!                [--incremental-channel URI] [--incremental-stream-id N]
@@ -388,7 +388,7 @@ impl Options {
                         .parse()
                         .map_err(|_| "--listen must be IP:PORT".to_owned())?;
                 }
-                "--aeron-dir" => driver_dir = Some(value("--aeron-dir")?.into()),
+                "--driver-dir" => driver_dir = Some(value("--driver-dir")?.into()),
                 "--symbol" => {
                     symbol = value("--symbol")?
                         .parse()
@@ -434,7 +434,7 @@ impl Options {
             }
         }
         let Some(driver_dir) = driver_dir else {
-            return Err("--aeron-dir is required".to_owned());
+            return Err("--driver-dir is required".to_owned());
         };
         let mut market_data = DeepmsgConfig::new(
             &driver_dir,
@@ -471,7 +471,7 @@ impl Options {
 
 fn print_usage() {
     println!(
-        "usage: deepbook-admin --aeron-dir PATH [--listen IP:PORT]\n\
+        "usage: deepbook-admin --driver-dir PATH [--listen IP:PORT]\n\
          \x20                    [--symbol N] [--ui-dir PATH] [--cluster-id N]\n\
          \x20                    [--bench-metrics PATH]\n\
          \x20                    [--incremental-channel URI] [--incremental-stream-id N]\n\

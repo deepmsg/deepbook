@@ -6,7 +6,7 @@
 //!             [--sender DEEPBOOK] [--target CLIENT]
 //!             [--heartbeat 30] [--journal 4096]
 //!
-//! fix-gateway --cluster --aeron-dir /dev/shm/aeron ...
+//! fix-gateway --cluster --driver-dir /dev/shm/aeron ...
 //! ```
 //!
 //! Without `--cluster` the in-process [`StubEngine`] answers (M1). With it,
@@ -71,7 +71,7 @@ fn run() -> Result<(), String> {
         let driver_dir = options
             .driver_dir
             .clone()
-            .ok_or_else(|| "--cluster needs --aeron-dir".to_owned())?;
+            .ok_or_else(|| "--cluster needs --driver-dir".to_owned())?;
         let mut cluster_config = ClusterEngineConfig::new(
             driver_dir,
             SessionKey::new(&options.sender, &options.target),
@@ -263,7 +263,7 @@ impl Options {
                         .map_err(|_| "--journal-batch must be a number".to_owned())?;
                 }
                 "--cluster" => options.cluster = true,
-                "--aeron-dir" => options.driver_dir = Some(value("--aeron-dir")?.into()),
+                "--driver-dir" => options.driver_dir = Some(value("--driver-dir")?.into()),
                 "--ingress-channel" => options.ingress_channel = value("--ingress-channel")?,
                 "--ingress-endpoints" => {
                     options.ingress_endpoints = Some(value("--ingress-endpoints")?);
@@ -318,7 +318,7 @@ fn print_usage() {
          \x20                  [--heartbeat SECONDS] [--journal ENTRIES]\n\
          \x20                  [--tick-us MICROSECONDS] [--backend epoll|uring]\n\
          \x20                  [--journal-sync each|batch] [--journal-batch N]\n\
-         \x20                  [--cluster --aeron-dir PATH]\n\
+         \x20                  [--cluster --driver-dir PATH]\n\
          \x20                  [--ingress-channel URI] [--ingress-stream-id N]\n\
          \x20                  [--ingress-endpoints M=HOST:PORT,...]\n\
          \x20                  [--egress-channel URI] [--egress-stream-id N]\n\

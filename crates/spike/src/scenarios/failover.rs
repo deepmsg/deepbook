@@ -304,7 +304,7 @@ impl Gateway {
             "--session-dir".to_owned(),
             root.join("gateway-sessions").display().to_string(),
             "--cluster".to_owned(),
-            "--aeron-dir".to_owned(),
+            "--driver-dir".to_owned(),
             driver_dir.display().to_string(),
             "--ingress-channel".to_owned(),
             "aeron:udp?term-length=128k".to_owned(),

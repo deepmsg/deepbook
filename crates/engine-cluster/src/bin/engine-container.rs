@@ -400,7 +400,7 @@ fn market_data_config(properties: &Properties, driver_dir: &Path) -> Result<Deep
         &response,
     );
     let driver_dir = properties
-        .get("deepbook.marketdata.aeron.dir")
+        .get("deepbook.marketdata.driver.dir")
         .map_or_else(|| driver_dir.to_path_buf(), PathBuf::from);
     let mut config = DeepmsgConfig::new(
         driver_dir,

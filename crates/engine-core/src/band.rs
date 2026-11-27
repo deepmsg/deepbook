@@ -563,6 +563,9 @@ impl Iterator for InBandDescending<'_> {
 }
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use deepbook_types::Qty;
 

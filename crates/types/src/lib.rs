@@ -33,6 +33,11 @@ pub type Seq = u64;
 pub const EMPTY_ORDER_ID: OrderId = u32::MAX;
 
 /// Order side.
+///
+/// `repr(u8)` because `OrderHot` places it inside a `repr(C, align(64))`
+/// record whose layout is asserted at compile time
+/// (`crates/engine-core/src/book.rs`).
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     /// Buy side.
@@ -42,6 +47,10 @@ pub enum Side {
 }
 
 /// Order state as seen by the engine and the FIX layer.
+///
+/// `repr(u8)` for the same reason as [`Side`]: it sits in `OrderHot`'s
+/// cache-line record.
+#[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OrderState {
     /// Accepted, no fill.

@@ -19,6 +19,13 @@ use crate::ids::{ClientOrderId, EMPTY_SLOT, MAX_SLOTS, next_generation, pack, sl
 use crate::snapshot::{BookSnapshot, LevelSnapshot, OrderSlotSnapshot, SnapshotError};
 
 /// One resting order's hot fields.
+///
+/// `repr(C, align(64))` pins the record to one cache line: the fields pack to
+/// exactly 64 bytes in declaration order, and the alignment makes the slab's
+/// base 64-byte aligned so no element straddles two lines. The layout is
+/// asserted below; changing a field means updating the assertions and ADR
+/// 0003's note on the record.
+#[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OrderHot {
     pub id: OrderId,
@@ -35,6 +42,20 @@ pub(crate) struct OrderHot {
     /// Whether the order dies at the end of the trading day.
     pub is_day: bool,
 }
+
+const _: () = {
+    use core::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<OrderHot>() == 64);
+    assert!(align_of::<OrderHot>() == 64);
+    // The padding slot between `id` and `price` is part of the layout: `Price`
+    // is 8-byte aligned and `id` is 4 bytes.
+    assert!(offset_of!(OrderHot, id) == 0);
+    assert!(offset_of!(OrderHot, price) == 8);
+    assert!(offset_of!(OrderHot, notional) == 32);
+    assert!(offset_of!(OrderHot, account) == 48);
+    assert!(offset_of!(OrderHot, side) == 60);
+    assert!(offset_of!(OrderHot, is_day) == 63);
+};
 
 impl OrderHot {
     fn free(next: u32) -> Self {

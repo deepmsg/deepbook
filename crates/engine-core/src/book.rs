@@ -753,6 +753,11 @@ fn derive_base(bids: &[LevelSnapshot], asks: &[LevelSnapshot], band_ticks: i64) 
 }
 
 fn check_level(level: &LevelSnapshot, capacity: usize) -> Result<(), SnapshotError> {
+    // A snapshot's levels are the non-empty ones; an empty level would come
+    // back as a phantom bit with no orders behind it.
+    if level.head == EMPTY_SLOT {
+        return Err(SnapshotError::BadLevel { price: level.price });
+    }
     for slot in [level.head, level.tail] {
         if slot != EMPTY_SLOT && usize::try_from(slot).map_or(true, |slot| slot >= capacity) {
             return Err(SnapshotError::BadLevel { price: level.price });

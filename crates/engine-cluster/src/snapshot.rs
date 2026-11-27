@@ -5,6 +5,11 @@
 //! can recover from a snapshot taken before the writer was switched. The
 //! rollout order still matters: every node must run a build that can read
 //! `DBS2` before any node writes it (ADR 0005).
+//!
+//! Schema version 3 carries the price band's base. A version-2 record has no
+//! base, and the reader derives one from the levels; that is only sound when
+//! the whole cluster cold-restarts from the record, because a live member's
+//! band may have moved since the snapshot was written.
 
 mod dbs1;
 mod sbe;

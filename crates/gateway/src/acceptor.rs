@@ -26,15 +26,17 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use deepbook_fix::ApplicationMessage;
 use deepbook_fix::clock::{Clock, SystemClock};
+use deepbook_fix::codec::tag;
 use deepbook_fix::frame::FrameDecoder;
 use deepbook_fix::journal::{FileJournal, FileSequenceStore, SyncPolicy};
 use deepbook_fix::session::{Action, Session, SessionConfig};
+use deepbook_fix::{ApplicationMessage, MsgType, ParsedMessage};
 use deepbook_io::{BackendKind, Event, EventLoop};
 
 use crate::metrics::GatewayMetrics;
 use crate::obs;
+use crate::seat::config::{SeatProtocol, SeatRegistry};
 use crate::sink::{Engine, SessionKey};
 
 /// The acceptor's configuration.
@@ -48,6 +50,8 @@ pub struct GatewayConfig {
     pub sender_comp_id: String,
     /// The expected peer `TargetCompID`.
     pub target_comp_id: String,
+    /// The shared FIX seat registry; `Some` selects multi-seat logon routing.
+    pub seats: Option<SeatRegistry>,
     /// Heartbeat interval before the peer's `108` arrives.
     pub heart_bt_int: u32,
     /// Outbound journal entries kept per session.
@@ -82,6 +86,7 @@ impl GatewayConfig {
             session_dir: session_dir.into(),
             sender_comp_id: sender_comp_id.into(),
             target_comp_id: target_comp_id.into(),
+            seats: None,
             heart_bt_int: 30,
             journal_capacity: 4_096,
             tick: Duration::from_millis(100),
@@ -94,11 +99,15 @@ impl GatewayConfig {
 }
 
 struct Connection {
-    key: SessionKey,
+    /// The FIX session key; `None` until a multi-seat Logon names it.
+    key: Option<SessionKey>,
     /// The peer that opened the TCP connection; carried for the log only.
     peer: SocketAddr,
     decoder: FrameDecoder,
-    session: Session<FileJournal, FileSequenceStore>,
+    /// `None` until the Logon is routed to a seat.
+    session: Option<Session<FileJournal, FileSequenceStore>>,
+    /// When the socket was accepted, for the pre-auth Logon timeout.
+    accepted_at: i64,
     outbound: Outbound,
     writing: bool,
     close_after_flush: bool,
@@ -211,6 +220,7 @@ pub struct Gateway<E: Engine> {
     io: Box<dyn EventLoop>,
     config: GatewayConfig,
     key: SessionKey,
+    seats: Option<SeatRegistry>,
     engine: E,
     connections: HashMap<u64, Connection>,
     /// Reports that arrived while their FIX session had no connection.
@@ -262,10 +272,12 @@ impl<E: Engine> Gateway<E> {
         let mut io = deepbook_io::open(config.backend, config.bind)?;
         io.start_accept()?;
         let key = SessionKey::new(&config.sender_comp_id, &config.target_comp_id);
+        let seats = config.seats.clone();
         Ok(Self {
             io,
             config,
             key,
+            seats,
             engine,
             connections: HashMap::new(),
             pending_reports: HashMap::new(),
@@ -381,21 +393,45 @@ impl<E: Engine> Gateway<E> {
     }
 
     fn add_connection(&mut self, id: u64, peer: SocketAddr) -> usize {
-        // A new TCP connection for the same CompID pair replaces the old
-        // session. The old file handles must be closed before the new session
-        // opens the same journal.
+        let now = SystemClock.now_millis();
+        if self.seats.is_some() {
+            // The seat is not known until the Logon's CompIDs arrive. Read
+            // into a bare decoder; `read_completion` creates the session.
+            self.connections.insert(
+                id,
+                Connection {
+                    key: None,
+                    peer,
+                    decoder: FrameDecoder::new(),
+                    session: None,
+                    accepted_at: now,
+                    outbound: Outbound::default(),
+                    writing: false,
+                    close_after_flush: false,
+                    read_paused: false,
+                    announced_open: false,
+                },
+            );
+            if self.io.start_read(id).is_err() {
+                self.drop_connection(id);
+            }
+            return 1;
+        }
+
+        // One CompID pair: a new TCP connection replaces the old session.
+        // The old file handles must be closed before the new session opens
+        // the same journal.
         let replaced: Vec<u64> = self
             .connections
             .iter()
-            .filter(|(_, connection)| connection.key == self.key)
+            .filter(|(_, connection)| connection.key.as_ref() == Some(&self.key))
             .map(|(id, _)| *id)
             .collect();
         for replaced in replaced {
             self.drop_connection(replaced);
         }
 
-        let now = SystemClock.now_millis();
-        let session = match self.open_session(now) {
+        let session = match self.open_session(&self.key, now) {
             Ok(session) => session,
             Err(error) => {
                 eprintln!("gateway: cannot open session for {peer}: {error}");
@@ -406,10 +442,11 @@ impl<E: Engine> Gateway<E> {
         self.connections.insert(
             id,
             Connection {
-                key: self.key.clone(),
+                key: Some(self.key.clone()),
                 peer,
                 decoder: FrameDecoder::new(),
-                session,
+                session: Some(session),
+                accepted_at: now,
                 outbound: Outbound::default(),
                 writing: false,
                 close_after_flush: false,
@@ -423,11 +460,68 @@ impl<E: Engine> Gateway<E> {
         1
     }
 
+    /// Route a pre-auth Logon to a configured FIX seat.
+    ///
+    /// The inbound `49` is the peer and `56` is us, so the session key is
+    /// `(incoming 56, incoming 49)`. An unknown pair is closed, not answered:
+    /// there is no session to put a reject on yet.
+    fn bind_seat_logon(&mut self, id: u64, message: &ParsedMessage, now: i64) -> bool {
+        let Some(registry) = self.seats.as_ref() else {
+            return false;
+        };
+        if !matches!(message.msg_type(), Ok(MsgType::Logon)) {
+            return false;
+        }
+        let (Ok(incoming_sender), Ok(incoming_target)) = (
+            message.get_str(tag::SENDER_COMP_ID),
+            message.get_str(tag::TARGET_COMP_ID),
+        ) else {
+            return false;
+        };
+        let key = SessionKey::new(incoming_target, incoming_sender);
+        let known = registry.iter().any(|seat| {
+            seat.protocol == SeatProtocol::Fix
+                && seat.sender.as_deref() == Some(key.sender_comp_id.as_str())
+                && seat.target.as_deref() == Some(key.target_comp_id.as_str())
+        });
+        if !known {
+            return false;
+        }
+
+        let replaced: Vec<u64> = self
+            .connections
+            .iter()
+            .filter(|entry| *entry.0 != id && entry.1.key.as_ref() == Some(&key))
+            .map(|entry| *entry.0)
+            .collect();
+        for replaced in replaced {
+            self.drop_connection(replaced);
+        }
+
+        let session = match self.open_session(&key, now) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!(
+                    "gateway: cannot open session for {}->{}: {error}",
+                    key.sender_comp_id, key.target_comp_id
+                );
+                return false;
+            }
+        };
+        let Some(connection) = self.connections.get_mut(&id) else {
+            return false;
+        };
+        connection.key = Some(key);
+        connection.session = Some(session);
+        true
+    }
+
     fn open_session(
         &self,
+        key: &SessionKey,
         now_millis: i64,
     ) -> Result<Session<FileJournal, FileSequenceStore>, io::Error> {
-        let directory = self.config.session_dir.join(self.key.directory_name());
+        let directory = self.config.session_dir.join(key.directory_name());
         let journal = FileJournal::open_with_sync(
             directory.join("journal.bin"),
             self.config.journal_capacity,
@@ -437,8 +531,8 @@ impl<E: Engine> Gateway<E> {
         let sequences =
             FileSequenceStore::with_sync(directory.join("sequences"), self.config.journal_sync);
         let mut config = SessionConfig::new(
-            &self.config.sender_comp_id,
-            &self.config.target_comp_id,
+            &key.sender_comp_id,
+            &key.target_comp_id,
             self.config.heart_bt_int,
         );
         config.logon_timeout_millis = self.config.logon_timeout_millis;
@@ -449,11 +543,9 @@ impl<E: Engine> Gateway<E> {
         if let Some(connection) = self.connections.remove(&id) {
             if connection.announced_open {
                 self.metrics.note_session_close();
-                obs::session_close(
-                    connection.peer,
-                    &self.config.sender_comp_id,
-                    &self.config.target_comp_id,
-                );
+                if let Some(key) = connection.key.as_ref() {
+                    obs::session_close(connection.peer, &key.sender_comp_id, &key.target_comp_id);
+                }
             }
         }
         self.io.close(id);
@@ -469,16 +561,17 @@ impl<E: Engine> Gateway<E> {
         let Some(connection) = self.connections.get_mut(&id) else {
             return false;
         };
-        if connection.announced_open || !connection.session.is_active() {
+        let active = connection.session.as_ref().is_some_and(Session::is_active);
+        if connection.announced_open || !active {
             return false;
         }
+        let Some(key) = connection.key.clone() else {
+            return false;
+        };
         connection.announced_open = true;
+        let peer = connection.peer;
         self.metrics.note_session_open();
-        obs::session_open(
-            connection.peer,
-            &self.config.sender_comp_id,
-            &self.config.target_comp_id,
-        );
+        obs::session_open(peer, &key.sender_comp_id, &key.target_comp_id);
         true
     }
 
@@ -532,10 +625,19 @@ impl<E: Engine> Gateway<E> {
             if matches!(message.msg_type(), Ok(kind) if !kind.is_admin()) {
                 self.metrics.note_fix_order_decoded();
             }
+            let needs_logon = self
+                .connections
+                .get(&id)
+                .is_some_and(|connection| connection.session.is_none());
+            if needs_logon && !self.bind_seat_logon(id, &message, now) {
+                self.drop_connection(id);
+                return work;
+            }
             let result = self
                 .connections
                 .get_mut(&id)
-                .map(|connection| connection.session.on_inbound(message.raw(), now));
+                .and_then(|connection| connection.session.as_mut())
+                .map(|session| session.on_inbound(message.raw(), now));
             let Some(result) = result else {
                 break;
             };
@@ -654,10 +756,12 @@ impl<E: Engine> Gateway<E> {
     fn flush_sessions(&mut self) {
         let ids: Vec<u64> = self.connections.keys().copied().collect();
         for id in ids {
-            let failed = self
-                .connections
-                .get_mut(&id)
-                .is_some_and(|connection| connection.session.flush_outbound().is_err());
+            let failed = self.connections.get_mut(&id).is_some_and(|connection| {
+                connection
+                    .session
+                    .as_mut()
+                    .is_some_and(|session| session.flush_outbound().is_err())
+            });
             if failed {
                 self.drop_connection(id);
             }
@@ -721,14 +825,24 @@ impl<E: Engine> Gateway<E> {
             let actions = self
                 .connections
                 .get_mut(&id)
-                .map(|connection| connection.session.on_tick(now));
+                .and_then(|connection| connection.session.as_mut())
+                .map(|session| session.on_tick(now));
             match actions {
                 Some(Ok(actions)) => work += self.apply_actions(id, actions),
                 Some(Err(_)) => {
                     self.drop_connection(id);
                     work += 1;
                 }
-                None => {}
+                None => {
+                    let expired = self.connections.get(&id).is_some_and(|connection| {
+                        now.saturating_sub(connection.accepted_at)
+                            > self.config.logon_timeout_millis
+                    });
+                    if expired {
+                        self.drop_connection(id);
+                        work += 1;
+                    }
+                }
             }
         }
         work
@@ -748,7 +862,7 @@ impl<E: Engine> Gateway<E> {
                     let key = self
                         .connections
                         .get(&id)
-                        .map(|connection| connection.key.clone());
+                        .and_then(|connection| connection.key.clone());
                     if let Some(key) = key {
                         self.metrics.note_order();
                         self.engine.deliver(&key, message);
@@ -774,7 +888,12 @@ impl<E: Engine> Gateway<E> {
             let Some(id) = self
                 .connections
                 .iter()
-                .find(|(_, connection)| connection.key == event.session)
+                .find(|(_, connection)| {
+                    connection
+                        .key
+                        .as_ref()
+                        .is_some_and(|key| *key == event.session)
+                })
                 .map(|(id, _)| *id)
             else {
                 // No live connection for the session: keep the report until
@@ -794,7 +913,8 @@ impl<E: Engine> Gateway<E> {
             let action = self
                 .connections
                 .get_mut(&id)
-                .map(|connection| connection.session.send_application(&event.message, now));
+                .and_then(|connection| connection.session.as_mut())
+                .map(|session| session.send_application(&event.message, now));
             match action {
                 Some(Ok(action)) => work += self.apply_actions(id, vec![action]),
                 Some(Err(error)) => eprintln!("gateway: send_application failed: {error}"),
@@ -817,8 +937,8 @@ impl<E: Engine> Gateway<E> {
         let active: Vec<(u64, SessionKey)> = self
             .connections
             .iter()
-            .filter(|(_, connection)| connection.session.is_active())
-            .map(|(id, connection)| (*id, connection.key.clone()))
+            .filter(|(_, connection)| connection.session.as_ref().is_some_and(Session::is_active))
+            .filter_map(|(id, connection)| connection.key.clone().map(|key| (*id, key)))
             .collect();
         let mut work = 0;
         for (id, key) in active {
@@ -830,7 +950,8 @@ impl<E: Engine> Gateway<E> {
                 let action = self
                     .connections
                     .get_mut(&id)
-                    .map(|connection| connection.session.send_application(&message, now));
+                    .and_then(|connection| connection.session.as_mut())
+                    .map(|session| session.send_application(&message, now));
                 match action {
                     Some(Ok(action)) => work += self.apply_actions(id, vec![action]),
                     Some(Err(error)) => {

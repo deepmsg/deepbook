@@ -94,13 +94,9 @@ fn run() -> Result<(), String> {
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             let registry = SeatRegistry::parse(&text).map_err(|error| error.to_string())?;
-            let engine = SeatFixEngine::connect_with(
-                cluster_config,
-                &registry,
-                session_key,
-                Arc::clone(&metrics),
-            )
-            .map_err(|error| format!("cannot connect the seat cluster client: {error}"))?;
+            let engine =
+                SeatFixEngine::connect_with(cluster_config, &registry, Arc::clone(&metrics))
+                    .map_err(|error| format!("cannot connect the seat cluster client: {error}"))?;
             println!(
                 "fix-gateway seats={} aeron={}",
                 path.display(),

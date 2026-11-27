@@ -161,6 +161,18 @@ impl FixSeatSession {
         self.config.account_id
     }
 
+    /// The configured symbol id.
+    #[must_use]
+    pub const fn symbol_id(&self) -> u16 {
+        self.symbol_id
+    }
+
+    /// The configured symbol name.
+    #[must_use]
+    pub fn symbol_name(&self) -> &str {
+        &self.symbol_name
+    }
+
     /// Whether a bind is current.
     #[must_use]
     pub const fn is_bound(&self) -> bool {

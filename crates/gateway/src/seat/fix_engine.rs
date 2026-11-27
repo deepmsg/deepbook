@@ -1,16 +1,15 @@
 //! The FIX-seat adapter over the service envelopes (ADR 0012 §6.3).
 //!
-//! It implements the gateway's existing [`Engine`] seam, so the M1 acceptor
-//! does not change: FIX messages arrive in `deliver`, engine events come back
-//! from `poll_event`. The difference is underneath — a seat is bound through
-//! `SeatClusterEngine`, its events are rendered with the `resync`/replace
-//! metadata, and its journal is the FIX seat journal.
+//! It implements the gateway's existing [`Engine`] seam, so the acceptor does
+//! not change: FIX messages arrive in `deliver`, engine events come back from
+//! `poll_event`. One `SeatFixEngine` owns every configured FIX seat over one
+//! cluster session; the acceptor routes a connection to a seat by its
+//! `SenderCompID`/`TargetCompID` pair.
 //!
-//! One `SeatFixEngine` hosts one FIX `SenderCompID`/`TargetCompID` pair, the
-//! same limit the M1 acceptor has. The multi-seat FIX listener is a later
-//! slice; this one makes the FIX path use the same outbox as OUCH.
+//! A seat is bound lazily, on the first application message. Binding at startup
+//! would let a resync report reach a FIX session before its peer logged on.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use deepbook_engine_core::{
@@ -26,127 +25,156 @@ use deepbook_types::{AccountId, Side as FixSide};
 
 use crate::cluster::{ClusterEngineConfig, ClusterEngineError, SeatClusterEngine, SeatEgress};
 use crate::metrics::GatewayMetrics;
-use crate::seat::config::{SeatProtocol, SeatRegistry};
+use crate::seat::config::{SeatConfig, SeatProtocol, SeatRegistry};
 use crate::seat::fix_session::{FixEventOutcome, FixSeatSession};
 use crate::seat::journal::latest;
-use crate::seat::session::BoundOutcome;
 use crate::sink::{CommandSink, EventSource, SessionEvent, SessionKey};
 
-/// The FIX-seat adapter.
-pub struct SeatFixEngine {
-    cluster: SeatClusterEngine,
-    session_key: SessionKey,
+/// One configured FIX seat's runtime.
+struct SeatRuntime {
+    key: SessionKey,
     session: FixSeatSession,
-    symbol_id: u16,
-    symbol_name: String,
-    /// `(seat_id, account_id, last journaled seq)` for the first bind.
     bind: (u16, u32, u64),
     bind_pending: bool,
     epoch: Option<u64>,
     pending: VecDeque<Command>,
-    events: VecDeque<(SessionEvent, u64)>,
-    /// The last sequence handed to the acceptor; the next poll acknowledges
-    /// it, because by then the FIX session has journaled the message.
+    /// The last sequence handed to the acceptor; the next poll acknowledges it.
     returned_seq: u64,
+}
+
+/// The FIX-seat adapter for every configured FIX seat.
+pub struct SeatFixEngine {
+    cluster: SeatClusterEngine,
+    seats: BTreeMap<u16, SeatRuntime>,
+    keys: HashMap<SessionKey, u16>,
+    events: VecDeque<(SessionEvent, u64)>,
     local_exec: u64,
 }
 
 impl SeatFixEngine {
-    /// Connect the cluster and bind one configured FIX seat.
+    /// Connect the cluster and register every configured FIX seat.
     ///
     /// # Errors
     ///
-    /// The registry has no FIX seat for `session_key`, or the cluster cannot be
-    /// reached.
+    /// The registry has no FIX seat, two seats share a key, or the cluster
+    /// cannot be reached.
     pub fn connect_with(
         config: ClusterEngineConfig,
         registry: &SeatRegistry,
-        session_key: SessionKey,
         metrics: Arc<GatewayMetrics>,
     ) -> Result<Self, ClusterEngineError> {
-        let seat = registry
-            .iter()
-            .find(|seat| {
-                seat.protocol == SeatProtocol::Fix
-                    && seat.sender.as_deref() == Some(session_key.sender_comp_id.as_str())
-                    && seat.target.as_deref() == Some(session_key.target_comp_id.as_str())
-            })
-            .cloned()
-            .ok_or_else(|| {
-                ClusterEngineError::Configuration(format!(
-                    "no fix seat for {}->{}",
-                    session_key.sender_comp_id, session_key.target_comp_id
-                ))
-            })?;
-        let last = latest(&seat.journal_dir)
-            .ok()
-            .flatten()
-            .map_or(0, |(_, last)| last);
-        let cluster = SeatClusterEngine::connect_with(config.clone(), metrics)?;
-        let symbol_name = config.symbol_name.clone();
+        let mut seats = BTreeMap::new();
+        let mut keys = HashMap::new();
+        for seat in registry.iter() {
+            if seat.protocol != SeatProtocol::Fix {
+                continue;
+            }
+            let key = SessionKey::new(
+                seat.sender.clone().unwrap_or_default(),
+                seat.target.clone().unwrap_or_default(),
+            );
+            if keys.insert(key.clone(), seat.seat_id).is_some() {
+                return Err(ClusterEngineError::Configuration(format!(
+                    "two fix seats share {}->{}",
+                    key.sender_comp_id, key.target_comp_id
+                )));
+            }
+            seats.insert(
+                seat.seat_id,
+                runtime(seat, key, config.symbol, &config.symbol_name),
+            );
+        }
+        if seats.is_empty() {
+            return Err(ClusterEngineError::Configuration(
+                "the registry has no fix seat".to_owned(),
+            ));
+        }
+        let cluster = SeatClusterEngine::connect_with(config, metrics)?;
         Ok(Self {
             cluster,
-            session_key,
-            session: FixSeatSession::new(seat.clone(), config.symbol, symbol_name.clone()),
-            symbol_id: config.symbol,
-            symbol_name,
-            bind: (seat.seat_id, seat.account_id, last),
-            bind_pending: false,
-            epoch: None,
-            pending: VecDeque::new(),
+            seats,
+            keys,
             events: VecDeque::new(),
-            returned_seq: 0,
             local_exec: 0,
         })
     }
 
-    fn ensure_bound(&mut self) {
-        if self.epoch.is_some() || self.bind_pending || !self.cluster.is_connected() {
+    fn runtime(&self, seat_id: u16) -> Option<&SeatRuntime> {
+        self.seats.get(&seat_id)
+    }
+
+    fn runtime_mut(&mut self, seat_id: u16) -> Option<&mut SeatRuntime> {
+        self.seats.get_mut(&seat_id)
+    }
+
+    fn ensure_bound(&mut self, seat_id: u16) {
+        if !self.cluster.is_connected() {
             return;
         }
-        let (seat_id, account_id, last) = self.bind;
-        self.cluster.bind(seat_id, account_id, last);
-        self.bind_pending = true;
+        let Some(bind) = self
+            .runtime(seat_id)
+            .filter(|runtime| runtime.epoch.is_none() && !runtime.bind_pending)
+            .map(|runtime| runtime.bind)
+        else {
+            return;
+        };
+        let (seat, account, last) = bind;
+        self.cluster.bind(seat, account, last);
+        if let Some(runtime) = self.runtime_mut(seat_id) {
+            runtime.bind_pending = true;
+        }
+    }
+
+    fn flush_pending(&mut self, seat_id: u16) {
+        let Some((epoch, commands)) = self.runtime_mut(seat_id).and_then(|runtime| {
+            let epoch = runtime.epoch?;
+            Some((epoch, runtime.pending.drain(..).collect::<Vec<Command>>()))
+        }) else {
+            return;
+        };
+        for command in commands {
+            let bytes = encode_command(&command);
+            self.cluster.seat_command(seat_id, epoch, &bytes);
+        }
     }
 
     fn on_bound(&mut self, bound: deepbook_engine_cluster::envelope::SeatBound) {
-        match self.session.on_seat_bound(bound) {
-            Ok(BoundOutcome { epoch, .. }) => {
-                self.epoch = Some(epoch);
-                self.bind_pending = false;
-                self.returned_seq = 0;
-                self.flush_pending();
-            }
-            Err(error) => eprintln!("fix-gateway: seat bound: {error}"),
+        let seat_id = bound.seat_id;
+        let Some(outcome) = self
+            .runtime_mut(seat_id)
+            .and_then(|runtime| runtime.session.on_seat_bound(bound).ok())
+        else {
+            return;
+        };
+        if let Some(runtime) = self.runtime_mut(seat_id) {
+            runtime.epoch = Some(outcome.epoch);
+            runtime.bind_pending = false;
+            runtime.returned_seq = 0;
         }
+        self.flush_pending(seat_id);
     }
 
     fn on_event(&mut self, event: crate::cluster::OwnedSeatEvent) {
-        match self.session.on_event(&event.borrowed()) {
+        let seat_id = event.seat_id;
+        let Some((key, outcome)) = self.runtime_mut(seat_id).map(|runtime| {
+            let key = runtime.key.clone();
+            let outcome = runtime.session.on_event(&event.borrowed());
+            (key, outcome)
+        }) else {
+            return;
+        };
+        match outcome {
             Ok(FixEventOutcome::Duplicate) => {}
-            Ok(FixEventOutcome::Message {
-                message, seat_seq, ..
-            }) => {
+            Ok(FixEventOutcome::Message { message, seat_seq }) => {
                 self.events.push_back((
                     SessionEvent {
-                        session: self.session_key.clone(),
+                        session: key,
                         message: *message,
                     },
                     seat_seq,
                 ));
             }
-            Err(error) => eprintln!("fix-gateway: seat event: {error}"),
-        }
-    }
-
-    fn flush_pending(&mut self) {
-        let Some(epoch) = self.epoch else {
-            return;
-        };
-        while let Some(command) = self.pending.pop_front() {
-            let bytes = encode_command(&command);
-            self.cluster
-                .seat_command(self.session.seat_id(), epoch, &bytes);
+            Err(error) => eprintln!("fix-gateway: seat {seat_id} event: {error}"),
         }
     }
 
@@ -155,11 +183,15 @@ impl SeatFixEngine {
         format!("GW-{}", self.local_exec)
     }
 
-    fn reject_new(&mut self, order: &NewOrderSingle, text: String) {
+    fn reject_new(&mut self, seat_id: u16, order: &NewOrderSingle, text: String) {
+        let Some(runtime) = self.runtime(seat_id) else {
+            return;
+        };
+        let session_key = runtime.key.clone();
         let exec_id = self.local_exec_id();
         self.events.push_back((
             SessionEvent {
-                session: self.session_key.clone(),
+                session: session_key,
                 message: ApplicationMessage::ExecutionReport(ExecutionReport {
                     exec_id,
                     order_id: "NONE".to_owned(),
@@ -186,14 +218,19 @@ impl SeatFixEngine {
 
     fn reject_cancel(
         &mut self,
+        seat_id: u16,
         cl_ord_id: &str,
         orig_cl_ord_id: &str,
         is_replace: bool,
         text: String,
     ) {
+        let Some(runtime) = self.runtime(seat_id) else {
+            return;
+        };
+        let session_key = runtime.key.clone();
         self.events.push_back((
             SessionEvent {
-                session: self.session_key.clone(),
+                session: session_key,
                 message: ApplicationMessage::OrderCancelReject(OrderCancelReject {
                     order_id: "NONE".to_owned(),
                     cl_ord_id: cl_ord_id.to_owned(),
@@ -212,8 +249,10 @@ impl SeatFixEngine {
         ));
     }
 
-    fn account(&self, value: Option<&str>) -> Result<AccountId, String> {
-        let seat_account = self.session.account_id();
+    fn account(&self, seat_id: u16, value: Option<&str>) -> Result<AccountId, String> {
+        let seat_account = self
+            .runtime(seat_id)
+            .map_or(0, |runtime| runtime.session.account_id());
         let Some(value) = value else {
             return Ok(seat_account);
         };
@@ -232,13 +271,23 @@ impl SeatFixEngine {
     }
 
     fn symbol(&self, value: &str) -> Result<u16, String> {
-        if value == self.symbol_name {
-            return Ok(self.symbol_id);
+        let symbol_id = self
+            .seats
+            .values()
+            .next()
+            .map_or(1, |runtime| runtime.session.symbol_id());
+        let symbol_name = self
+            .seats
+            .values()
+            .next()
+            .map_or("", |runtime| runtime.session.symbol_name());
+        if value == symbol_name {
+            return Ok(symbol_id);
         }
         value
             .parse::<u16>()
             .ok()
-            .filter(|symbol| *symbol == self.symbol_id)
+            .filter(|symbol| *symbol == symbol_id)
             .ok_or_else(|| format!("unknown symbol '{value}'"))
     }
 
@@ -269,8 +318,8 @@ impl SeatFixEngine {
         }
     }
 
-    fn map_new(&self, order: &NewOrderSingle) -> Result<Command, String> {
-        let account = self.account(order.account.as_deref())?;
+    fn map_new(&self, seat_id: u16, order: &NewOrderSingle) -> Result<Command, String> {
+        let account = self.account(seat_id, order.account.as_deref())?;
         let symbol = self.symbol(&order.symbol)?;
         let cl_ord_id = Self::client_order_id(&order.cl_ord_id)?;
         if order.order_qty <= 0 {
@@ -289,8 +338,10 @@ impl SeatFixEngine {
         }))
     }
 
-    fn map_cancel(&self, request: &OrderCancelRequest) -> Result<Command, String> {
-        let account = self.session.account_id();
+    fn map_cancel(&self, seat_id: u16, request: &OrderCancelRequest) -> Result<Command, String> {
+        let account = self
+            .runtime(seat_id)
+            .map_or(0, |runtime| runtime.session.account_id());
         let cl_ord_id = Self::client_order_id(&request.cl_ord_id)?;
         let orig_cl_ord_id = Self::client_order_id(&request.orig_cl_ord_id)?;
         Ok(Command::CancelOrder(CancelOrder {
@@ -300,8 +351,12 @@ impl SeatFixEngine {
         }))
     }
 
-    fn map_replace(&self, request: &OrderCancelReplaceRequest) -> Result<Command, String> {
-        let account = self.account(request.account.as_deref())?;
+    fn map_replace(
+        &self,
+        seat_id: u16,
+        request: &OrderCancelReplaceRequest,
+    ) -> Result<Command, String> {
+        let account = self.account(seat_id, request.account.as_deref())?;
         let symbol = self.symbol(&request.symbol)?;
         let _ = symbol;
         let cl_ord_id = Self::client_order_id(&request.cl_ord_id)?;
@@ -322,18 +377,35 @@ impl SeatFixEngine {
     }
 }
 
+fn runtime(seat: &SeatConfig, key: SessionKey, symbol_id: u16, symbol_name: &str) -> SeatRuntime {
+    let last = latest(&seat.journal_dir)
+        .ok()
+        .flatten()
+        .map_or(0, |(_, last)| last);
+    SeatRuntime {
+        key,
+        session: FixSeatSession::new(seat.clone(), symbol_id, symbol_name),
+        bind: (seat.seat_id, seat.account_id, last),
+        bind_pending: false,
+        epoch: None,
+        pending: VecDeque::new(),
+        returned_seq: 0,
+    }
+}
+
 impl CommandSink for SeatFixEngine {
     fn deliver(&mut self, session: &SessionKey, message: ApplicationMessage) {
-        if session != &self.session_key {
+        let Some(&seat_id) = self.keys.get(session) else {
             return;
-        }
+        };
         if !self.cluster.is_connected() {
             match &message {
                 ApplicationMessage::NewOrderSingle(order) => {
-                    self.reject_new(order, "cluster unavailable".to_owned());
+                    self.reject_new(seat_id, order, "cluster unavailable".to_owned());
                 }
                 ApplicationMessage::OrderCancelRequest(request) => {
                     self.reject_cancel(
+                        seat_id,
                         &request.cl_ord_id,
                         &request.orig_cl_ord_id,
                         false,
@@ -342,6 +414,7 @@ impl CommandSink for SeatFixEngine {
                 }
                 ApplicationMessage::OrderCancelReplaceRequest(request) => {
                     self.reject_cancel(
+                        seat_id,
                         &request.cl_ord_id,
                         &request.orig_cl_ord_id,
                         true,
@@ -352,63 +425,109 @@ impl CommandSink for SeatFixEngine {
             }
             return;
         }
-        self.ensure_bound();
-        match message {
-            ApplicationMessage::NewOrderSingle(order) => match self.map_new(&order) {
-                Ok(command) => self.pending.push_back(command),
+        self.ensure_bound(seat_id);
+        let command = match message {
+            ApplicationMessage::NewOrderSingle(order) => match self.map_new(seat_id, &order) {
+                Ok(command) => Some(command),
                 Err(text) => {
-                    self.reject_new(&order, text);
-                    return;
+                    self.reject_new(seat_id, &order, text);
+                    None
                 }
             },
-            ApplicationMessage::OrderCancelRequest(request) => match self.map_cancel(&request) {
-                Ok(command) => self.pending.push_back(command),
-                Err(text) => {
-                    self.reject_cancel(&request.cl_ord_id, &request.orig_cl_ord_id, false, text);
-                    return;
-                }
-            },
-            ApplicationMessage::OrderCancelReplaceRequest(request) => {
-                match self.map_replace(&request) {
-                    Ok(command) => self.pending.push_back(command),
+            ApplicationMessage::OrderCancelRequest(request) => {
+                match self.map_cancel(seat_id, &request) {
+                    Ok(command) => Some(command),
                     Err(text) => {
-                        self.reject_cancel(&request.cl_ord_id, &request.orig_cl_ord_id, true, text);
-                        return;
+                        self.reject_cancel(
+                            seat_id,
+                            &request.cl_ord_id,
+                            &request.orig_cl_ord_id,
+                            false,
+                            text,
+                        );
+                        None
                     }
                 }
             }
-            _ => {}
+            ApplicationMessage::OrderCancelReplaceRequest(request) => {
+                match self.map_replace(seat_id, &request) {
+                    Ok(command) => Some(command),
+                    Err(text) => {
+                        self.reject_cancel(
+                            seat_id,
+                            &request.cl_ord_id,
+                            &request.orig_cl_ord_id,
+                            true,
+                            text,
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some(command) = command {
+            if let Some(runtime) = self.runtime_mut(seat_id) {
+                runtime.pending.push_back(command);
+            }
+            self.flush_pending(seat_id);
         }
-        self.flush_pending();
     }
 
     fn flush(&mut self) {
-        self.flush_pending();
+        let seat_ids: Vec<u16> = self.seats.keys().copied().collect();
+        for seat_id in seat_ids {
+            self.ensure_bound(seat_id);
+            self.flush_pending(seat_id);
+        }
     }
 
     fn pending_commands(&self) -> usize {
-        self.pending
-            .len()
+        self.seats
+            .values()
+            .map(|runtime| runtime.pending.len())
+            .sum::<usize>()
             .saturating_add(self.cluster.pending_commands())
     }
 }
 
 impl EventSource for SeatFixEngine {
     fn poll_event(&mut self) -> Option<SessionEvent> {
-        if !self.cluster.is_connected() {
-            self.epoch = None;
-            self.bind_pending = false;
-        } else if self.epoch.is_none() && !self.pending.is_empty() {
-            self.ensure_bound();
+        let connected = self.cluster.is_connected();
+        let seat_ids: Vec<u16> = self.seats.keys().copied().collect();
+        for seat_id in &seat_ids {
+            if !connected {
+                if let Some(runtime) = self.runtime_mut(*seat_id) {
+                    runtime.epoch = None;
+                    runtime.bind_pending = false;
+                }
+            } else {
+                let has_pending = self
+                    .runtime(*seat_id)
+                    .is_some_and(|runtime| !runtime.pending.is_empty());
+                if has_pending {
+                    self.ensure_bound(*seat_id);
+                }
+            }
         }
-        // Ack what the acceptor returned on the previous call: by now the FIX
-        // session has journaled (and sent) that message.
-        if let Ok(Some(ack)) = self.session.ack_due(self.returned_seq) {
+        let mut acks = Vec::new();
+        for seat_id in &seat_ids {
+            if let Some(runtime) = self.runtime_mut(*seat_id) {
+                if let Ok(Some(ack)) = runtime.session.ack_due(runtime.returned_seq) {
+                    acks.push(ack);
+                }
+            }
+        }
+        for ack in acks {
             self.cluster.ack(ack.seat_id, ack.epoch, ack.up_to_seq);
         }
         if let Some((event, seat_seq)) = self.events.pop_front() {
             if seat_seq > 0 {
-                self.returned_seq = seat_seq;
+                if let Some(seat_id) = self.keys.get(&event.session).copied() {
+                    if let Some(runtime) = self.runtime_mut(seat_id) {
+                        runtime.returned_seq = seat_seq;
+                    }
+                }
             }
             return Some(event);
         }
@@ -418,21 +537,29 @@ impl EventSource for SeatFixEngine {
                 SeatEgress::Event(event) => self.on_event(event),
                 SeatEgress::Rejected(rejected) => {
                     eprintln!("fix-gateway: seat {} bind rejected", rejected.seat_id);
-                    self.bind_pending = false;
+                    if let Some(runtime) = self.runtime_mut(rejected.seat_id) {
+                        runtime.bind_pending = false;
+                    }
                 }
                 SeatEgress::Fenced(fenced) => {
                     eprintln!("fix-gateway: seat {} fenced", fenced.seat_id);
-                    self.session.mark_unbound();
-                    self.epoch = None;
-                    self.bind_pending = false;
-                    self.returned_seq = 0;
+                    if let Some(runtime) = self.runtime_mut(fenced.seat_id) {
+                        runtime.session.mark_unbound();
+                        runtime.epoch = None;
+                        runtime.bind_pending = false;
+                        runtime.returned_seq = 0;
+                    }
                 }
             }
         }
         let popped = self.events.pop_front();
-        if let Some((_, seat_seq)) = &popped {
+        if let Some((event, seat_seq)) = &popped {
             if *seat_seq > 0 {
-                self.returned_seq = *seat_seq;
+                if let Some(seat_id) = self.keys.get(&event.session).copied() {
+                    if let Some(runtime) = self.runtime_mut(seat_id) {
+                        runtime.returned_seq = *seat_seq;
+                    }
+                }
             }
         }
         popped.map(|(event, _)| event)

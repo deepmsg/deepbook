@@ -521,6 +521,10 @@ impl EngineService {
         {
             return;
         }
+        eprintln!(
+            "engine: seat {} bind epoch {} resync {} replay {} next {}",
+            message.seat_id, epoch, resync, replay_from, next_seq
+        );
         if let Some(previous) = previous_session {
             if previous != session {
                 self.queue_control(
@@ -635,7 +639,14 @@ impl EngineService {
         {
             return;
         }
-        seat.ack(message.up_to_seq);
+        let effective = seat.ack(message.up_to_seq);
+        eprintln!(
+            "engine: seat {} ack {} -> {} acked {}",
+            message.seat_id,
+            message.up_to_seq,
+            effective,
+            seat.acked_seq()
+        );
     }
 
     fn reject_malformed(&mut self, session: SessionId, message: RejectMalformed) {
@@ -705,6 +716,7 @@ impl EngineService {
     }
 
     fn overflow_seat(&mut self, seat_id: u16) {
+        eprintln!("engine: seat {seat_id} outbox overflow");
         let Some(epoch) = self.seats.get_mut(&seat_id).map(|seat| {
             seat.overflow();
             seat.epoch()

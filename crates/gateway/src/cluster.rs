@@ -917,6 +917,10 @@ pub struct SeatClusterEngine {
     egress: Rc<RefCell<VecDeque<EgressRecord>>>,
     decoded: VecDeque<SeatEgress>,
     commands: VecDeque<Vec<u8>>,
+    /// Binds, acks and malformed rejects. They may overtake queued commands:
+    /// an ack only covers events the service already emitted, and a bind must
+    /// precede the commands that use its epoch.
+    control: VecDeque<Vec<u8>>,
     /// `seat_id -> (account_id, last journaled seat_seq)` for reconnect.
     rebind: BTreeMap<u16, (u32, u64)>,
     sessions_opened: u16,
@@ -980,6 +984,7 @@ impl SeatClusterEngine {
             egress,
             decoded: VecDeque::new(),
             commands: VecDeque::new(),
+            control: VecDeque::new(),
             rebind: BTreeMap::new(),
             sessions_opened: 1,
             last_keep_alive: Instant::now(),
@@ -1003,13 +1008,13 @@ impl SeatClusterEngine {
     /// How many ingress envelopes are waiting.
     #[must_use]
     pub fn pending_commands(&self) -> usize {
-        self.commands.len()
+        self.commands.len().saturating_add(self.control.len())
     }
 
     /// Bind a seat; the call is queued like every other ingress.
     pub fn bind(&mut self, seat_id: u16, account_id: u32, last_journal_seq: u64) {
         self.rebind.insert(seat_id, (account_id, last_journal_seq));
-        self.queue_ingress(
+        self.queue_control(
             Ingress::BindSeat(BindSeat {
                 seat_id,
                 account_id,
@@ -1036,7 +1041,7 @@ impl SeatClusterEngine {
         if let Some((_, last)) = self.rebind.get_mut(&seat_id) {
             *last = (*last).max(up_to_seq);
         }
-        self.queue_ingress(
+        self.queue_control(
             Ingress::AckSeat(AckSeat {
                 seat_id,
                 epoch,
@@ -1056,7 +1061,7 @@ impl SeatClusterEngine {
         is_cancel_or_replace: bool,
         reason: u8,
     ) {
-        self.queue_ingress(
+        self.queue_control(
             Ingress::RejectMalformed(RejectMalformed {
                 seat_id,
                 epoch,
@@ -1072,7 +1077,7 @@ impl SeatClusterEngine {
     /// Release a seat's binding.
     pub fn unbind_seat(&mut self, seat_id: u16, epoch: u64, reason: u8) {
         self.rebind.remove(&seat_id);
-        self.queue_ingress(
+        self.queue_control(
             Ingress::UnbindSeat(UnbindSeat {
                 seat_id,
                 epoch,
@@ -1104,6 +1109,22 @@ impl SeatClusterEngine {
                 }
             }
             Err(error) => eprintln!("ouch-gateway: service ingress: {error}"),
+        }
+    }
+
+    fn queue_control(
+        &mut self,
+        message: Result<Vec<u8>, deepbook_engine_cluster::envelope::EnvelopeError>,
+    ) {
+        match message {
+            Ok(payload) => {
+                if self.control.len() >= MAX_PENDING_COMMANDS {
+                    eprintln!("ouch-gateway: cluster control queue is full; dropping a frame");
+                } else {
+                    self.control.push_back(payload);
+                }
+            }
+            Err(error) => eprintln!("ouch-gateway: service control: {error}"),
         }
     }
 
@@ -1202,7 +1223,7 @@ impl SeatClusterEngine {
             .map(|(seat_id, (account_id, last))| (*seat_id, *account_id, *last))
             .collect();
         for (seat_id, account_id, last_journal_seq) in rebinds {
-            self.queue_ingress(
+            self.queue_control(
                 Ingress::BindSeat(BindSeat {
                     seat_id,
                     account_id,
@@ -1217,26 +1238,28 @@ impl SeatClusterEngine {
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        while let Some(command) = self.commands.front() {
-            match session.offer(&mut self.client, command) {
-                Some(Appended::Ok { .. }) => {
-                    self.commands.pop_front();
-                }
-                Some(
-                    Appended::EndOfLog
-                    | Appended::MidRotation
-                    | Appended::BackPressured
-                    | Appended::NotConnected,
-                )
-                | None => break,
-                Some(Appended::MaxPositionExceeded)
-                | Some(Appended::MessageTooLarge)
-                | Some(Appended::Malformed) => {
-                    let command = self.commands.pop_front().expect("observed");
-                    eprintln!(
-                        "ouch-gateway: dropping a {} byte envelope the cluster refused",
-                        command.len()
-                    );
+        for queue in [&mut self.control, &mut self.commands] {
+            while let Some(command) = queue.front() {
+                match session.offer(&mut self.client, command) {
+                    Some(Appended::Ok { .. }) => {
+                        queue.pop_front();
+                    }
+                    Some(
+                        Appended::EndOfLog
+                        | Appended::MidRotation
+                        | Appended::BackPressured
+                        | Appended::NotConnected,
+                    )
+                    | None => return,
+                    Some(Appended::MaxPositionExceeded)
+                    | Some(Appended::MessageTooLarge)
+                    | Some(Appended::Malformed) => {
+                        let command = queue.pop_front().expect("observed");
+                        eprintln!(
+                            "ouch-gateway: dropping a {} byte envelope the cluster refused",
+                            command.len()
+                        );
+                    }
                 }
             }
         }

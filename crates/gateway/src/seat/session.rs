@@ -187,6 +187,7 @@ pub struct SeatSession {
     generation: u64,
     bound: bool,
     last_applied_seq: u64,
+    acked_seq: u64,
     next_seq: u64,
     unacked: u64,
     last_ack: Instant,
@@ -203,6 +204,7 @@ impl SeatSession {
             generation: 0,
             bound: false,
             last_applied_seq: 0,
+            acked_seq: 0,
             next_seq: 1,
             unacked: 0,
             last_ack: Instant::now(),
@@ -257,7 +259,7 @@ impl SeatSession {
                 found: bound.seat_id,
             });
         }
-        let journal = SeatJournal::open(&self.config.journal_dir, bound.generation)?;
+        let journal = SeatJournal::open_with_sync(&self.config.journal_dir, bound.generation, 64)?;
         self.last_applied_seq = journal.oldest_seq().map_or_else(
             || bound.replay_from_seq.saturating_sub(1),
             |_| journal.next_seq().saturating_sub(1),
@@ -267,6 +269,7 @@ impl SeatSession {
         self.generation = bound.generation;
         self.next_seq = bound.next_seq;
         self.bound = true;
+        self.acked_seq = self.last_applied_seq;
         self.unacked = 0;
         self.last_ack = Instant::now();
         Ok(BoundOutcome {
@@ -404,12 +407,21 @@ impl SeatSession {
         if self.unacked < ACK_BATCH && self.last_ack.elapsed() < ACK_INTERVAL {
             return Ok(None);
         }
+        let journal = self.journal.as_mut().ok_or(SeatSessionError::NotBound)?;
+        journal.sync()?;
+        let durable = journal.synced_seq().min(self.last_applied_seq);
+        if durable <= self.acked_seq {
+            self.unacked = 0;
+            self.last_ack = Instant::now();
+            return Ok(None);
+        }
+        self.acked_seq = durable;
         self.unacked = 0;
         self.last_ack = Instant::now();
         Ok(Some(AckSeat {
             seat_id: self.config.seat_id,
             epoch: self.epoch,
-            up_to_seq: self.last_applied_seq,
+            up_to_seq: durable,
         }))
     }
 

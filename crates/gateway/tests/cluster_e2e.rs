@@ -419,6 +419,12 @@ impl Harness {
             "1".to_owned(),
             "--backend".to_owned(),
             self.backend.clone(),
+            "--tick-us".to_owned(),
+            "200".to_owned(),
+            "--journal-sync".to_owned(),
+            "batch".to_owned(),
+            "--journal-batch".to_owned(),
+            "64".to_owned(),
             "--new-leader-timeout-ms".to_owned(),
             "4000".to_owned(),
             // Tests run in parallel and their own harness owns no metrics
@@ -473,6 +479,8 @@ impl Harness {
             seats.display().to_string(),
             "--backend".to_owned(),
             self.backend.clone(),
+            "--tick-us".to_owned(),
+            "200".to_owned(),
         ];
         self.ouch_gateway = Some(spawn(binary, &args, &log)?);
         let deadline = Instant::now() + READY_TIMEOUT;
@@ -1162,6 +1170,78 @@ journal = "{}"
     assert_eq!(40, maker.cum_qty);
     assert_eq!(60, maker.leaves_qty);
 
+    let _ = std::fs::remove_dir_all(root);
+    let _ = &mut harness;
+}
+
+#[test]
+#[ignore = "starts a media driver, a cluster node, two gateways and four bench arms"]
+fn the_fix_vs_ouch_abba_runs() {
+    let root = std::env::temp_dir().join(format!("deepbook-e2e-abba-{}", std::process::id()));
+    let token = "cd".repeat(32);
+    let seats = format!(
+        r#"
+[[seat]]
+seat_id = 1
+account_id = 11
+protocol = "fix"
+sender = "DEEPBOOK"
+target = "CLIENT"
+journal = "{}"
+
+[[seat]]
+seat_id = 2
+account_id = 12
+protocol = "ouch"
+token = "{token}"
+journal = "{}"
+"#,
+        root.join("fix-1").display(),
+        root.join("ouch-2").display()
+    );
+    let Some(mut harness) = Harness::start_inner("epoll", 26_500, Some(&seats)) else {
+        eprintln!("SKIPPED: the deepmsg or engine-container binaries are not built");
+        return;
+    };
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/protocol-abba.sh");
+    if !script.is_file() {
+        eprintln!("SKIPPED: {} is not present", script.display());
+        return;
+    }
+    let rate = std::env::var("ABBA_RATE").unwrap_or_else(|_| "10000".to_owned());
+    let samples = std::env::var("ABBA_SAMPLES").unwrap_or_else(|_| "100000".to_owned());
+    let warmup = std::env::var("ABBA_WARMUP").unwrap_or_else(|_| "5000".to_owned());
+    let output = Process::new("bash")
+        .arg(&script)
+        .args([
+            "--fix-addr",
+            &harness.gateway_addr.to_string(),
+            "--ouch-addr",
+            &harness.ouch_addr.to_string(),
+            "--seat",
+            "2",
+            "--token",
+            &token,
+            "--fix-account",
+            "11",
+            "--rate",
+            &rate,
+            "--samples",
+            &samples,
+            "--warmup",
+            &warmup,
+            "--out",
+            &harness.root.join("abba").display().to_string(),
+        ])
+        .output()
+        .expect("run protocol-abba.sh");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "protocol-abba.sh failed with {}",
+        output.status
+    );
     let _ = std::fs::remove_dir_all(root);
     let _ = &mut harness;
 }

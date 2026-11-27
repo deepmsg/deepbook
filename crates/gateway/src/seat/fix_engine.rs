@@ -30,6 +30,11 @@ use crate::seat::fix_session::{FixEventOutcome, FixSeatSession};
 use crate::seat::journal::latest;
 use crate::sink::{CommandSink, EventSource, SessionEvent, SessionKey};
 
+/// Cluster egress frames handled per `poll_event` call. Without a bound, a
+/// busy service keeps the acceptor inside this loop for the whole run and the
+/// FIX reports only reach the socket when the burst ends.
+const MAX_EGRESS_PER_CALL: usize = 64;
+
 /// One configured FIX seat's runtime.
 struct SeatRuntime {
     key: SessionKey,
@@ -146,6 +151,10 @@ impl SeatFixEngine {
         else {
             return;
         };
+        eprintln!(
+            "fix-gateway: seat {seat_id} bound epoch {} next {}",
+            outcome.epoch, outcome.next_seq
+        );
         if let Some(runtime) = self.runtime_mut(seat_id) {
             runtime.epoch = Some(outcome.epoch);
             runtime.bind_pending = false;
@@ -531,7 +540,10 @@ impl EventSource for SeatFixEngine {
             }
             return Some(event);
         }
-        while let Some(egress) = self.cluster.poll_egress() {
+        for _ in 0..MAX_EGRESS_PER_CALL {
+            let Some(egress) = self.cluster.poll_egress() else {
+                break;
+            };
             match egress {
                 SeatEgress::Bound(bound) => self.on_bound(bound),
                 SeatEgress::Event(event) => self.on_event(event),
@@ -542,7 +554,10 @@ impl EventSource for SeatFixEngine {
                     }
                 }
                 SeatEgress::Fenced(fenced) => {
-                    eprintln!("fix-gateway: seat {} fenced", fenced.seat_id);
+                    eprintln!(
+                        "fix-gateway: seat {} fenced epoch {} reason {}",
+                        fenced.seat_id, fenced.new_epoch, fenced.reason
+                    );
                     if let Some(runtime) = self.runtime_mut(fenced.seat_id) {
                         runtime.session.mark_unbound();
                         runtime.epoch = None;

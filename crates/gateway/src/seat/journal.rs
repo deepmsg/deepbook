@@ -79,6 +79,9 @@ pub struct SeatJournal {
     file: File,
     oldest: Option<u64>,
     next: u64,
+    sync_every: u32,
+    unsynced: u32,
+    synced: u64,
 }
 
 impl SeatJournal {
@@ -88,6 +91,20 @@ impl SeatJournal {
     ///
     /// [`SeatJournalError`] for an I/O failure or a corrupt record sequence.
     pub fn open(directory: impl AsRef<Path>, generation: u64) -> Result<Self, SeatJournalError> {
+        Self::open_with_sync(directory, generation, 1)
+    }
+
+    /// The same, syncing every `sync_every` appends; the tail is flushed by
+    /// [`Self::sync`] (an acknowledgement forces it).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open`].
+    pub fn open_with_sync(
+        directory: impl AsRef<Path>,
+        generation: u64,
+        sync_every: u32,
+    ) -> Result<Self, SeatJournalError> {
         let directory = directory.as_ref();
         fs::create_dir_all(directory).map_err(|source| SeatJournalError::Io {
             path: directory.to_path_buf(),
@@ -128,6 +145,9 @@ impl SeatJournal {
             file,
             oldest,
             next,
+            sync_every: sync_every.max(1),
+            unsynced: 0,
+            synced: next.saturating_sub(1),
         })
     }
 
@@ -177,12 +197,42 @@ impl SeatJournal {
             .write_all(&seat_seq.to_le_bytes())
             .and_then(|()| self.file.write_all(&length.to_le_bytes()))
             .and_then(|()| self.file.write_all(frame))
-            .and_then(|()| self.file.sync_data())
             .map_err(|source| SeatJournalError::Io {
                 path: self.path.clone(),
                 source,
             })?;
         self.next = seat_seq.saturating_add(1);
+        self.unsynced = self.unsynced.saturating_add(1);
+        if self.sync_every <= 1 || self.unsynced >= self.sync_every {
+            self.sync()?;
+        }
+        Ok(())
+    }
+
+    /// The last sequence known durable.
+    #[must_use]
+    pub const fn synced_seq(&self) -> u64 {
+        self.synced
+    }
+
+    /// Flush the unsynced tail.
+    ///
+    /// # Errors
+    ///
+    /// [`SeatJournalError`] for an I/O failure.
+    pub fn sync(&mut self) -> Result<(), SeatJournalError> {
+        if self.unsynced == 0 {
+            self.synced = self.synced.max(self.next.saturating_sub(1));
+            return Ok(());
+        }
+        self.file
+            .sync_data()
+            .map_err(|source| SeatJournalError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.unsynced = 0;
+        self.synced = self.next.saturating_sub(1);
         Ok(())
     }
 

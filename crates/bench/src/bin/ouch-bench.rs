@@ -217,7 +217,7 @@ fn run(options: &Options) -> Result<Report, String> {
     let _ = accepted;
 
     let started = Arc::new(Mutex::new(HashMap::<u64, Instant>::new()));
-    let (sender, receiver) = mpsc::channel::<(u64, bool)>();
+    let (sender, receiver) = mpsc::channel::<(u64, Instant, bool)>();
     let reader_stream = stream
         .try_clone()
         .map_err(|error| format!("clone socket: {error}"))?;
@@ -268,34 +268,44 @@ fn run(options: &Options) -> Result<Report, String> {
         started.lock().expect("sent map").insert(cl_ord_id, before);
         sent += 1;
 
-        while let Ok((id, was_rejected)) = receiver.try_recv() {
-            completed += 1;
-            if was_rejected {
-                rejected += 1;
-            }
+        while let Ok((id, completed_at, was_rejected)) = receiver.try_recv() {
             if let Some(t0) = started.lock().expect("sent map").remove(&id) {
-                if id > options.warmup {
-                    samples.push(t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+                completed += 1;
+                if was_rejected {
+                    rejected += 1;
                 }
+                if id > options.warmup {
+                    samples.push(
+                        completed_at
+                            .saturating_duration_since(t0)
+                            .as_nanos()
+                            .min(u128::from(u64::MAX)) as u64,
+                    );
+                }
+                last_completion = completed_at;
             }
-            last_completion = Instant::now();
         }
     }
 
     let deadline = started_time(first_send.unwrap_or(began)) + options.timeout;
     while completed < sent && Instant::now() < deadline {
         match receiver.recv_timeout(Duration::from_millis(50)) {
-            Ok((id, was_rejected)) => {
-                completed += 1;
-                if was_rejected {
-                    rejected += 1;
-                }
+            Ok((id, completed_at, was_rejected)) => {
                 if let Some(t0) = started.lock().expect("sent map").remove(&id) {
-                    if id > options.warmup {
-                        samples.push(t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+                    completed += 1;
+                    if was_rejected {
+                        rejected += 1;
                     }
+                    if id > options.warmup {
+                        samples.push(
+                            completed_at
+                                .saturating_duration_since(t0)
+                                .as_nanos()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
+                    }
+                    last_completion = completed_at;
                 }
-                last_completion = Instant::now();
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
@@ -330,6 +340,7 @@ fn read_message(
     decoder: &mut Vec<u8>,
     buffer: &mut [u8],
 ) -> Result<(Message, usize), String> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match wire::decode(decoder) {
             Ok((message, used)) => {
@@ -339,15 +350,23 @@ fn read_message(
             Err(wire::FrameError::Truncated) => {}
             Err(error) => return Err(error.to_string()),
         }
-        let count = stream.read(buffer).map_err(|error| error.to_string())?;
-        if count == 0 {
-            return Err("connection closed during login".to_owned());
+        match stream.read(buffer) {
+            Ok(0) => return Err("connection closed during login".to_owned()),
+            Ok(count) => decoder.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= deadline {
+                    return Err("login timed out".to_owned());
+                }
+            }
+            Err(error) => return Err(error.to_string()),
         }
-        decoder.extend_from_slice(&buffer[..count]);
     }
 }
 
-fn reader_loop(mut stream: TcpStream, sender: mpsc::Sender<(u64, bool)>) {
+fn reader_loop(mut stream: TcpStream, sender: mpsc::Sender<(u64, Instant, bool)>) {
     let mut decoder = Vec::new();
     let mut buffer = [0_u8; 8192];
     loop {
@@ -363,7 +382,7 @@ fn reader_loop(mut stream: TcpStream, sender: mpsc::Sender<(u64, bool)>) {
                     Message::Logout { .. } => return,
                     _ => continue,
                 };
-                if sender.send((id, was_rejected)).is_err() {
+                if sender.send((id, Instant::now(), was_rejected)).is_err() {
                     return;
                 }
                 continue;
@@ -372,8 +391,12 @@ fn reader_loop(mut stream: TcpStream, sender: mpsc::Sender<(u64, bool)>) {
             Err(_) => return,
         }
         match stream.read(&mut buffer) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
             Ok(count) => decoder.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return,
         }
     }
 }

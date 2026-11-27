@@ -8,7 +8,7 @@
 #
 #   deploy/protocol-abba.sh --fix-addr 127.0.0.1:9876 \
 #       --ouch-addr 127.0.0.1:9880 --seat 1 --token <64 hex> \
-#       [--fix-sender CLIENT --fix-target DEEPBOOK] \
+#       [--fix-sender CLIENT --fix-target DEEPBOOK --fix-account 11] \
 #       [--rate 10000] [--samples 100000] [--warmup 5000] [--out DIR]
 #
 # Build first:
@@ -22,6 +22,7 @@ SEAT=""
 TOKEN=""
 FIX_SENDER=CLIENT
 FIX_TARGET=DEEPBOOK
+FIX_ACCOUNT=11
 RATE=10000
 SAMPLES=100000
 WARMUP=5000
@@ -37,6 +38,7 @@ while [ $# -gt 0 ]; do
         --token) TOKEN=$2; shift 2 ;;
         --fix-sender) FIX_SENDER=$2; shift 2 ;;
         --fix-target) FIX_TARGET=$2; shift 2 ;;
+        --fix-account) FIX_ACCOUNT=$2; shift 2 ;;
         --rate) RATE=$2; shift 2 ;;
         --samples) SAMPLES=$2; shift 2 ;;
         --warmup) WARMUP=$2; shift 2 ;;
@@ -59,7 +61,8 @@ done
 mkdir -p "$OUT"
 run_fix() {
     "$FIX_BENCH" --connect "$FIX_ADDR" --sender "$FIX_SENDER" --target "$FIX_TARGET" \
-        --rate "$RATE" --samples "$SAMPLES" --warmup "$WARMUP" --json > "$OUT/$1.json"
+        --account "$FIX_ACCOUNT" --rate "$RATE" --samples "$SAMPLES" --warmup "$WARMUP" \
+        --json > "$OUT/$1.json"
 }
 run_ouch() {
     "$OUCH_BENCH" --connect "$OUCH_ADDR" --seat "$SEAT" --token "$TOKEN" \

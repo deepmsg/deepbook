@@ -197,7 +197,7 @@ impl FixSeatSession {
                 found: bound.seat_id,
             });
         }
-        let journal = SeatJournal::open(&self.config.journal_dir, bound.generation)?;
+        let journal = SeatJournal::open_with_sync(&self.config.journal_dir, bound.generation, 64)?;
         self.last_applied_seq = journal.oldest_seq().map_or_else(
             || bound.replay_from_seq.saturating_sub(1),
             |_| journal.next_seq().saturating_sub(1),
@@ -300,12 +300,22 @@ impl FixSeatSession {
         {
             return Ok(None);
         }
-        self.acked_seq = effective;
+        let journal = self.journal.as_mut().ok_or(FixSeatError::NotBound)?;
+        journal.sync()?;
+        let durable = journal
+            .synced_seq()
+            .min(self.last_applied_seq)
+            .min(up_to_seq);
+        if durable <= self.acked_seq {
+            self.last_ack = Instant::now();
+            return Ok(None);
+        }
+        self.acked_seq = durable;
         self.last_ack = Instant::now();
         Ok(Some(AckSeat {
             seat_id: self.config.seat_id,
             epoch: self.epoch,
-            up_to_seq: effective,
+            up_to_seq: durable,
         }))
     }
 

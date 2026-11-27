@@ -10,12 +10,17 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod fix_engine;
+pub mod fix_render;
+pub mod fix_session;
 pub mod gateway;
 pub mod journal;
 pub mod render;
 pub mod session;
 
 pub use config::{SeatConfig, SeatConfigError, SeatProtocol, SeatRegistry};
+pub use fix_engine::SeatFixEngine;
+pub use fix_session::{FixEventOutcome, FixSeatError, FixSeatSession};
 pub use gateway::{SeatGateway, SeatGatewayConfig};
 pub use journal::{SeatJournal, SeatJournalError, latest as latest_journal};
 pub use render::{RenderError, render_event};

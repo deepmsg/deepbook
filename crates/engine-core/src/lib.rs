@@ -21,6 +21,7 @@
 //! are M4; market-data fan-out is M3.
 #![forbid(unsafe_code)]
 
+mod band;
 pub mod book;
 pub mod command;
 pub mod engine;

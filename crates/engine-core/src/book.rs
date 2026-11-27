@@ -107,12 +107,15 @@ pub(crate) struct PriceLevel {
 }
 
 impl PriceLevel {
+    /// An empty level: no quantity and no orders.
+    pub(crate) const EMPTY: Self = Self {
+        total_qty: 0,
+        head: EMPTY_SLOT,
+        tail: EMPTY_SLOT,
+    };
+
     fn empty() -> Self {
-        Self {
-            total_qty: 0,
-            head: EMPTY_SLOT,
-            tail: EMPTY_SLOT,
-        }
+        Self::EMPTY
     }
 }
 

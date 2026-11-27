@@ -11,10 +11,12 @@ pub mod envelope;
 pub mod metrics;
 pub mod obs;
 pub mod outbox;
+pub mod seats;
 pub mod service;
 pub mod snapshot;
 
 pub use metrics::EngineMetrics;
 pub use outbox::{OutboxEntry, SeatOutbox, SeatSnapshot};
+pub use seats::{SeatConfig, SeatConfigError, SeatProtocol, SeatRegistry};
 pub use service::{EngineService, MarketDataConfig, ServiceError};
 pub use snapshot::{CodecError, ServiceSnapshot, decode, decode_service, encode, encode_service};

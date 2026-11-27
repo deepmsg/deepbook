@@ -17,6 +17,10 @@
 //! | `deepbook.risk.max-open-orders` | unlimited |
 //! | `deepbook.risk.self-trade` | `none` |
 //! | `deepbook.metrics.bind` | `127.0.0.1:26100` (`off` serves nothing) |
+//! | `deepbook.seats` | off (legacy single peer) |
+//!
+//! With `deepbook.seats` the file must parse as `seats.toml` and
+//! `deepbook.risk.max-open-orders` must be at most 4096.
 //!
 //! Every `deepbook.*` value is parsed strictly: a malformed limit stops the
 //! container instead of silently falling back to "unlimited". The limits are
@@ -40,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use deepbook_engine_cluster::metrics as engine_metrics;
 use deepbook_engine_cluster::obs::{self, COMPONENTS, Engine as EngineComponent};
-use deepbook_engine_cluster::{EngineService, MarketDataConfig};
+use deepbook_engine_cluster::{EngineService, MarketDataConfig, SeatRegistry};
 use deepbook_engine_core::{EngineConfig, RiskConfig, SelfTradePrevention};
 use deepbook_marketdata::{DeepmsgConfig, DeepmsgRecoveryResponder};
 use deepbook_types::{Price, Qty};
@@ -68,7 +72,8 @@ deepbook.engine.recent-window. The pre-trade limits are deepbook.risk.max-order-
 deepbook.risk.max-notional, deepbook.risk.price-band-ticks,
 deepbook.risk.fat-finger-ticks, deepbook.risk.reference-price,
 deepbook.risk.max-open-orders and deepbook.risk.self-trade (none, cancel-resting
-or reject-taker). A malformed value is refused at startup. The media driver and
+or reject-taker). deepbook.seats names the shared seat registry; with it,
+max-open-orders must be at most 4096. A malformed value is refused at startup. The media driver and
 the archive are separate processes in the same -Daeron.dir.";
 
 fn main() -> ExitCode {
@@ -121,6 +126,7 @@ fn run() -> Result<(), String> {
     })?;
     let engine_config = engine_config(&properties)?;
     println!("{NAME}: {}", describe_risk(&engine_config.risk));
+    let seats = seat_registry(&properties)?;
     let service = if property(&properties, "deepbook.marketdata.enabled", true)? {
         // deepmsg's own `ServiceContainerConfig` still calls it `aeron_dir`;
         // the name is the dependency's, not this tree's.
@@ -163,6 +169,12 @@ fn run() -> Result<(), String> {
         service
     } else {
         EngineService::new(engine_config)
+    };
+    let service = match seats {
+        Some(registry) => service
+            .with_seats(registry)
+            .map_err(|error| error.to_string())?,
+        None => service,
     };
 
     sys::set_current_thread_name("deepbook-engine")
@@ -362,6 +374,23 @@ fn optional<T: std::str::FromStr>(
             .map(Some)
             .map_err(|_| format!("{name}={value} is not a valid value")),
     }
+}
+
+fn seat_registry(properties: &Properties) -> Result<Option<SeatRegistry>, String> {
+    let path = property_string(properties, "deepbook.seats", "");
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("deepbook.seats={path}: {error}"))?;
+    let registry =
+        SeatRegistry::parse(&text).map_err(|error| format!("deepbook.seats={path}: {error}"))?;
+    println!(
+        "{NAME}: seats path={path} hash={:016x} count={}",
+        SeatRegistry::config_hash(&text),
+        registry.len()
+    );
+    Ok(Some(registry))
 }
 
 fn property_string(properties: &Properties, name: &str, default: &str) -> String {

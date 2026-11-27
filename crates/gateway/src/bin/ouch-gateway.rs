@@ -34,6 +34,11 @@ fn run() -> Result<(), String> {
     let text = std::fs::read_to_string(&options.seats)
         .map_err(|error| format!("{}: {error}", options.seats.display()))?;
     let registry = SeatRegistry::parse(&text).map_err(|error| error.to_string())?;
+    println!(
+        "ouch-gateway seats hash={:016x} count={}",
+        SeatRegistry::config_hash(&text),
+        registry.len()
+    );
     if registry.is_empty() {
         return Err(format!("{} has no seats", options.seats.display()));
     }

@@ -38,6 +38,7 @@ use crate::obs;
 use crate::outbox::{
     MAX_TOTAL_OUTBOX_BYTES, SeatOutbox, SeatSnapshot, eviction_plan, total_buffered_bytes,
 };
+use crate::seats::SeatRegistry;
 use crate::snapshot::{
     CodecError, DBS3_MAGIC, ServiceSnapshot, decode, decode_service, encode, encode_service,
 };
@@ -53,6 +54,8 @@ pub enum ServiceError {
     Snapshot(deepbook_engine_core::SnapshotError),
     /// The market-data transport is unavailable.
     MarketData(String),
+    /// The deployment configuration is refused.
+    Configuration(String),
 }
 
 impl fmt::Display for ServiceError {
@@ -62,6 +65,7 @@ impl fmt::Display for ServiceError {
             Self::Codec(error) => write!(formatter, "{error}"),
             Self::Snapshot(error) => write!(formatter, "{error}"),
             Self::MarketData(detail) => write!(formatter, "market data: {detail}"),
+            Self::Configuration(detail) => write!(formatter, "configuration: {detail}"),
         }
     }
 }
@@ -119,6 +123,8 @@ pub struct EngineService {
     pending_egress: HashMap<SessionId, VecDeque<Vec<u8>>>,
     /// The seats the service has pinned (ADR 0012), keyed by `seat_id`.
     seats: BTreeMap<u16, SeatOutbox>,
+    /// The shared registry, when the deployment is multi-seat.
+    seat_registry: Option<SeatRegistry>,
     /// The immutable `account_id -> seat_id` pin, for conflict detection.
     seat_accounts: BTreeMap<AccountId, u16>,
     /// Which cluster session currently owns a seat. Transient: never
@@ -182,11 +188,31 @@ impl EngineService {
             seat_accounts: BTreeMap::new(),
             seat_sessions: BTreeMap::new(),
             control_egress: VecDeque::new(),
+            seat_registry: None,
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
             last_book_refresh: Instant::now(),
         }
+    }
+
+    /// Attach the shared seat registry (multi-seat mode).
+    ///
+    /// The deployment must cap `max_open_orders_per_account` at the resync
+    /// batch bound, or a full resync could overflow the seat outbox on its own.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::Configuration`] when the risk cap is above the bound.
+    pub fn with_seats(mut self, registry: SeatRegistry) -> Result<Self, ServiceError> {
+        if self.config.risk.max_open_orders_per_account > MAX_RESYNC_ORDERS {
+            return Err(ServiceError::Configuration(format!(
+                "max-open-orders {} is above the multi-seat bound {MAX_RESYNC_ORDERS}",
+                self.config.risk.max_open_orders_per_account
+            )));
+        }
+        self.seat_registry = Some(registry);
+        Ok(self)
     }
 
     /// A fresh engine that also publishes market data on `config.deepmsg`.
@@ -221,6 +247,7 @@ impl EngineService {
             seat_accounts: BTreeMap::new(),
             seat_sessions: BTreeMap::new(),
             control_egress: VecDeque::new(),
+            seat_registry: None,
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
@@ -246,6 +273,7 @@ impl EngineService {
             seat_accounts: BTreeMap::new(),
             seat_sessions: BTreeMap::new(),
             control_egress: VecDeque::new(),
+            seat_registry: None,
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
@@ -362,6 +390,23 @@ impl EngineService {
         if message.seat_id == 0 {
             self.reject_bind(session, message.seat_id, bind_reject_reason::INVALID_SEAT);
             return;
+        }
+        if let Some(registry) = &self.seat_registry {
+            match registry.get(message.seat_id) {
+                None => {
+                    self.reject_bind(session, message.seat_id, bind_reject_reason::UNKNOWN_SEAT);
+                    return;
+                }
+                Some(seat) if seat.account_id != message.account_id => {
+                    self.reject_bind(
+                        session,
+                        message.seat_id,
+                        bind_reject_reason::ACCOUNT_CONFLICT,
+                    );
+                    return;
+                }
+                Some(_) => {}
+            }
         }
         if let Some(owner) = self.seat_accounts.get(&message.account_id).copied() {
             if owner != message.seat_id {
@@ -1732,6 +1777,64 @@ mod tests {
             1,
             "the first pin is immutable"
         );
+    }
+
+    fn seat_config() -> EngineConfig {
+        let mut config = config();
+        config.risk.max_open_orders_per_account = 4_096;
+        config
+    }
+
+    fn registry() -> crate::seats::SeatRegistry {
+        crate::seats::SeatRegistry::parse(
+            r#"
+[[seat]]
+seat_id = 1
+account_id = 11
+protocol = "ouch"
+token = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+"#,
+        )
+        .expect("registry")
+    }
+
+    #[test]
+    fn the_shared_registry_is_enforced_at_bind() {
+        let mut service = EngineService::new(seat_config())
+            .with_seats(registry())
+            .expect("seats");
+        bind(&mut service, 10, 1, 99, 0);
+        let (_, frame) = service.control_egress.back().expect("reject");
+        match Egress::decode(frame).expect("egress") {
+            Egress::BindRejected(message) => {
+                assert_eq!(message.reason, bind_reject_reason::ACCOUNT_CONFLICT);
+            }
+            other => panic!("expected BindRejected, got {other:?}"),
+        }
+        bind(&mut service, 10, 2, 11, 0);
+        let (_, frame) = service.control_egress.back().expect("reject");
+        match Egress::decode(frame).expect("egress") {
+            Egress::BindRejected(message) => {
+                assert_eq!(message.reason, bind_reject_reason::UNKNOWN_SEAT);
+            }
+            other => panic!("expected BindRejected, got {other:?}"),
+        }
+        bind(&mut service, 10, 1, 11, 0);
+        let (_, frame) = service.control_egress.back().expect("bound");
+        assert!(matches!(
+            Egress::decode(frame).expect("egress"),
+            Egress::SeatBound(_)
+        ));
+    }
+
+    #[test]
+    fn the_multi_seat_risk_cap_is_checked_at_startup() {
+        let mut config = config();
+        config.risk.max_open_orders_per_account = 4_097;
+        assert!(matches!(
+            EngineService::new(config).with_seats(registry()),
+            Err(ServiceError::Configuration(_))
+        ));
     }
 
     #[test]

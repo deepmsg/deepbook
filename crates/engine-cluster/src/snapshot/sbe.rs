@@ -1,4 +1,4 @@
-//! The SBE snapshot codec (schema id 200, version 2).
+//! The SBE snapshot codec (schema id 200, version 3).
 //!
 //! The generated codec (`deepbook-codec-snapshot`) reads and writes one
 //! `EngineSnapshot` message. The generated decoders index the buffer without
@@ -42,6 +42,8 @@ const MAX_ITEMS: usize = 1 << 24;
 // record without invoking the generated decoder; a mismatch is a schema change
 // that must bump the version.
 const MESSAGE_BLOCK: usize = SBE_BLOCK_LENGTH as usize;
+/// Version 2 block length: version 3 appended `hasBasePrice` and `basePrice`.
+const MESSAGE_BLOCK_V2: usize = MESSAGE_BLOCK - 9;
 const KILLED_ACCOUNTS_BLOCK: usize = 4;
 const OPEN_ORDERS_BLOCK: usize = 8;
 const SEEN_BLOCK: usize = 73;
@@ -101,7 +103,9 @@ pub fn encode(snapshot: &EngineSnapshot) -> Result<Vec<u8>, CodecError> {
         .free_head(snapshot.book.free_head)
         .md_seq(snapshot.book.md_seq)
         .has_last_trade(u8::from(snapshot.book.last_trade.is_some()))
-        .last_trade(snapshot.book.last_trade.unwrap_or_default());
+        .last_trade(snapshot.book.last_trade.unwrap_or_default())
+        .has_base_price(u8::from(snapshot.book.base_price.is_some()))
+        .base_price(snapshot.book.base_price.unwrap_or_default());
 
     let mut group = message.killed_accounts_encoder(
         count(snapshot.killed_accounts.len())?,
@@ -214,6 +218,11 @@ pub fn encode(snapshot: &EngineSnapshot) -> Result<Vec<u8>, CodecError> {
 pub fn decode(payload: &[u8]) -> Result<EngineSnapshot, CodecError> {
     validate(payload)?;
 
+    let acting_version = {
+        let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
+        header.version()
+    };
+
     let header = MessageHeaderDecoder::default().wrap(ReadBuf::new(payload), 0);
     let decoder = EngineSnapshotDecoder::default().header(header, 0);
 
@@ -223,6 +232,11 @@ pub fn decode(payload: &[u8]) -> Result<EngineSnapshot, CodecError> {
     let free_head = decoder.free_head();
     let md_seq = decoder.md_seq();
     let last_trade = (decoder.has_last_trade() != 0).then(|| decoder.last_trade());
+    let base_price = if acting_version >= 3 && decoder.has_base_price() != 0 {
+        Some(decoder.base_price())
+    } else {
+        None
+    };
 
     let mut group = decoder.killed_accounts_decoder();
     let mut killed_accounts = Vec::with_capacity(group.count() as usize);
@@ -336,6 +350,7 @@ pub fn decode(payload: &[u8]) -> Result<EngineSnapshot, CodecError> {
             free_head,
             bids,
             asks,
+            base_price,
             last_trade,
             md_seq,
         },
@@ -359,10 +374,16 @@ fn validate(payload: &[u8]) -> Result<(), CodecError> {
     if template_id != SBE_TEMPLATE_ID || schema_id != SBE_SCHEMA_ID {
         return Err(CodecError::BadMagic);
     }
-    if version != 1 && version != SBE_SCHEMA_VERSION {
+    if version != 1 && version != 2 && version != SBE_SCHEMA_VERSION {
         return Err(CodecError::BadVersion(version.min(u16::from(u8::MAX)) as u8));
     }
-    if block_length != MESSAGE_BLOCK {
+    // Version 3 appended `hasBasePrice` and `basePrice` to the root block.
+    let expected_block = if version >= 3 {
+        MESSAGE_BLOCK
+    } else {
+        MESSAGE_BLOCK_V2
+    };
+    if block_length != expected_block {
         return Err(CodecError::BadVersion(version as u8));
     }
     cursor.skip(block_length)?;

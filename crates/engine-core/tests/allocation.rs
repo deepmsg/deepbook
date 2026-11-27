@@ -156,6 +156,61 @@ fn matching_and_canceling_do_not_allocate_after_warmup() {
 }
 
 #[test]
+fn a_first_order_at_a_brand_new_level_does_not_allocate() {
+    // The MVP `BTreeMap` allocates when an order opens a price level that did
+    // not exist. The band must make that free, and cancelling the level away
+    // must stay free too.
+    const LEVELS: u64 = 20_000;
+
+    let mut engine = Engine::new(EngineConfig {
+        symbol: 1,
+        max_orders: 1_024,
+        recent_order_window: 100_000,
+        risk: RiskConfig::disabled(),
+    });
+    let mut sink = NullSink;
+
+    // The first limit order anchors the band on its own price; it stays
+    // resting. Account 2 keeps one resting order throughout, so its entry in
+    // the open-order map is created once here and never removed in the loop
+    // (an insert into that map is a legitimate allocation this test is not
+    // about).
+    engine.on_command(
+        &order(1, client_order_id(0), Side::Sell, 1_000_000, 1),
+        1,
+        &mut sink,
+    );
+    engine.on_command(
+        &order(2, client_order_id(1), Side::Buy, 900_000, 1),
+        2,
+        &mut sink,
+    );
+
+    TRACKING.with(|tracking| tracking.set(true));
+    ALLOCATIONS.with(|allocations| allocations.set(0));
+
+    for index in 0..LEVELS {
+        let price = 900_001 + i64::try_from(index).expect("fits");
+        let cl = client_order_id(index + 10);
+        let log = i64::try_from(index).expect("fits") * 2 + 3;
+        engine.on_command(&order(2, cl, Side::Buy, price, 1), log, &mut sink);
+        engine.on_command(
+            &Command::CancelOrder(CancelOrder {
+                account: 2,
+                cl_ord_id: client_order_id(index + 100_000),
+                orig_cl_ord_id: cl,
+            }),
+            log + 1,
+            &mut sink,
+        );
+    }
+
+    let allocations = ALLOCATIONS.with(std::cell::Cell::get);
+    TRACKING.with(|tracking| tracking.set(false));
+    assert_eq!(0, allocations, "a brand-new in-band level allocated");
+}
+
+#[test]
 fn a_power_of_two_window_rolls_over_without_allocating() {
     // A window that is a power of two used to size its table to exactly the
     // window, leaving no spare slot: once full, every insert evicted and

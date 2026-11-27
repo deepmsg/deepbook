@@ -21,7 +21,9 @@
 
 use std::collections::BTreeMap;
 
-use deepbook_types::{Price, Qty};
+use deepbook_types::Price;
+#[cfg(test)]
+use deepbook_types::Qty;
 
 use crate::book::PriceLevel;
 use crate::ids::EMPTY_SLOT;
@@ -152,7 +154,11 @@ impl PriceBandSide {
             }
             return;
         }
-        if self.outliers.get(&price).is_some_and(|level| level.head == EMPTY_SLOT) {
+        if self
+            .outliers
+            .get(&price)
+            .is_some_and(|level| level.head == EMPTY_SLOT)
+        {
             self.outliers.remove(&price);
             if price < base {
                 self.outliers_below -= 1;
@@ -206,11 +212,13 @@ impl PriceBandSide {
     }
 
     /// Non-empty levels strictly below the band.
+    #[cfg(test)]
     pub(crate) const fn outliers_below(&self) -> u32 {
         self.outliers_below
     }
 
     /// Non-empty levels at or above the band's top.
+    #[cfg(test)]
     pub(crate) const fn outliers_above(&self) -> u32 {
         self.outliers_above
     }
@@ -251,7 +259,8 @@ impl PriceBandSide {
     /// The difference must be a multiple of [`STEP_TICKS`]. This is the cold
     /// path: it may move levels into `outliers` (allocating) and back.
     pub(crate) fn recenter(&mut self, old_base: Price, new_base: Price) {
-        let units = (i128::from(new_base) - i128::from(old_base)).div_euclid(i128::from(STEP_TICKS));
+        let units =
+            (i128::from(new_base) - i128::from(old_base)).div_euclid(i128::from(STEP_TICKS));
         let Ok(units) = i64::try_from(units) else {
             self.rebuild(old_base, new_base);
             return;
@@ -305,7 +314,9 @@ impl PriceBandSide {
                 .outliers
                 .remove(&price)
                 .expect("the range yielded the key");
-            let index = self.band_index(price, new_base).expect("the range is the band");
+            let index = self
+                .band_index(price, new_base)
+                .expect("the range is the band");
             self.set_bit(index);
             self.levels[index] = level;
         }
@@ -355,7 +366,9 @@ impl PriceBandSide {
     fn shift_down(&mut self, old_base: Price, new_base: Price, shift: usize) {
         let shift_l2 = shift * 64;
         let shift_ticks = shift as i64 * STEP_TICKS;
-        let entry = old_base.saturating_add(self.band_ticks).saturating_sub(shift_ticks);
+        let entry = old_base
+            .saturating_add(self.band_ticks)
+            .saturating_sub(shift_ticks);
 
         let prices: Vec<Price> = self
             .in_band_ascending(old_base)
@@ -376,11 +389,9 @@ impl PriceBandSide {
         self.levels
             .copy_within(0..band - shift_ticks as usize, shift_ticks as usize);
         self.levels[..shift_ticks as usize].fill(PriceLevel::EMPTY);
-        self.l2
-            .copy_within(0..l2_words - shift_l2, shift_l2);
+        self.l2.copy_within(0..l2_words - shift_l2, shift_l2);
         self.l2[..shift_l2].fill(0);
-        self.l1
-            .copy_within(0..self.l1.len() - shift, shift);
+        self.l1.copy_within(0..self.l1.len() - shift, shift);
         self.l1[..shift].fill(0);
         self.l0 <<= shift;
 
@@ -391,7 +402,11 @@ impl PriceBandSide {
 
     /// Move every outlier in `range` into the band.
     fn admit_range(&mut self, range: std::ops::Range<Price>, base: Price) {
-        let prices: Vec<Price> = self.outliers.range(range).map(|(price, _)| *price).collect();
+        let prices: Vec<Price> = self
+            .outliers
+            .range(range)
+            .map(|(price, _)| *price)
+            .collect();
         for price in prices {
             let level = self
                 .outliers
@@ -400,7 +415,10 @@ impl PriceBandSide {
             let index = self
                 .band_index(price, base)
                 .expect("the range is inside the band");
-            debug_assert!(self.levels[index].head == EMPTY_SLOT, "admitted onto a level");
+            debug_assert!(
+                self.levels[index].head == EMPTY_SLOT,
+                "admitted onto a level"
+            );
             self.set_bit(index);
             self.levels[index] = level;
         }
@@ -471,6 +489,7 @@ impl PriceBandSide {
     }
 
     /// The level map as tests compare it, without the empty placeholders.
+    #[cfg(test)]
     pub(crate) fn to_map(&self, base: Price) -> BTreeMap<Price, (Qty, u32, u32)> {
         let mut map = BTreeMap::new();
         for (price, level) in self.in_band_ascending(base) {
@@ -545,6 +564,8 @@ impl Iterator for InBandDescending<'_> {
 
 #[cfg(test)]
 mod tests {
+    use deepbook_types::Qty;
+
     use super::*;
 
     /// A level with `qty` and a live head (any slot but the sentinel).
@@ -685,7 +706,12 @@ mod tests {
             -10_000, -4_097, -1, 0, 63, 64, 4_095, 4_096, 8_192, 16_383, 16_384, 30_000,
         ];
         for price in prices {
-            insert(&mut side, 0, price, u64::from(price.unsigned_abs().min(1_000)) as i64 + 1);
+            insert(
+                &mut side,
+                0,
+                price,
+                price.unsigned_abs().min(1_000) as i64 + 1,
+            );
         }
         let before = side.to_map(0);
         let mut base = 0;

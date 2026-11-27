@@ -226,6 +226,7 @@ pub fn decode(bytes: &[u8]) -> Result<EngineSnapshot, CodecError> {
             free_head,
             bids,
             asks,
+            base_price: None,
             last_trade,
             md_seq,
         },
@@ -471,7 +472,10 @@ mod tests {
         let snapshot = engine.snapshot();
         let bytes = encode(&snapshot);
         let decoded = decode(&bytes).expect("decode");
-        assert_eq!(snapshot, decoded);
+        // DBS1 predates the price band and cannot carry its base.
+        let mut without_base = snapshot.clone();
+        without_base.book.base_price = None;
+        assert_eq!(without_base, decoded);
 
         let mut restored = Engine::restore(config(), &decoded).expect("restore");
         assert_eq!(engine.book_hash(), restored.book_hash());

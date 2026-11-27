@@ -335,6 +335,10 @@ impl Engine {
             order.ord_type,
             sink,
         );
+        // After the fills of this command, not between them: a recenter is
+        // one deterministic move that every replica derives from the same
+        // last trade price.
+        self.book.recenter_if_needed();
 
         let hot = self.book.orders[slot as usize];
         let cold = self.book.cold[slot as usize];
@@ -1014,11 +1018,7 @@ impl Engine {
     }
 
     fn reduce_level(&mut self, side: Side, price: Price, qty: Qty) {
-        let level = match side {
-            Side::Buy => self.book.bids.get_mut(&price),
-            Side::Sell => self.book.asks.get_mut(&price),
-        };
-        if let Some(level) = level {
+        if let Some(level) = self.book.level_mut(side, price) {
             level.total_qty -= qty;
         }
     }
@@ -1073,17 +1073,14 @@ impl Engine {
         match opposite(side) {
             Side::Sell => self
                 .book
-                .asks
-                .iter()
-                .take_while(|(price, _)| crosses(side, limit, **price))
-                .any(|(_, level)| self.level_has_account(*level, account)),
+                .levels_ascending(Side::Sell)
+                .take_while(|(price, _)| crosses(side, limit, *price))
+                .any(|(_, level)| self.level_has_account(level, account)),
             Side::Buy => self
                 .book
-                .bids
-                .iter()
-                .rev()
-                .take_while(|(price, _)| crosses(side, limit, **price))
-                .any(|(_, level)| self.level_has_account(*level, account)),
+                .levels_descending(Side::Buy)
+                .take_while(|(price, _)| crosses(side, limit, *price))
+                .any(|(_, level)| self.level_has_account(level, account)),
         }
     }
 
@@ -1104,19 +1101,19 @@ impl Engine {
         let mut total: Qty = 0;
         match opposite(side) {
             Side::Sell => {
-                for (price, level) in &self.book.asks {
-                    if !crosses(side, limit, *price) || remaining <= 0 {
+                for (price, level) in self.book.levels_ascending(Side::Sell) {
+                    if !crosses(side, limit, price) || remaining <= 0 {
                         break;
                     }
-                    total += self.level_fillable(*level, account, &mut remaining);
+                    total += self.level_fillable(level, account, &mut remaining);
                 }
             }
             Side::Buy => {
-                for (price, level) in self.book.bids.iter().rev() {
-                    if !crosses(side, limit, *price) || remaining <= 0 {
+                for (price, level) in self.book.levels_descending(Side::Buy) {
+                    if !crosses(side, limit, price) || remaining <= 0 {
                         break;
                     }
-                    total += self.level_fillable(*level, account, &mut remaining);
+                    total += self.level_fillable(level, account, &mut remaining);
                 }
             }
         }

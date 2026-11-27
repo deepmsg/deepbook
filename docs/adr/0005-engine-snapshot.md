@@ -37,9 +37,10 @@ silently changed by a snapshot.
    restored, so a client retry after recovery replays the original
    acknowledgement instead of becoming a second order.
 5. **Record format.** `encode` writes `DBS2`: the SBE message from
-   `schemas/deepbook-snapshot.xml` (schema id 200, version 2), generated into
-   `crates/codec/snapshot` by `just gen-snapshot` with the pinned sbe-tool
-   1.40.2. `decode` dispatches on the four-byte magic and still accepts the
+   `schemas/deepbook-snapshot.xml` (schema id 200, version 3 since ADR 0011),
+   generated into `crates/codec/snapshot` by `just gen-snapshot` with the
+   pinned sbe-tool 1.42.0 (agrona 2.7.1), the generator deepmsg's ADR-0004
+   uses. `decode` dispatches on the four-byte magic and still accepts the
    original hand-written `DBS1` record, so a snapshot taken by an older build
    is recoverable. Version 2 appends `isDay` to the slot block for DAY
    expiry; a version-1 `DBS2` record still decodes (its orders restore as

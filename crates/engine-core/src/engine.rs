@@ -335,6 +335,10 @@ impl Engine {
             order.ord_type,
             sink,
         );
+        // After the fills of this command, not between them: a recenter is
+        // one deterministic move that every replica derives from the same
+        // last trade price.
+        self.book.recenter_if_needed();
 
         let hot = self.book.orders[slot as usize];
         let cold = self.book.cold[slot as usize];
@@ -1014,11 +1018,7 @@ impl Engine {
     }
 
     fn reduce_level(&mut self, side: Side, price: Price, qty: Qty) {
-        let level = match side {
-            Side::Buy => self.book.bids.get_mut(&price),
-            Side::Sell => self.book.asks.get_mut(&price),
-        };
-        if let Some(level) = level {
+        if let Some(level) = self.book.level_mut(side, price) {
             level.total_qty -= qty;
         }
     }
@@ -1073,17 +1073,14 @@ impl Engine {
         match opposite(side) {
             Side::Sell => self
                 .book
-                .asks
-                .iter()
-                .take_while(|(price, _)| crosses(side, limit, **price))
-                .any(|(_, level)| self.level_has_account(*level, account)),
+                .levels_ascending(Side::Sell)
+                .take_while(|(price, _)| crosses(side, limit, *price))
+                .any(|(_, level)| self.level_has_account(level, account)),
             Side::Buy => self
                 .book
-                .bids
-                .iter()
-                .rev()
-                .take_while(|(price, _)| crosses(side, limit, **price))
-                .any(|(_, level)| self.level_has_account(*level, account)),
+                .levels_descending(Side::Buy)
+                .take_while(|(price, _)| crosses(side, limit, *price))
+                .any(|(_, level)| self.level_has_account(level, account)),
         }
     }
 
@@ -1104,19 +1101,19 @@ impl Engine {
         let mut total: Qty = 0;
         match opposite(side) {
             Side::Sell => {
-                for (price, level) in &self.book.asks {
-                    if !crosses(side, limit, *price) || remaining <= 0 {
+                for (price, level) in self.book.levels_ascending(Side::Sell) {
+                    if !crosses(side, limit, price) || remaining <= 0 {
                         break;
                     }
-                    total += self.level_fillable(*level, account, &mut remaining);
+                    total += self.level_fillable(level, account, &mut remaining);
                 }
             }
             Side::Buy => {
-                for (price, level) in self.book.bids.iter().rev() {
-                    if !crosses(side, limit, *price) || remaining <= 0 {
+                for (price, level) in self.book.levels_descending(Side::Buy) {
+                    if !crosses(side, limit, price) || remaining <= 0 {
                         break;
                     }
-                    total += self.level_fillable(*level, account, &mut remaining);
+                    total += self.level_fillable(level, account, &mut remaining);
                 }
             }
         }
@@ -2192,5 +2189,62 @@ mod tests {
             &mut killed,
         );
         assert_eq!(Some(RejectReason::KillSwitch), last_report(&killed).reason);
+    }
+
+    #[test]
+    fn a_taker_crosses_an_outlier_ask() {
+        let mut engine = new_engine();
+        let mut events = Vec::new();
+        // Anchors the band at target_base(500_000) = 40,448 - ... see below:
+        // 500,000 - 262,144/2 = 368,928, aligned down to 4,096 -> 368,640,
+        // so the band is [368,640, 630,784).
+        engine.on_command(
+            &limit(
+                1,
+                "B1",
+                Side::Buy,
+                500_000,
+                1,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            1,
+            &mut events,
+        );
+        engine.on_command(
+            &limit(
+                2,
+                "S1",
+                Side::Sell,
+                900_000,
+                1,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            2,
+            &mut events,
+        );
+        assert_eq!(engine.book.asks.outliers_above(), 1);
+
+        let mut fills = Vec::new();
+        engine.on_command(
+            &limit(
+                3,
+                "B2",
+                Side::Buy,
+                950_000,
+                1,
+                TimeInForce::GoodTillCanceled,
+                false,
+            ),
+            3,
+            &mut fills,
+        );
+        assert!(fills.iter().any(|event| matches!(event, Event::Trade(_))));
+        assert_eq!(engine.book.asks.outliers_above(), 0);
+        let view = engine.view();
+        assert!(view.asks.is_empty(), "the outlier ask should be gone");
+        assert_eq!(view.bids.len(), 1);
+        assert_eq!(view.bids[0].price, 500_000);
     }
 }

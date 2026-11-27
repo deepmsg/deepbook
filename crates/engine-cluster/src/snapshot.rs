@@ -5,6 +5,11 @@
 //! can recover from a snapshot taken before the writer was switched. The
 //! rollout order still matters: every node must run a build that can read
 //! `DBS2` before any node writes it (ADR 0005).
+//!
+//! Schema version 3 carries the price band's base. A version-2 record has no
+//! base, and the reader derives one from the levels; that is only sound when
+//! the whole cluster cold-restarts from the record, because a live member's
+//! band may have moved since the snapshot was written.
 
 mod dbs1;
 mod sbe;
@@ -121,7 +126,10 @@ mod tests {
         let sbe = encode(&snapshot).expect("sbe encode");
 
         assert!(sbe.starts_with(b"DBS2"));
-        assert_eq!(decode(&dbs1).expect("dbs1 decode"), snapshot);
+        // DBS1 predates the price band and cannot carry its base.
+        let mut without_base = snapshot.clone();
+        without_base.book.base_price = None;
+        assert_eq!(decode(&dbs1).expect("dbs1 decode"), without_base);
         assert_eq!(decode(&sbe).expect("sbe decode"), snapshot);
     }
 
@@ -168,8 +176,8 @@ mod tests {
         assert_eq!(decode(&foreign_schema), Err(CodecError::BadMagic));
 
         let mut foreign_version = bytes;
-        foreign_version[10..12].copy_from_slice(&3_u16.to_le_bytes());
-        assert_eq!(decode(&foreign_version), Err(CodecError::BadVersion(3)));
+        foreign_version[10..12].copy_from_slice(&4_u16.to_le_bytes());
+        assert_eq!(decode(&foreign_version), Err(CodecError::BadVersion(4)));
     }
 
     #[test]
@@ -178,14 +186,14 @@ mod tests {
         let bytes = encode(&snapshot).expect("sbe encode");
 
         assert_eq!(&bytes[..4], b"DBS2");
-        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 32); // block length
+        assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), 41); // block length
         assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 1); // template id
         assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 200); // schema id
-        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 2); // version
+        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 3); // version
         // header + fixed block + seven group headers and entries + var-data
         let expected = 4
             + 8
-            + 32
+            + 41
             + 6
             + 4 * snapshot.killed_accounts.len()
             + 6
@@ -254,6 +262,7 @@ mod tests {
                     tail: 0,
                 }],
                 asks: Vec::new(),
+                base_price: Some(0),
                 last_trade: Some(100),
                 md_seq: 9,
             },

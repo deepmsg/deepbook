@@ -73,6 +73,9 @@ pub struct BookSnapshot {
     pub bids: Vec<LevelSnapshot>,
     /// Ask levels, ascending by price.
     pub asks: Vec<LevelSnapshot>,
+    /// The low end of the price band, or `None` when no limit order has
+    /// anchored it yet (a version-2 snapshot does not carry it).
+    pub base_price: Option<Price>,
     /// Last trade price.
     pub last_trade: Option<Price>,
     /// Market-data sequence.

@@ -102,3 +102,9 @@ could cancel a different order. M2 also has to settle the matching rules, the
   sit inside one cache line. Moving `notional` to the cold table would make it
   48 bytes and 8-byte aligned, which straddles about three elements in four —
   a layout change needs either ≤ 32 bytes or a 64-byte-aligned slab.
+- **2026-11-27:** `OrderHot` is now `repr(C, align(64))`: the slab allocation
+  is 64-byte aligned, the field order still packs to exactly 64 bytes, and the
+  offsets are compile-time assertions (`book.rs`). This is the
+  "64-byte-aligned slab" the note above allowed; `notional` stays in the hot
+  record. `Side` and `OrderState` became `repr(u8)` so those offsets are
+  guaranteed by the type, not by the compiler's choice.

@@ -13,12 +13,12 @@ The engine snapshot is the one SBE contract:
 
 | Schema | id / version | Generated crate |
 |---|---|---|
-| `deepbook-snapshot.xml` | 200 / 2 | `crates/codec/snapshot` (`deepbook-codec-snapshot`) |
+| `deepbook-snapshot.xml` | 200 / 3 | `crates/codec/snapshot` (`deepbook-codec-snapshot`) |
 
 Generation:
 
 - `just gen-snapshot` runs `scripts/gen-snapshot-sbe.sh`, which uses the pinned
-  `sbe-tool` 1.40.2 and `agrona` 2.6.1 with the Rust target and validates
+  `sbe-tool` 1.42.0 and `agrona` 2.7.1 with the Rust target and validates
   against `fpl/sbe.xsd`.
 - The generated `src/` is committed; the crate's `Cargo.toml` is hand-written.
   Regeneration replaces `src/` wholesale, so nothing hand-written may go there.

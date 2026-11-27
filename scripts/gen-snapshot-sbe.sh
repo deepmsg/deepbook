@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Regenerate the engine snapshot SBE codec (ADR 0005).
 #
-# Mirrors the generator setup deepmsg uses (deepmsg ADR-0004): sbe-tool 1.40.2
-# with its Rust target, agrona 2.6.1 on the classpath, and FIX's sbe.xsd
+# Mirrors the generator setup deepmsg uses (deepmsg ADR-0004): sbe-tool 1.42.0
+# with its Rust target, agrona 2.7.1 on the classpath, and FIX's sbe.xsd
 # validating the schema. The generator is not a build dependency: this script
 # is run explicitly and its output is checked in.
 #
@@ -13,8 +13,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
-SBE_TOOL_VERSION=1.40.2
-AGRONA_VERSION=2.6.1
+SBE_TOOL_VERSION=1.42.0
+AGRONA_VERSION=2.7.1
 SCHEMA=schemas/deepbook-snapshot.xml
 XSD=schemas/fpl/sbe.xsd
 PACKAGE=deepbook_snapshot

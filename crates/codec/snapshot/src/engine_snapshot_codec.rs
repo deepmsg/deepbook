@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 32;
+pub const SBE_BLOCK_LENGTH: u16 = 41;
 pub const SBE_TEMPLATE_ID: u16 = 1;
 
 pub mod encoder {
@@ -174,6 +174,38 @@ pub mod encoder {
         #[inline]
         pub fn last_trade(&mut self, value: i64) -> &mut Self {
             let offset = self.offset + 24;
+            self.get_buf_mut().put_i64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'hasBasePrice'
+        /// - min value: 0
+        /// - max value: 254
+        /// - null value: 0xff_u8
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 32
+        /// - encodedLength: 1
+        /// - version: 3
+        #[inline]
+        pub fn has_base_price(&mut self, value: u8) -> &mut Self {
+            let offset = self.offset + 32;
+            self.get_buf_mut().put_u8_at(offset, value);
+            self
+        }
+
+        /// primitive field 'basePrice'
+        /// - min value: -9223372036854775807
+        /// - max value: 9223372036854775807
+        /// - null value: -9223372036854775808_i64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 33
+        /// - encodedLength: 8
+        /// - version: 3
+        #[inline]
+        pub fn base_price(&mut self, value: i64) -> &mut Self {
+            let offset = self.offset + 33;
             self.get_buf_mut().put_i64_at(offset, value);
             self
         }
@@ -1694,6 +1726,26 @@ pub mod decoder {
             self.get_buf().get_i64_at(self.offset + 24)
         }
 
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn has_base_price(&self) -> u8 {
+            if self.acting_version() < 3 {
+                return 0xff_u8;
+            }
+
+            self.get_buf().get_u8_at(self.offset + 32)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn base_price(&self) -> i64 {
+            if self.acting_version() < 3 {
+                return -9223372036854775808_i64;
+            }
+
+            self.get_buf().get_i64_at(self.offset + 33)
+        }
+
         /// GROUP DECODER (id=100)
         #[inline]
         pub fn killed_accounts_decoder(self) -> KilledAccountsDecoder<Self> {
@@ -1816,7 +1868,7 @@ pub mod decoder {
             self
         }
 
-        /// group token - Token{signal=BEGIN_GROUP, name='killedAccounts', referencedName='null', description='null', packageName='null', id=100, version=0, deprecated=0, encodedLength=4, offset=32, componentTokenCount=9, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
+        /// group token - Token{signal=BEGIN_GROUP, name='killedAccounts', referencedName='null', description='null', packageName='null', id=100, version=0, deprecated=0, encodedLength=4, offset=41, componentTokenCount=9, encoding=Encoding{presence=REQUIRED, primitiveType=null, byteOrder=LITTLE_ENDIAN, minValue=null, maxValue=null, nullValue=null, constValue=null, characterEncoding='null', epoch='null', timeUnit=null, semanticType='null'}}
         #[inline]
         pub fn parent(&mut self) -> SbeResult<P> {
             self.parent.take().ok_or(SbeErr::ParentNotSet)

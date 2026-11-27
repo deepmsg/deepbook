@@ -9,6 +9,7 @@ members = [
     "crates/engine-cluster",
     "crates/marketdata",
     "crates/admin",
+    "crates/ouch",
     "crates/bench",
     "crates/io",
     "crates/http",

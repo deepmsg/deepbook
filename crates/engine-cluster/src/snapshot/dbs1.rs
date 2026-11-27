@@ -34,6 +34,9 @@ pub enum CodecError {
     BadEnum(u8),
     /// A length does not fit the encoding.
     TooLarge,
+    /// The record is internally inconsistent (an invariant failure, not a
+    /// property of the input).
+    Inconsistent,
     /// The generated codec could not be driven (an invariant failure, not a
     /// property of the input).
     Sbe,
@@ -48,6 +51,7 @@ impl fmt::Display for CodecError {
             Self::BadCount(count) => write!(formatter, "implausible item count {count}"),
             Self::BadEnum(byte) => write!(formatter, "unknown enum value {byte}"),
             Self::TooLarge => write!(formatter, "value does not fit the snapshot encoding"),
+            Self::Inconsistent => write!(formatter, "inconsistent snapshot record"),
             Self::Sbe => write!(formatter, "generated snapshot codec failure"),
         }
     }
@@ -330,17 +334,25 @@ fn seen_state_from(byte: u8) -> Result<SeenState, CodecError> {
     }
 }
 
-struct Reader<'a> {
+pub(super) struct Reader<'a> {
     bytes: &'a [u8],
     offset: usize,
 }
 
 impl<'a> Reader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
+    pub(super) const fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, offset: 0 }
     }
 
-    fn take(&mut self, length: usize) -> Result<&'a [u8], CodecError> {
+    pub(super) fn is_empty(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
+    pub(super) fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.offset)
+    }
+
+    pub(super) fn take(&mut self, length: usize) -> Result<&'a [u8], CodecError> {
         let end = self
             .offset
             .checked_add(length)
@@ -353,33 +365,33 @@ impl<'a> Reader<'a> {
         Ok(slice)
     }
 
-    fn u8(&mut self) -> Result<u8, CodecError> {
+    pub(super) fn u8(&mut self) -> Result<u8, CodecError> {
         Ok(self.take(1)?[0])
     }
 
-    fn u16(&mut self) -> Result<u16, CodecError> {
+    pub(super) fn u16(&mut self) -> Result<u16, CodecError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().expect("two")))
     }
 
-    fn u32(&mut self) -> Result<u32, CodecError> {
+    pub(super) fn u32(&mut self) -> Result<u32, CodecError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four")))
     }
 
-    fn u64(&mut self) -> Result<u64, CodecError> {
+    pub(super) fn u64(&mut self) -> Result<u64, CodecError> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight")))
     }
 
-    fn i64(&mut self) -> Result<i64, CodecError> {
+    pub(super) fn i64(&mut self) -> Result<i64, CodecError> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().expect("eight")))
     }
 
-    fn i128(&mut self) -> Result<i128, CodecError> {
+    pub(super) fn i128(&mut self) -> Result<i128, CodecError> {
         Ok(i128::from_le_bytes(
             self.take(16)?.try_into().expect("sixteen"),
         ))
     }
 
-    fn count(&mut self) -> Result<usize, CodecError> {
+    pub(super) fn count(&mut self) -> Result<usize, CodecError> {
         let count = self.u32()?;
         if usize::try_from(count).unwrap_or(usize::MAX) > MAX_ITEMS {
             Err(CodecError::BadCount(count))
@@ -388,7 +400,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn price(&mut self) -> Result<Option<Price>, CodecError> {
+    pub(super) fn price(&mut self) -> Result<Option<Price>, CodecError> {
         match self.u8()? {
             0 => Ok(None),
             1 => Ok(Some(self.i64()?)),
@@ -396,7 +408,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn client_order_id(&mut self) -> Result<ClientOrderId, CodecError> {
+    pub(super) fn client_order_id(&mut self) -> Result<ClientOrderId, CodecError> {
         let bytes: [u8; ClientOrderId::LENGTH] = self
             .take(ClientOrderId::LENGTH)?
             .try_into()

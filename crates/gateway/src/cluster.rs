@@ -36,13 +36,17 @@
 //!   restart an order the gateway has not seen again answers `unknown order`.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use deepbook_engine_cluster::envelope::{
+    AckSeat, BindRejected, BindSeat, Egress, FenceEvicted, Ingress, RejectMalformed, SeatBound,
+    SeatCommand as SeatCommandEnvelope, SeatEvent, UnbindSeat,
+};
 use deepbook_engine_core::{
     CancelOrder, ClientOrderId, Command, Event, ExecType as EngineExecType, ExecutionReportEvent,
     NewOrder, OrdType as EngineOrdType, ReplaceOrder, TimeInForce as EngineTimeInForce,
@@ -338,6 +342,7 @@ impl Mapping {
             exec_id: exec_id(event.header.log_pos, event.header.event_seq),
             order_id,
             cl_ord_id: cl_ord_id.clone(),
+            orig_cl_ord_id: None,
             exec_type: exec_type(event.exec_type),
             ord_status: status,
             symbol,
@@ -381,6 +386,7 @@ impl Mapping {
                 exec_id,
                 order_id: "NONE".to_owned(),
                 cl_ord_id: request.cl_ord_id.clone(),
+                orig_cl_ord_id: None,
                 exec_type: ExecType::Rejected,
                 ord_status: OrdStatus::Rejected,
                 symbol: request.symbol.clone(),
@@ -400,6 +406,7 @@ impl Mapping {
             exec_id,
             order_id: order.order_id.clone(),
             cl_ord_id: request.cl_ord_id.clone(),
+            orig_cl_ord_id: None,
             exec_type: ExecType::OrderStatus,
             ord_status: order.status,
             symbol: order.symbol.clone(),
@@ -486,7 +493,7 @@ impl ClusterEngine {
         let mut attempt = 0;
         let session = loop {
             attempt += 1;
-            match open_session(&config, 0, &egress, &mut client) {
+            match open_session(&config, 0, &egress, &mut client, "deepbook-fix-gateway") {
                 Ok(session) => break session,
                 Err(error) if attempt < attempts => {
                     eprintln!(
@@ -574,6 +581,7 @@ impl ClusterEngine {
             self.sessions_opened,
             &self.egress,
             &mut self.client,
+            "deepbook-fix-gateway",
         ) {
             Ok(session) => {
                 eprintln!(
@@ -705,6 +713,7 @@ impl ClusterEngine {
             exec_id,
             order_id: "NONE".to_owned(),
             cl_ord_id: order.cl_ord_id.clone(),
+            orig_cl_ord_id: None,
             exec_type: ExecType::Rejected,
             ord_status: OrdStatus::Rejected,
             symbol: order.symbol.clone(),
@@ -842,11 +851,404 @@ impl EventSource for ClusterEngine {
     }
 }
 
+/// One `SeatEvent` owned by the gateway (the envelope borrows its payload).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnedSeatEvent {
+    /// The seat.
+    pub seat_id: u16,
+    /// The seat epoch.
+    pub epoch: u64,
+    /// The journal generation.
+    pub generation: u64,
+    /// The outbound sequence.
+    pub seat_seq: u64,
+    /// `0/1/2` liquidity tag.
+    pub liquidity: u8,
+    /// `0` engine event, `1` malformed reject.
+    pub payload_kind: u8,
+    /// Whether the event is synthetic resync state.
+    pub resync: bool,
+    /// The replace request id on a `Replaced` report.
+    pub replace_req_cl_ord_id: Option<ClientOrderId>,
+    /// The engine event or the 18-byte malformed reject.
+    pub payload: Vec<u8>,
+}
+
+impl OwnedSeatEvent {
+    /// The borrowed form the envelope/renderer use.
+    #[must_use]
+    pub fn borrowed(&self) -> SeatEvent<'_> {
+        SeatEvent {
+            seat_id: self.seat_id,
+            epoch: self.epoch,
+            generation: self.generation,
+            seat_seq: self.seat_seq,
+            liquidity: self.liquidity,
+            payload_kind: self.payload_kind,
+            resync: self.resync,
+            replace_req_cl_ord_id: self.replace_req_cl_ord_id,
+            payload: &self.payload,
+        }
+    }
+}
+
+/// One decoded service egress frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SeatEgress {
+    /// `SeatBound`.
+    Bound(SeatBound),
+    /// `BindRejected`.
+    Rejected(BindRejected),
+    /// `SeatEvent`.
+    Event(OwnedSeatEvent),
+    /// `FenceEvicted`.
+    Fenced(FenceEvicted),
+}
+
+/// The multi-seat cluster client (ADR 0012 §6).
+///
+/// It owns one cluster session and speaks the service envelope in both
+/// directions. The gateway loop drives [`poll_egress`](Self::poll_egress) and
+/// converts each frame with the seat session state machine.
+pub struct SeatClusterEngine {
+    config: ClusterEngineConfig,
+    client: Client,
+    session: Option<ClusterClient>,
+    egress: Rc<RefCell<VecDeque<EgressRecord>>>,
+    decoded: VecDeque<SeatEgress>,
+    commands: VecDeque<Vec<u8>>,
+    /// `seat_id -> (account_id, last journaled seat_seq)` for reconnect.
+    rebind: BTreeMap<u16, (u32, u64)>,
+    sessions_opened: u16,
+    last_keep_alive: Instant,
+    reconnect_at: Option<Instant>,
+    metrics: Arc<GatewayMetrics>,
+}
+
+impl fmt::Debug for SeatClusterEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SeatClusterEngine")
+            .field("cluster_session_id", &self.cluster_session_id())
+            .field("pending_commands", &self.commands.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SeatClusterEngine {
+    /// Connect the media driver and open a cluster session.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClusterEngine::connect`].
+    pub fn connect(config: ClusterEngineConfig) -> Result<Self, ClusterEngineError> {
+        Self::connect_with(config, Arc::new(GatewayMetrics::default()))
+    }
+
+    /// The same, with the counters the binary reads.
+    ///
+    /// # Errors
+    ///
+    /// As [`ClusterEngine::connect`].
+    pub fn connect_with(
+        config: ClusterEngineConfig,
+        metrics: Arc<GatewayMetrics>,
+    ) -> Result<Self, ClusterEngineError> {
+        let mut client = Client::connect(&config.driver_dir)
+            .map_err(|error| ClusterEngineError::Driver(error.to_string()))?;
+        let egress = Rc::new(RefCell::new(VecDeque::new()));
+        let attempts = config.connect_attempts.max(1);
+        let mut attempt = 0;
+        let session = loop {
+            attempt += 1;
+            match open_session(&config, 0, &egress, &mut client, "deepbook-ouch-gateway") {
+                Ok(session) => break session,
+                Err(error) if attempt < attempts => {
+                    eprintln!(
+                        "ouch-gateway: cluster connect attempt {attempt}/{attempts} failed: \
+                         {error}; connecting again"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        metrics.set_cluster_connected(true);
+        Ok(Self {
+            config,
+            client,
+            session: Some(session),
+            egress,
+            decoded: VecDeque::new(),
+            commands: VecDeque::new(),
+            rebind: BTreeMap::new(),
+            sessions_opened: 1,
+            last_keep_alive: Instant::now(),
+            reconnect_at: None,
+            metrics,
+        })
+    }
+
+    /// The cluster-assigned session id.
+    #[must_use]
+    pub fn cluster_session_id(&self) -> Option<i64> {
+        self.session.as_ref().map(ClusterClient::cluster_session_id)
+    }
+
+    /// Whether the session is currently open.
+    #[must_use]
+    pub fn is_connected(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// How many ingress envelopes are waiting.
+    #[must_use]
+    pub fn pending_commands(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Bind a seat; the call is queued like every other ingress.
+    pub fn bind(&mut self, seat_id: u16, account_id: u32, last_journal_seq: u64) {
+        self.rebind.insert(seat_id, (account_id, last_journal_seq));
+        self.queue_ingress(
+            Ingress::BindSeat(BindSeat {
+                seat_id,
+                account_id,
+                last_journal_seq,
+            })
+            .encode(),
+        );
+    }
+
+    /// Offer one engine command on behalf of a seat.
+    pub fn seat_command(&mut self, seat_id: u16, epoch: u64, command: &[u8]) {
+        self.queue_ingress(
+            Ingress::SeatCommand(SeatCommandEnvelope {
+                seat_id,
+                epoch,
+                command,
+            })
+            .encode(),
+        );
+    }
+
+    /// Acknowledge the durable prefix.
+    pub fn ack(&mut self, seat_id: u16, epoch: u64, up_to_seq: u64) {
+        if let Some((_, last)) = self.rebind.get_mut(&seat_id) {
+            *last = (*last).max(up_to_seq);
+        }
+        self.queue_ingress(
+            Ingress::AckSeat(AckSeat {
+                seat_id,
+                epoch,
+                up_to_seq,
+            })
+            .encode(),
+        );
+    }
+
+    /// Reject a parsed but invalid request through the log.
+    pub fn reject_malformed(
+        &mut self,
+        seat_id: u16,
+        epoch: u64,
+        raw_cl_ord_id: u64,
+        raw_orig_cl_ord_id: u64,
+        is_cancel_or_replace: bool,
+        reason: u8,
+    ) {
+        self.queue_ingress(
+            Ingress::RejectMalformed(RejectMalformed {
+                seat_id,
+                epoch,
+                raw_cl_ord_id,
+                raw_orig_cl_ord_id,
+                is_cancel_or_replace,
+                reason,
+            })
+            .encode(),
+        );
+    }
+
+    /// Release a seat's binding.
+    pub fn unbind_seat(&mut self, seat_id: u16, epoch: u64, reason: u8) {
+        self.rebind.remove(&seat_id);
+        self.queue_ingress(
+            Ingress::UnbindSeat(UnbindSeat {
+                seat_id,
+                epoch,
+                reason,
+            })
+            .encode(),
+        );
+    }
+
+    /// The next decoded egress frame, driving the client first when empty.
+    pub fn poll_egress(&mut self) -> Option<SeatEgress> {
+        if let Some(frame) = self.decoded.pop_front() {
+            return Some(frame);
+        }
+        self.pump();
+        self.decoded.pop_front()
+    }
+
+    fn queue_ingress(
+        &mut self,
+        message: Result<Vec<u8>, deepbook_engine_cluster::envelope::EnvelopeError>,
+    ) {
+        match message {
+            Ok(payload) => {
+                if self.commands.len() >= MAX_PENDING_COMMANDS {
+                    eprintln!("ouch-gateway: cluster ingress queue is full; dropping an envelope");
+                } else {
+                    self.commands.push_back(payload);
+                }
+            }
+            Err(error) => eprintln!("ouch-gateway: service ingress: {error}"),
+        }
+    }
+
+    fn pump(&mut self) {
+        let _ = self.client.poll();
+        if let Some(session) = self.session.as_mut() {
+            if let Err(error) = session.poll_egress(&mut self.client) {
+                eprintln!("ouch-gateway: cluster egress: {error}");
+            }
+            if session.is_closed() {
+                self.metrics.set_cluster_connected(false);
+                eprintln!("ouch-gateway: cluster session closed");
+                self.session = None;
+                self.reconnect_at = Some(Instant::now() + RECONNECT_DELAY);
+            } else if self.last_keep_alive.elapsed() >= KEEP_ALIVE_INTERVAL {
+                session.send_keep_alive(&mut self.client);
+                self.last_keep_alive = Instant::now();
+            }
+        }
+        self.drain_egress();
+        if self.session.is_none() {
+            self.reconnect();
+        } else {
+            self.flush_commands();
+        }
+    }
+
+    fn drain_egress(&mut self) {
+        loop {
+            let record = self.egress.borrow_mut().pop_front();
+            let Some(record) = record else {
+                break;
+            };
+            match Egress::decode(&record.payload) {
+                Ok(Egress::SeatBound(message)) => {
+                    self.decoded.push_back(SeatEgress::Bound(message));
+                }
+                Ok(Egress::BindRejected(message)) => {
+                    self.decoded.push_back(SeatEgress::Rejected(message));
+                }
+                Ok(Egress::SeatEvent(message)) => {
+                    self.decoded.push_back(SeatEgress::Event(OwnedSeatEvent {
+                        seat_id: message.seat_id,
+                        epoch: message.epoch,
+                        generation: message.generation,
+                        seat_seq: message.seat_seq,
+                        liquidity: message.liquidity,
+                        payload_kind: message.payload_kind,
+                        resync: message.resync,
+                        replace_req_cl_ord_id: message.replace_req_cl_ord_id,
+                        payload: message.payload.to_vec(),
+                    }));
+                }
+                Ok(Egress::FenceEvicted(message)) => {
+                    self.decoded.push_back(SeatEgress::Fenced(message));
+                }
+                Err(error) => eprintln!("ouch-gateway: service egress: {error}"),
+            }
+        }
+    }
+
+    fn reconnect(&mut self) {
+        let now = Instant::now();
+        if self.reconnect_at.is_some_and(|at| now < at) {
+            return;
+        }
+        match open_session(
+            &self.config,
+            self.sessions_opened,
+            &self.egress,
+            &mut self.client,
+            "deepbook-ouch-gateway",
+        ) {
+            Ok(session) => {
+                eprintln!(
+                    "ouch-gateway: cluster reconnected session={}",
+                    session.cluster_session_id()
+                );
+                self.metrics.set_cluster_connected(true);
+                self.sessions_opened = self.sessions_opened.saturating_add(1);
+                self.session = Some(session);
+                self.reconnect_at = None;
+                self.queue_rebinds();
+            }
+            Err(error) => {
+                eprintln!("ouch-gateway: cluster reconnect: {error}");
+                self.reconnect_at = Some(now + RECONNECT_DELAY);
+            }
+        }
+    }
+
+    fn queue_rebinds(&mut self) {
+        let rebinds: Vec<(u16, u32, u64)> = self
+            .rebind
+            .iter()
+            .map(|(seat_id, (account_id, last))| (*seat_id, *account_id, *last))
+            .collect();
+        for (seat_id, account_id, last_journal_seq) in rebinds {
+            self.queue_ingress(
+                Ingress::BindSeat(BindSeat {
+                    seat_id,
+                    account_id,
+                    last_journal_seq,
+                })
+                .encode(),
+            );
+        }
+    }
+
+    fn flush_commands(&mut self) {
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        while let Some(command) = self.commands.front() {
+            match session.offer(&mut self.client, command) {
+                Some(Appended::Ok { .. }) => {
+                    self.commands.pop_front();
+                }
+                Some(
+                    Appended::EndOfLog
+                    | Appended::MidRotation
+                    | Appended::BackPressured
+                    | Appended::NotConnected,
+                )
+                | None => break,
+                Some(Appended::MaxPositionExceeded)
+                | Some(Appended::MessageTooLarge)
+                | Some(Appended::Malformed) => {
+                    let command = self.commands.pop_front().expect("observed");
+                    eprintln!(
+                        "ouch-gateway: dropping a {} byte envelope the cluster refused",
+                        command.len()
+                    );
+                }
+            }
+        }
+    }
+}
+
 fn open_session(
     config: &ClusterEngineConfig,
     egress_offset: u16,
     egress: &Rc<RefCell<VecDeque<EgressRecord>>>,
     client: &mut Client,
+    client_name: &str,
 ) -> Result<ClusterClient, ClusterEngineError> {
     let egress_channel = egress_channel_for(&config.egress_channel, egress_offset);
     let context = ClusterClientContext::new()
@@ -857,7 +1259,7 @@ fn open_session(
         .egress_stream_id(config.egress_stream_id)
         .message_timeout_ns(config.message_timeout_ns)
         .new_leader_timeout_ns(config.new_leader_timeout_ns)
-        .client_name("deepbook-fix-gateway")
+        .client_name(client_name)
         .egress_listener(Box::new(EgressQueue(Rc::clone(egress))));
     ClusterClient::connect(context, client)
         .map_err(|error| ClusterEngineError::Connect(error.to_string()))

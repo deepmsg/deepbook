@@ -6,15 +6,22 @@
 //! rollout order still matters: every node must run a build that can read
 //! `DBS2` before any node writes it (ADR 0005).
 //!
+//! [`encode_service`] / [`decode_service`] add the `DBS3` service envelope
+//! (ADR 0012), which nests the `DBS2` bytes and appends the pinned seats and
+//! their outboxes. `DBS3` is a separate dispatch: [`decode`] still reads only
+//! the engine record.
+//!
 //! Schema version 3 carries the price band's base. A version-2 record has no
 //! base, and the reader derives one from the levels; that is only sound when
 //! the whole cluster cold-restarts from the record, because a live member's
 //! band may have moved since the snapshot was written.
 
 mod dbs1;
+mod dbs3;
 mod sbe;
 
 pub use dbs1::CodecError;
+pub use dbs3::{MAGIC as DBS3_MAGIC, ServiceSnapshot, decode_service, encode_service};
 
 use deepbook_engine_core::EngineSnapshot;
 

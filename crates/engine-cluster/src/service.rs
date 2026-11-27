@@ -2,32 +2,45 @@
 //!
 //! It decodes the command record the gateway offered, applies it to
 //! [`Engine`] with the log position from the callback header, and offers each
-//! engine event back to the originating cluster session. `on_take_snapshot`
-//! writes the SBE snapshot record (`DBS2`) in as many records as the snapshot
-//! publication's maximum payload needs; `on_start` concatenates them and
-//! restores whichever format the record carries (`DBS1` or `DBS2`; ADR 0005).
+//! engine event back to the originating cluster session. Multi-seat traffic
+//! (ADR 0012) arrives as service envelopes, is routed by account into a
+//! [`SeatOutbox`], and is snapshotted as the `DBS3` service envelope around the
+//! unchanged `DBS2` engine record. Legacy bare commands and `DBS1`/`DBS2`/
+//! `MDS1` snapshots stay readable.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use deepbook_engine_core::wire::{decode_command, encode_command, encode_event};
-use deepbook_engine_core::{Command, Engine, EngineConfig, EngineSnapshot, Event, ExecType};
+use deepbook_engine_core::{
+    Command, Engine, EngineConfig, EngineSnapshot, Event, EventHeader, ExecType,
+    ExecutionReportEvent, RestingOrderSummary,
+};
 use deepbook_marketdata::{
     DeepmsgConfig, DeepmsgIncrementalPublisher, Level, MarketDataService,
     ServiceConfig as MarketServiceConfig, Snapshot,
 };
-use deepbook_types::{LogPos, Seq};
+use deepbook_types::{AccountId, LogPos, OrderId, Seq};
 use deepmsg_cluster_service::service::{SnapshotReader, SnapshotWriter};
 use deepmsg_cluster_service::{
     Cluster, ClusteredService, ContainerError, LogHeader, Role, SessionId,
 };
 use deepmsg_codec_cluster::close_reason::CloseReason;
 
+use crate::envelope::{
+    AckSeat, BindRejected, BindSeat, Egress, FenceEvicted, Ingress, RejectMalformed, SeatBound,
+    SeatCommand, SeatEvent, UnbindSeat, bind_reject_reason, fence_reason,
+};
 use crate::metrics::{BookShape, EngineMetrics};
 use crate::obs;
-use crate::snapshot::{CodecError, decode, encode};
+use crate::outbox::{
+    MAX_TOTAL_OUTBOX_BYTES, SeatOutbox, SeatSnapshot, eviction_plan, total_buffered_bytes,
+};
+use crate::snapshot::{
+    CodecError, DBS3_MAGIC, ServiceSnapshot, decode, decode_service, encode, encode_service,
+};
 
 /// A service-layer failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +117,17 @@ pub struct EngineService {
     /// it (the engine log can replay the commands, and the gateway's FIX
     /// journal covers the reports it already received).
     pending_egress: HashMap<SessionId, VecDeque<Vec<u8>>>,
+    /// The seats the service has pinned (ADR 0012), keyed by `seat_id`.
+    seats: BTreeMap<u16, SeatOutbox>,
+    /// The immutable `account_id -> seat_id` pin, for conflict detection.
+    seat_accounts: BTreeMap<AccountId, u16>,
+    /// Which cluster session currently owns a seat. Transient: never
+    /// snapshotted, and never allowed to influence deterministic state.
+    seat_sessions: BTreeMap<u16, SessionId>,
+    /// Control egress (`SeatBound`, `BindRejected`, `FenceEvicted`) awaiting a
+    /// free cluster egress ring. Seat events are not queued here; they live in
+    /// the outbox and are offered from `send_cursor`.
+    control_egress: VecDeque<(SessionId, Vec<u8>)>,
     /// The cluster sessions currently open, in open order.
     ///
     /// A command that originates in the service itself (the day-expiry
@@ -127,6 +151,12 @@ pub struct EngineService {
 /// slab capacity, so one end-of-day expiry (one cancel report and one book
 /// update per order) fits.
 const MAX_PENDING_EGRESS: usize = 65_536;
+/// The most resting orders one resync batch may synthesize. Matches the
+/// multi-seat configuration ceiling in ADR 0012 §3.5.
+const MAX_RESYNC_ORDERS: usize = 4096;
+/// Synthetic resync reports use `event_seq | 0x8000_0000` so their FIX
+/// `ExecID` cannot collide with a real per-command event sequence.
+const RESYNC_EVENT_SEQ: u32 = 0x8000_0000;
 
 /// Timer correlation ids.
 const EXPIRY_TIMER: i64 = 1;
@@ -148,6 +178,10 @@ impl EngineService {
             market_data: None,
             restored_log_pos: -1,
             pending_egress: HashMap::new(),
+            seats: BTreeMap::new(),
+            seat_accounts: BTreeMap::new(),
+            seat_sessions: BTreeMap::new(),
+            control_egress: VecDeque::new(),
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
@@ -183,6 +217,10 @@ impl EngineService {
             }),
             restored_log_pos: -1,
             pending_egress: HashMap::new(),
+            seats: BTreeMap::new(),
+            seat_accounts: BTreeMap::new(),
+            seat_sessions: BTreeMap::new(),
+            control_egress: VecDeque::new(),
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
@@ -196,19 +234,25 @@ impl EngineService {
     ///
     /// The record is corrupt or does not fit the configuration.
     pub fn from_snapshot(config: EngineConfig, bytes: &[u8]) -> Result<Self, ServiceError> {
-        let (snapshot, _) = decode_service_snapshot(bytes)?;
+        let (snapshot, _market_seq, seats) = decode_service_snapshot(bytes)?;
         let engine = Engine::restore(config, &snapshot).map_err(ServiceError::Snapshot)?;
-        Ok(Self {
+        let mut service = Self {
             config,
             engine,
             market_data: None,
             restored_log_pos: snapshot.last_log_pos,
             pending_egress: HashMap::new(),
+            seats: BTreeMap::new(),
+            seat_accounts: BTreeMap::new(),
+            seat_sessions: BTreeMap::new(),
+            control_egress: VecDeque::new(),
             sessions: Vec::new(),
             expiry_scheduled: false,
             metrics: Arc::new(EngineMetrics::default()),
             last_book_refresh: Instant::now(),
-        })
+        };
+        service.install_seats(seats)?;
+        Ok(service)
     }
 
     /// The live market-data snapshot, when market data is enabled.
@@ -246,13 +290,16 @@ impl EngineService {
     ///
     /// A count or an encoded length does not fit the record.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ServiceError> {
-        let body = encode(&self.engine.snapshot()).map_err(ServiceError::Codec)?;
-        Ok(encode_service_snapshot(
-            body,
-            self.market_data
+        let engine_blob = encode(&self.engine.snapshot()).map_err(ServiceError::Codec)?;
+        let snapshot = ServiceSnapshot {
+            engine_blob,
+            md_seq: self
+                .market_data
                 .as_ref()
                 .map(|market| market.service.last_md_seq()),
-        ))
+            seats: self.seats.values().map(SeatOutbox::snapshot).collect(),
+        };
+        encode_service(&snapshot).map_err(ServiceError::Codec)
     }
 
     /// Decode and apply one command at `log_pos`.
@@ -277,6 +324,358 @@ impl EngineService {
         }
         self.refresh_book_metrics(false);
         Ok(events)
+    }
+
+    /// Restore the pinned seats from a `DBS3` record.
+    fn install_seats(&mut self, snapshots: Vec<SeatSnapshot>) -> Result<(), ServiceError> {
+        self.seats.clear();
+        self.seat_accounts.clear();
+        self.seat_sessions.clear();
+        for snapshot in snapshots {
+            let seat = SeatOutbox::from_snapshot(snapshot)
+                .map_err(|_| ServiceError::Codec(CodecError::Inconsistent))?;
+            let seat_id = seat.seat_id();
+            let account_id = seat.account_id();
+            if self.seats.contains_key(&seat_id) || self.seat_accounts.contains_key(&account_id) {
+                return Err(ServiceError::Codec(CodecError::Inconsistent));
+            }
+            self.seat_accounts.insert(account_id, seat_id);
+            self.seats.insert(seat_id, seat);
+        }
+        Ok(())
+    }
+
+    /// Apply one service envelope (ADR 0012). Decode errors are logged and
+    /// dropped: a trusted gateway sending a corrupt envelope must not take the
+    /// cluster service down.
+    fn handle_ingress(&mut self, session: SessionId, log_pos: LogPos, ingress: Ingress<'_>) {
+        match ingress {
+            Ingress::BindSeat(message) => self.bind_seat(session, log_pos, message),
+            Ingress::SeatCommand(message) => self.seat_command(session, log_pos, message),
+            Ingress::AckSeat(message) => self.ack_seat(session, message),
+            Ingress::RejectMalformed(message) => self.reject_malformed(session, message),
+            Ingress::UnbindSeat(message) => self.unbind_seat(session, message),
+        }
+    }
+
+    fn bind_seat(&mut self, session: SessionId, log_pos: LogPos, message: BindSeat) {
+        if message.seat_id == 0 {
+            self.reject_bind(session, message.seat_id, bind_reject_reason::INVALID_SEAT);
+            return;
+        }
+        if let Some(owner) = self.seat_accounts.get(&message.account_id).copied() {
+            if owner != message.seat_id {
+                self.reject_bind(
+                    session,
+                    message.seat_id,
+                    bind_reject_reason::ACCOUNT_CONFLICT,
+                );
+                return;
+            }
+        }
+        if let Some(existing) = self.seats.get(&message.seat_id) {
+            if existing.account_id() != message.account_id {
+                self.reject_bind(
+                    session,
+                    message.seat_id,
+                    bind_reject_reason::ACCOUNT_CONFLICT,
+                );
+                return;
+            }
+        }
+
+        let resync = self
+            .seats
+            .get(&message.seat_id)
+            .is_some_and(|seat| seat.needs_resync(message.last_journal_seq));
+        let mut summaries: Vec<RestingOrderSummary> = Vec::new();
+        if resync {
+            self.engine
+                .resting_orders_for_account(message.account_id, &mut summaries);
+            if summaries.len() > MAX_RESYNC_ORDERS {
+                eprintln!(
+                    "engine: seat {} has {} resting orders; refusing the resync",
+                    message.seat_id,
+                    summaries.len()
+                );
+                self.reject_bind(session, message.seat_id, bind_reject_reason::INVALID_SEAT);
+                return;
+            }
+        }
+
+        if let std::collections::btree_map::Entry::Vacant(vacant) =
+            self.seats.entry(message.seat_id)
+        {
+            vacant.insert(SeatOutbox::new(message.seat_id, message.account_id));
+            self.seat_accounts
+                .insert(message.account_id, message.seat_id);
+        }
+        let previous_session = self.seat_sessions.insert(message.seat_id, session);
+
+        let (epoch, generation, replay_from, next_seq) = {
+            let seat = self
+                .seats
+                .get_mut(&message.seat_id)
+                .expect("the seat was created above");
+            let epoch = seat.epoch().saturating_add(1);
+            seat.set_epoch(epoch);
+            let replay_from = if resync {
+                let replay_from = seat.begin_resync();
+                let mut ordinal = 0_u32;
+                for summary in &summaries {
+                    let avg_px = if summary.filled == 0 {
+                        0
+                    } else {
+                        i64::try_from(summary.notional / i128::from(summary.filled)).unwrap_or(0)
+                    };
+                    let report = ExecutionReportEvent {
+                        header: EventHeader {
+                            log_pos,
+                            event_seq: RESYNC_EVENT_SEQ | ordinal,
+                        },
+                        order_id: summary.order_id,
+                        cl_ord_id: summary.cl_ord_id,
+                        account: message.account_id,
+                        symbol: self.config.symbol,
+                        side: summary.side,
+                        exec_type: ExecType::New,
+                        state: summary.state,
+                        price: Some(summary.price),
+                        order_qty: summary.order_qty,
+                        last_qty: 0,
+                        last_px: None,
+                        leaves_qty: summary.order_qty - summary.filled,
+                        cum_qty: summary.filled,
+                        avg_px,
+                        reason: None,
+                    };
+                    let bytes = encode_event(&Event::ExecutionReport(report));
+                    seat.push_engine_event(0, true, None, bytes);
+                    ordinal = ordinal.saturating_add(1);
+                }
+                replay_from
+            } else {
+                let effective = message
+                    .last_journal_seq
+                    .min(seat.next_seq().saturating_sub(1));
+                effective.saturating_add(1)
+            };
+            seat.set_send_cursor(replay_from.saturating_sub(1));
+            (epoch, seat.generation(), replay_from, seat.next_seq())
+        };
+
+        // The resync batch can push the global budget over its cap; the
+        // deterministic eviction may pick this seat. If it did (or the batch
+        // alone exceeded the seat cap), the bind is answered with a fence, not
+        // a `SeatBound` whose entries never existed.
+        self.enforce_outbox_limits();
+        if self
+            .seats
+            .get(&message.seat_id)
+            .is_some_and(SeatOutbox::overflowed)
+        {
+            return;
+        }
+        if let Some(previous) = previous_session {
+            if previous != session {
+                self.queue_control(
+                    previous,
+                    Egress::FenceEvicted(FenceEvicted {
+                        seat_id: message.seat_id,
+                        new_epoch: epoch,
+                        reason: fence_reason::SUPERSEDED,
+                    }),
+                );
+            }
+        }
+        self.queue_control(
+            session,
+            Egress::SeatBound(SeatBound {
+                seat_id: message.seat_id,
+                epoch,
+                generation,
+                replay_from_seq: replay_from,
+                next_seq,
+                resynced: resync,
+            }),
+        );
+    }
+
+    fn seat_command(&mut self, session: SessionId, log_pos: LogPos, message: SeatCommand<'_>) {
+        let Some(seat) = self.seats.get(&message.seat_id) else {
+            return;
+        };
+        if seat.epoch() != message.epoch
+            || self.seat_sessions.get(&message.seat_id) != Some(&session)
+        {
+            return;
+        }
+        let account = seat.account_id();
+        let command = match decode_command(message.command) {
+            Ok(command) => command,
+            Err(error) => {
+                eprintln!("engine: seat {} command: {error}", message.seat_id);
+                return;
+            }
+        };
+        if command.account() != Some(account) {
+            eprintln!(
+                "engine: seat {} tried to act for another account",
+                message.seat_id
+            );
+            return;
+        }
+        let events = match self.apply(message.command, log_pos) {
+            Ok(events) => events,
+            Err(error) => {
+                eprintln!("engine: seat {} command: {error}", message.seat_id);
+                return;
+            }
+        };
+        self.publish_market_data(&events);
+        self.route_events(&events, Some(&command));
+    }
+
+    /// Route order-state events to the seat that owns each account. One
+    /// command can touch several seats: a taker on seat A fills a maker on
+    /// seat B, and both reports must reach their owner.
+    fn route_events(&mut self, events: &[Event], command: Option<&Command>) {
+        let mut liquidity: HashMap<OrderId, u8> = HashMap::new();
+        for event in events {
+            if let Event::Trade(trade) = event {
+                liquidity.insert(trade.maker_order_id, 1);
+                liquidity.insert(trade.taker_order_id, 2);
+            }
+        }
+        let replace_req = match command {
+            Some(Command::ReplaceOrder(replace)) => Some((replace.account, replace.cl_ord_id)),
+            _ => None,
+        };
+        for event in events {
+            let (account, bytes, tag, request) = match event {
+                Event::ExecutionReport(report) => {
+                    let tag = if report.exec_type == ExecType::Trade {
+                        liquidity.get(&report.order_id).copied().unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    let request = if report.exec_type == ExecType::Replaced {
+                        replace_req
+                            .filter(|(account, _)| *account == report.account)
+                            .map(|(_, id)| id)
+                    } else {
+                        None
+                    };
+                    (report.account, encode_event(event), tag, request)
+                }
+                Event::CancelReject(reject) => (reject.account, encode_event(event), 0, None),
+                _ => continue,
+            };
+            let Some(seat_id) = self.seat_accounts.get(&account).copied() else {
+                continue;
+            };
+            if let Some(seat) = self.seats.get_mut(&seat_id) {
+                seat.push_engine_event(tag, false, request, bytes);
+            }
+        }
+        self.enforce_outbox_limits();
+    }
+
+    fn ack_seat(&mut self, session: SessionId, message: AckSeat) {
+        let Some(seat) = self.seats.get_mut(&message.seat_id) else {
+            return;
+        };
+        if seat.epoch() != message.epoch
+            || self.seat_sessions.get(&message.seat_id) != Some(&session)
+        {
+            return;
+        }
+        seat.ack(message.up_to_seq);
+    }
+
+    fn reject_malformed(&mut self, session: SessionId, message: RejectMalformed) {
+        let Some(seat) = self.seats.get(&message.seat_id) else {
+            return;
+        };
+        if seat.epoch() != message.epoch
+            || self.seat_sessions.get(&message.seat_id) != Some(&session)
+        {
+            return;
+        }
+        if let Some(seat) = self.seats.get_mut(&message.seat_id) {
+            seat.push_malformed_reject(
+                message.raw_cl_ord_id,
+                message.raw_orig_cl_ord_id,
+                message.is_cancel_or_replace,
+                message.reason,
+            );
+        }
+        self.enforce_outbox_limits();
+    }
+
+    fn unbind_seat(&mut self, session: SessionId, message: UnbindSeat) {
+        let Some(seat) = self.seats.get(&message.seat_id) else {
+            return;
+        };
+        if seat.epoch() != message.epoch {
+            return;
+        }
+        if self.seat_sessions.get(&message.seat_id) == Some(&session) {
+            self.seat_sessions.remove(&message.seat_id);
+        }
+    }
+
+    fn reject_bind(&mut self, session: SessionId, seat_id: u16, reason: u8) {
+        self.queue_control(
+            session,
+            Egress::BindRejected(BindRejected { seat_id, reason }),
+        );
+    }
+
+    fn queue_control(&mut self, session: SessionId, message: Egress<'_>) {
+        match message.encode() {
+            Ok(frame) => self.control_egress.push_back((session, frame)),
+            Err(error) => eprintln!("engine: service egress: {error}"),
+        }
+    }
+
+    /// Apply the per-seat and global outbox budgets (ADR 0012 §3.6).
+    fn enforce_outbox_limits(&mut self) {
+        let over: Vec<u16> = self
+            .seats
+            .iter()
+            .filter(|(_, seat)| seat.over_capacity())
+            .map(|(id, _)| *id)
+            .collect();
+        for seat_id in over {
+            self.overflow_seat(seat_id);
+        }
+        if total_buffered_bytes(self.seats.values()) <= MAX_TOTAL_OUTBOX_BYTES {
+            return;
+        }
+        let victims = eviction_plan(self.seats.values(), MAX_TOTAL_OUTBOX_BYTES);
+        for seat_id in victims {
+            self.overflow_seat(seat_id);
+        }
+    }
+
+    fn overflow_seat(&mut self, seat_id: u16) {
+        let Some(epoch) = self.seats.get_mut(&seat_id).map(|seat| {
+            seat.overflow();
+            seat.epoch()
+        }) else {
+            return;
+        };
+        if let Some(session) = self.seat_sessions.remove(&seat_id) {
+            self.queue_control(
+                session,
+                Egress::FenceEvicted(FenceEvicted {
+                    seat_id,
+                    new_epoch: epoch,
+                    reason: fence_reason::OUTBOX_OVERFLOW,
+                }),
+            );
+        }
     }
 
     /// Read the book's shape for the metrics page, at most once a second.
@@ -378,7 +777,7 @@ impl EngineService {
     /// runs after every command (and on the day timer once it is scheduled),
     /// which is enough: a gateway that is not reading is also not sending
     /// commands.
-    fn flush_egress(&mut self, cluster: &mut Cluster<'_>) {
+    fn flush_legacy(&mut self, cluster: &mut Cluster<'_>) {
         if self.pending_egress.is_empty() {
             return;
         }
@@ -401,6 +800,79 @@ impl EngineService {
             }
         }
         self.pending_egress.retain(|_, queue| !queue.is_empty());
+    }
+
+    /// Offer every queued control frame, stopping at the first back-pressure.
+    ///
+    /// Returns `true` when the control queue is empty, which is the barrier
+    /// that keeps `SeatBound` ahead of the first `SeatEvent` for that session.
+    fn flush_control(&mut self, cluster: &mut Cluster<'_>) -> bool {
+        while let Some((session, frame)) = self.control_egress.front() {
+            match offer_once(cluster, *session, frame) {
+                OfferOutcome::Sent => {
+                    self.control_egress.pop_front();
+                }
+                OfferOutcome::BackPressured => return false,
+            }
+        }
+        true
+    }
+
+    /// Offer each bound seat's retained events from its `send_cursor`.
+    fn flush_seats(&mut self, cluster: &mut Cluster<'_>) {
+        let seat_ids: Vec<u16> = self.seats.keys().copied().collect();
+        for seat_id in seat_ids {
+            let Some(session) = self.seat_sessions.get(&seat_id).copied() else {
+                continue;
+            };
+            loop {
+                let (next, frame) = {
+                    let Some(seat) = self.seats.get(&seat_id) else {
+                        break;
+                    };
+                    let next = seat.send_cursor().saturating_add(1);
+                    let Some(entry) = seat.entry_at(next) else {
+                        break;
+                    };
+                    let encoded = Egress::SeatEvent(SeatEvent {
+                        seat_id,
+                        epoch: seat.epoch(),
+                        generation: seat.generation(),
+                        seat_seq: entry.seat_seq,
+                        liquidity: entry.liquidity,
+                        payload_kind: entry.payload_kind,
+                        resync: entry.is_resync(),
+                        replace_req_cl_ord_id: entry.replace_req_cl_ord_id,
+                        payload: &entry.payload,
+                    })
+                    .encode();
+                    match encoded {
+                        Ok(frame) => (next, frame),
+                        Err(error) => {
+                            eprintln!("engine: seat {seat_id} egress: {error}");
+                            break;
+                        }
+                    }
+                };
+                match offer_once(cluster, session, &frame) {
+                    OfferOutcome::Sent => {
+                        if let Some(seat) = self.seats.get_mut(&seat_id) {
+                            seat.advance_send_cursor(next);
+                        }
+                    }
+                    OfferOutcome::BackPressured => break,
+                }
+            }
+        }
+    }
+
+    /// Offer control frames, then the legacy queue, then the seat outboxes.
+    fn flush_egress(&mut self, cluster: &mut Cluster<'_>) {
+        if !self.flush_control(cluster) {
+            return;
+        }
+        self.flush_legacy(cluster);
+        self.flush_seats(cluster);
     }
 
     /// Offer the end-of-day command as a service message.
@@ -432,11 +904,19 @@ impl ClusteredService for EngineService {
         let restored_from_snapshot = snapshot.is_some();
         let mut restored_bytes = 0_usize;
         obs::start(self.config.symbol);
+        // Sessions and queued egress are process-local; a start begins with
+        // none of them, whatever the previous incarnation left behind.
+        self.pending_egress.clear();
+        self.seat_sessions.clear();
+        self.control_egress.clear();
+        self.sessions.clear();
         if let Some(reader) = snapshot {
             let bytes = read_snapshot(cluster, reader)?;
             restored_bytes = bytes.len();
-            let (decoded, market_seq) = decode_service_snapshot(&bytes).map_err(container)?;
+            let (decoded, market_seq, seats) =
+                decode_service_snapshot(&bytes).map_err(container)?;
             self.engine = Engine::restore(self.config, &decoded).map_err(container)?;
+            self.install_seats(seats).map_err(container)?;
             self.restored_log_pos = decoded.last_log_pos;
             // ★ Said out loud, and said on **both** branches, because "did this
             // member come back from its snapshot or replay the log from the
@@ -519,6 +999,16 @@ impl ClusteredService for EngineService {
     ) -> Result<(), ContainerError> {
         // The cluster session is gone; nothing can deliver these reports.
         self.pending_egress.remove(&session);
+        self.control_egress.retain(|(target, _)| *target != session);
+        let unbound: Vec<u16> = self
+            .seat_sessions
+            .iter()
+            .filter(|(_, owner)| **owner == session)
+            .map(|(seat_id, _)| *seat_id)
+            .collect();
+        for seat_id in unbound {
+            self.seat_sessions.remove(&seat_id);
+        }
         self.sessions.retain(|open| *open != session);
         Ok(())
     }
@@ -544,18 +1034,31 @@ impl ClusteredService for EngineService {
             self.expiry_scheduled = true;
         }
 
+        if payload.first() == Some(&crate::envelope::MAGIC) {
+            if let Some(session) = session {
+                match Ingress::decode(payload) {
+                    Ok(ingress) => self.handle_ingress(session, header.position, ingress),
+                    Err(error) => eprintln!("engine: service envelope: {error}"),
+                }
+            }
+            self.flush_egress(cluster);
+            return Ok(());
+        }
+
         let events = self.apply(payload, header.position).map_err(container)?;
         self.publish_market_data(&events);
         match session {
             Some(session) => self.queue_egress(session, &events),
             // A service-originated command (the day expiry) has no originating
-            // session; its reports go to every open session.
-            None => {
+            // session. With seats, route each report to the account's owner;
+            // the legacy single-session mode still broadcasts.
+            None if self.seats.is_empty() => {
                 let targets = self.sessions.clone();
                 for target in targets {
                     self.queue_egress(target, &events);
                 }
             }
+            None => self.route_events(&events, None),
         }
         self.flush_egress(cluster);
         Ok(())
@@ -608,11 +1111,15 @@ impl ClusteredService for EngineService {
             // compared across a failover -- which is the question a four-host
             // run actually asks.
             let mut state_hash = None;
-            if let Ok((mut snapshot, seq)) = decode_service_snapshot(&bytes) {
+            if let Ok((mut snapshot, _seq, seats)) = decode_service_snapshot(&bytes) {
                 snapshot.last_log_pos = 0;
                 if let Ok(body) = encode(&snapshot) {
                     let mut state = std::collections::hash_map::DefaultHasher::new();
-                    encode_service_snapshot(body, seq).hash(&mut state);
+                    body.hash(&mut state);
+                    for seat in &seats {
+                        seat.seat_id.hash(&mut state);
+                        seat.account_id.hash(&mut state);
+                    }
                     state_hash = Some(state.finish());
                     eprintln!("engine: state hash={:016x}", state.finish());
                 }
@@ -650,6 +1157,13 @@ impl ClusteredService for EngineService {
             // ours; arm a new one on the next command (the callback has no
             // cluster handle, so it cannot schedule here).
             self.expiry_scheduled = false;
+            // `send_cursor` is the previous leader's process-local progress;
+            // re-offer every unacknowledged entry. Gateways deduplicate by
+            // `seat_seq`, so this can duplicate a delivery but never loses one.
+            for seat in self.seats.values_mut() {
+                let acked = seat.acked_seq();
+                seat.set_send_cursor(acked);
+            }
         }
         Ok(())
     }
@@ -697,34 +1211,32 @@ fn market_snapshot_from_engine(engine: &Engine, md_seq: Seq) -> Snapshot {
 /// Prepend the market-data sequence to an encoded engine snapshot.
 ///
 /// The M4 record is unchanged after the 13-byte prefix, and a record without
-/// the prefix (a snapshot written before market data was enabled) still
-/// decodes: the prefix is additive.
-fn encode_service_snapshot(body: Vec<u8>, market_seq: Option<Seq>) -> Vec<u8> {
-    let Some(market_seq) = market_seq else {
-        return body;
-    };
-    let mut out = Vec::with_capacity(MARKET_PREFIX + body.len());
-    out.extend_from_slice(&MARKET_MAGIC);
-    out.push(MARKET_VERSION);
-    out.extend_from_slice(&market_seq.to_le_bytes());
-    out.extend_from_slice(&body);
-    out
-}
-
-fn decode_service_snapshot(bytes: &[u8]) -> Result<(EngineSnapshot, Option<Seq>), ServiceError> {
-    if !bytes.starts_with(&MARKET_MAGIC) {
-        return Ok((decode(bytes).map_err(ServiceError::Codec)?, None));
+/// Decode a container snapshot.
+///
+/// `DBS3` carries the engine blob plus the pinned seats; the legacy `MDS1`
+/// prefix and bare `DBS1`/`DBS2` records carry no seats.
+fn decode_service_snapshot(
+    bytes: &[u8],
+) -> Result<(EngineSnapshot, Option<Seq>, Vec<SeatSnapshot>), ServiceError> {
+    if bytes.starts_with(&DBS3_MAGIC) {
+        let snapshot = decode_service(bytes).map_err(ServiceError::Codec)?;
+        let engine = decode(&snapshot.engine_blob).map_err(ServiceError::Codec)?;
+        return Ok((engine, snapshot.md_seq, snapshot.seats));
     }
-    if bytes.len() < MARKET_PREFIX {
-        return Err(ServiceError::Codec(CodecError::Truncated));
+    if bytes.starts_with(&MARKET_MAGIC) {
+        if bytes.len() < MARKET_PREFIX {
+            return Err(ServiceError::Codec(CodecError::Truncated));
+        }
+        if bytes[4] != MARKET_VERSION {
+            return Err(ServiceError::Codec(CodecError::BadVersion(bytes[4])));
+        }
+        let mut seq = [0_u8; 8];
+        seq.copy_from_slice(&bytes[5..MARKET_PREFIX]);
+        let engine = decode(&bytes[MARKET_PREFIX..]).map_err(ServiceError::Codec)?;
+        return Ok((engine, Some(Seq::from_le_bytes(seq)), Vec::new()));
     }
-    if bytes[4] != MARKET_VERSION {
-        return Err(ServiceError::Codec(CodecError::BadVersion(bytes[4])));
-    }
-    let mut seq = [0_u8; 8];
-    seq.copy_from_slice(&bytes[5..MARKET_PREFIX]);
-    let snapshot = decode(&bytes[MARKET_PREFIX..]).map_err(ServiceError::Codec)?;
-    Ok((snapshot, Some(Seq::from_le_bytes(seq))))
+    let engine = decode(bytes).map_err(ServiceError::Codec)?;
+    Ok((engine, None, Vec::new()))
 }
 
 fn read_snapshot(
@@ -790,7 +1302,7 @@ fn container(error: impl fmt::Display) -> ContainerError {
 mod tests {
     use super::*;
     use deepbook_engine_core::ClientOrderId;
-    use deepbook_engine_core::wire::{encode_command, encode_event};
+    use deepbook_engine_core::wire::{decode_event, encode_command, encode_event};
     use deepbook_engine_core::{Command, NewOrder, OrdType, RiskConfig, TimeInForce};
     use deepbook_types::{AccountId, Price, Qty, Side};
 
@@ -921,15 +1433,329 @@ mod tests {
         }
 
         let body = encode(&service.engine.snapshot()).expect("snapshot");
-        let wrapped = encode_service_snapshot(body, Some(42));
-        let (decoded, market_seq) = decode_service_snapshot(&wrapped).expect("decode");
+        let wrapped = encode_service(&ServiceSnapshot {
+            engine_blob: body,
+            md_seq: Some(42),
+            seats: Vec::new(),
+        })
+        .expect("encode");
+        let (decoded, market_seq, seats) = decode_service_snapshot(&wrapped).expect("decode");
         assert_eq!(Some(42), market_seq);
+        assert!(seats.is_empty());
         let restored = Engine::restore(config(), &decoded).expect("restore");
         assert_eq!(service.book_hash(), restored.book_hash());
 
-        // A record written before market data was enabled has no prefix.
+        // A record written before market data was enabled has no market seq.
         let bare = service.snapshot_bytes().expect("bare snapshot");
-        let (_, no_market_seq) = decode_service_snapshot(&bare).expect("bare");
+        let (_, no_market_seq, no_seats) = decode_service_snapshot(&bare).expect("bare");
         assert_eq!(None, no_market_seq);
+        assert!(no_seats.is_empty());
+    }
+
+    fn bind(
+        service: &mut EngineService,
+        session: i64,
+        seat_id: u16,
+        account_id: AccountId,
+        last_journal_seq: u64,
+    ) {
+        service.handle_ingress(
+            SessionId(session),
+            1,
+            Ingress::BindSeat(BindSeat {
+                seat_id,
+                account_id,
+                last_journal_seq,
+            }),
+        );
+    }
+
+    fn seat_command(
+        service: &mut EngineService,
+        session: i64,
+        log_pos: LogPos,
+        seat_id: u16,
+        epoch: u64,
+        command: &Command,
+    ) {
+        let encoded = encode_command(command);
+        service.handle_ingress(
+            SessionId(session),
+            log_pos,
+            Ingress::SeatCommand(SeatCommand {
+                seat_id,
+                epoch,
+                command: &encoded,
+            }),
+        );
+    }
+
+    fn report(entry: &crate::outbox::OutboxEntry) -> ExecutionReportEvent {
+        match decode_event(&entry.payload).expect("event") {
+            Event::ExecutionReport(report) => report,
+            other => panic!("expected an execution report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fill_routes_to_both_seat_owners() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        bind(&mut service, 11, 2, 2, 0);
+        seat_command(
+            &mut service,
+            10,
+            2,
+            1,
+            1,
+            &limit(1, "S1", Side::Sell, 100, 10),
+        );
+        seat_command(
+            &mut service,
+            11,
+            3,
+            2,
+            1,
+            &limit(2, "B1", Side::Buy, 100, 4),
+        );
+
+        let maker_seat = service.seats.get(&1).expect("maker seat");
+        let maker_fills: Vec<_> = maker_seat
+            .entries()
+            .filter_map(|entry| {
+                let report = report(entry);
+                (report.exec_type == ExecType::Trade).then_some((entry.liquidity, report))
+            })
+            .collect();
+        assert_eq!(maker_fills.len(), 1);
+        assert_eq!(maker_fills[0].0, 1, "maker liquidity");
+        assert_eq!(maker_fills[0].1.account, 1);
+        assert_eq!(maker_fills[0].1.last_qty, 4);
+        assert_eq!(maker_fills[0].1.leaves_qty, 6);
+
+        let taker_seat = service.seats.get(&2).expect("taker seat");
+        let taker_fills: Vec<_> = taker_seat
+            .entries()
+            .filter_map(|entry| {
+                let report = report(entry);
+                (report.exec_type == ExecType::Trade).then_some((entry.liquidity, report))
+            })
+            .collect();
+        assert_eq!(taker_fills.len(), 1);
+        assert_eq!(taker_fills[0].0, 2, "taker liquidity");
+        assert_eq!(taker_fills[0].1.account, 2);
+        assert_eq!(taker_fills[0].1.last_qty, 4);
+    }
+
+    #[test]
+    fn an_ack_trims_the_seat_outbox() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        seat_command(
+            &mut service,
+            10,
+            2,
+            1,
+            1,
+            &limit(1, "S1", Side::Sell, 100, 10),
+        );
+        let next = service.seats.get(&1).expect("seat").next_seq();
+        service.handle_ingress(
+            SessionId(10),
+            3,
+            Ingress::AckSeat(AckSeat {
+                seat_id: 1,
+                epoch: 1,
+                up_to_seq: next.saturating_sub(1),
+            }),
+        );
+        let seat = service.seats.get(&1).expect("seat");
+        assert_eq!(seat.acked_seq(), next.saturating_sub(1));
+        assert_eq!(seat.entry_count(), 0);
+        assert!(!seat.needs_resync(next.saturating_sub(1)));
+    }
+
+    #[test]
+    fn an_overflowed_bind_restates_the_resting_orders() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        seat_command(
+            &mut service,
+            10,
+            2,
+            1,
+            1,
+            &limit(1, "S1", Side::Sell, 100, 10),
+        );
+
+        service.seat_sessions.remove(&1);
+        {
+            let seat = service.seats.get_mut(&1).expect("seat");
+            seat.overflow();
+        }
+        let generation = service.seats.get(&1).expect("seat").generation();
+        bind(&mut service, 12, 1, 1, 0);
+
+        let seat = service.seats.get(&1).expect("seat");
+        assert_eq!(seat.generation(), generation + 1);
+        assert_eq!(seat.entry_count(), 1);
+        let entry = seat.entries().next().expect("synthetic report");
+        assert!(entry.is_resync());
+        let report = report(entry);
+        assert_eq!(report.cl_ord_id, cl("S1"));
+        assert_eq!(report.price, Some(100));
+        assert_eq!(report.order_qty, 10);
+        assert_eq!(report.leaves_qty, 10);
+        assert_eq!(report.cum_qty, 0);
+        assert_eq!(report.exec_type, ExecType::New);
+        assert_eq!(report.header.event_seq & RESYNC_EVENT_SEQ, RESYNC_EVENT_SEQ);
+
+        let (target, frame) = service.control_egress.back().expect("seat bound");
+        assert_eq!(*target, SessionId(12));
+        match Egress::decode(frame).expect("egress") {
+            Egress::SeatBound(bound) => {
+                assert!(bound.resynced);
+                assert_eq!(bound.generation, generation + 1);
+                assert_eq!(bound.next_seq, seat.next_seq());
+            }
+            other => panic!("expected SeatBound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_new_bind_fences_the_previous_session() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        bind(&mut service, 11, 1, 1, 0);
+
+        let seat = service.seats.get(&1).expect("seat");
+        assert_eq!(seat.epoch(), 2);
+        assert_eq!(service.seat_sessions.get(&1).copied(), Some(SessionId(11)));
+
+        let mut fenced = false;
+        let mut bound = false;
+        for (target, frame) in &service.control_egress {
+            match Egress::decode(frame).expect("egress") {
+                Egress::FenceEvicted(message) => {
+                    assert_eq!(*target, SessionId(10));
+                    assert_eq!(message.new_epoch, 2);
+                    fenced = true;
+                }
+                Egress::SeatBound(message) if message.epoch == 2 => {
+                    assert_eq!(*target, SessionId(11));
+                    bound = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(fenced, "the old session must be fenced");
+        assert!(bound, "the new session must get SeatBound");
+    }
+
+    #[test]
+    fn a_malformed_reject_is_a_service_entry() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        service.handle_ingress(
+            SessionId(10),
+            2,
+            Ingress::RejectMalformed(RejectMalformed {
+                seat_id: 1,
+                epoch: 1,
+                raw_cl_ord_id: 0,
+                raw_orig_cl_ord_id: 7,
+                is_cancel_or_replace: true,
+                reason: 101,
+            }),
+        );
+        let seat = service.seats.get(&1).expect("seat");
+        let entry = seat.entries().next().expect("reject");
+        assert_eq!(entry.payload_kind, crate::envelope::KIND_MALFORMED_REJECT);
+        assert_eq!(entry.liquidity, 0);
+        assert_eq!(entry.payload.len(), 18);
+        assert_eq!(entry.payload[16], 1);
+        assert_eq!(entry.payload[17], 101);
+    }
+
+    #[test]
+    fn unbinding_keeps_the_outbox() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        seat_command(
+            &mut service,
+            10,
+            2,
+            1,
+            1,
+            &limit(1, "S1", Side::Sell, 100, 10),
+        );
+        let entries = service.seats.get(&1).expect("seat").entry_count();
+        service.handle_ingress(
+            SessionId(10),
+            3,
+            Ingress::UnbindSeat(UnbindSeat {
+                seat_id: 1,
+                epoch: 1,
+                reason: 1,
+            }),
+        );
+        assert!(!service.seat_sessions.contains_key(&1));
+        assert_eq!(service.seats.get(&1).expect("seat").entry_count(), entries);
+    }
+
+    #[test]
+    fn a_seat_cannot_send_a_service_command() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        let next = service.seats.get(&1).expect("seat").next_seq();
+        seat_command(&mut service, 10, 2, 1, 1, &Command::Snapshot);
+        assert_eq!(service.seats.get(&1).expect("seat").next_seq(), next);
+    }
+
+    #[test]
+    fn conflicting_pins_are_refused() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        bind(&mut service, 11, 2, 1, 0);
+        assert_eq!(service.seats.len(), 1);
+        match Egress::decode(&service.control_egress.back().expect("reject").1).expect("egress") {
+            Egress::BindRejected(message) => {
+                assert_eq!(message.seat_id, 2);
+                assert_eq!(message.reason, bind_reject_reason::ACCOUNT_CONFLICT);
+            }
+            other => panic!("expected BindRejected, got {other:?}"),
+        }
+
+        bind(&mut service, 11, 1, 2, 0);
+        assert_eq!(
+            service.seats.get(&1).expect("seat").account_id(),
+            1,
+            "the first pin is immutable"
+        );
+    }
+
+    #[test]
+    fn seats_round_trip_in_the_dbs3_snapshot() {
+        let mut service = EngineService::new(config());
+        bind(&mut service, 10, 1, 1, 0);
+        seat_command(
+            &mut service,
+            10,
+            2,
+            1,
+            1,
+            &limit(1, "S1", Side::Sell, 100, 10),
+        );
+        let bytes = service.snapshot_bytes().expect("snapshot");
+        assert!(bytes.starts_with(&DBS3_MAGIC));
+
+        let restored = EngineService::from_snapshot(config(), &bytes).expect("restore");
+        assert_eq!(service.book_hash(), restored.book_hash());
+        assert_eq!(restored.seats.len(), 1);
+        assert_eq!(restored.seat_accounts.get(&1), Some(&1));
+        assert_eq!(
+            restored.seats.get(&1).expect("seat").snapshot(),
+            service.seats.get(&1).expect("seat").snapshot()
+        );
     }
 }

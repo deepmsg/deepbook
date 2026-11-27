@@ -108,6 +108,7 @@ fn execution_report_event(session: SessionKey) -> SessionEvent {
             exec_id: "1-0".to_owned(),
             order_id: "1".to_owned(),
             cl_ord_id: "C-1".to_owned(),
+            orig_cl_ord_id: None,
             exec_type: ExecType::New,
             ord_status: OrdStatus::New,
             symbol: "AAPL".to_owned(),

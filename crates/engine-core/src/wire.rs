@@ -442,6 +442,15 @@ fn reason_from_value(reason: RejectReason) -> u8 {
     }
 }
 
+/// The wire code for a reject reason.
+///
+/// This is the same table [`decode_event`] reads, exposed so a gateway can
+/// project it onto an outbound protocol without duplicating the numbers.
+#[must_use]
+pub fn reject_reason_code(reason: RejectReason) -> u8 {
+    reason_from_value(reason)
+}
+
 fn reason_from(byte: u8) -> Result<Option<RejectReason>, WireError> {
     Ok(match byte {
         0 => None,

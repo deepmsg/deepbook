@@ -117,6 +117,24 @@ pub enum Command {
     Snapshot,
 }
 
+impl Command {
+    /// The account this command acts for, when it has one.
+    ///
+    /// A seat may only submit commands whose account it is bound to. The
+    /// service-only commands (`Snapshot`, `ExpireDayOrders`, and a global
+    /// `KillSwitch`) have no account and are never accepted from a seat.
+    #[must_use]
+    pub const fn account(&self) -> Option<AccountId> {
+        match self {
+            Self::NewOrder(order) => Some(order.account),
+            Self::CancelOrder(cancel) => Some(cancel.account),
+            Self::ReplaceOrder(replace) => Some(replace.account),
+            Self::KillSwitch { account } => *account,
+            Self::ExpireDayOrders | Self::Snapshot => None,
+        }
+    }
+}
+
 /// Why the engine refused a command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RejectReason {

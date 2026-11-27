@@ -7,11 +7,14 @@
 //! `deepbook-gateway`'s `ClusterEngine` (ADR 0006).
 #![forbid(unsafe_code)]
 
+pub mod envelope;
 pub mod metrics;
 pub mod obs;
+pub mod outbox;
 pub mod service;
 pub mod snapshot;
 
 pub use metrics::EngineMetrics;
+pub use outbox::{OutboxEntry, SeatOutbox, SeatSnapshot};
 pub use service::{EngineService, MarketDataConfig, ServiceError};
-pub use snapshot::{CodecError, decode, encode};
+pub use snapshot::{CodecError, ServiceSnapshot, decode, decode_service, encode, encode_service};

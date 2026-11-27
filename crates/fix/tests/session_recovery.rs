@@ -41,6 +41,7 @@ fn execution_report(exec_id: &str) -> ApplicationMessage {
         exec_id: exec_id.to_owned(),
         order_id: "O-1".to_owned(),
         cl_ord_id: "C-1".to_owned(),
+        orig_cl_ord_id: None,
         exec_type: ExecType::New,
         ord_status: OrdStatus::New,
         symbol: "AAPL".to_owned(),

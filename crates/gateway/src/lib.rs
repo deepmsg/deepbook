@@ -23,11 +23,15 @@ pub mod acceptor;
 pub mod cluster;
 pub mod metrics;
 pub mod obs;
+pub mod seat;
 pub mod sink;
 pub mod stub;
 
 pub use acceptor::{Gateway, GatewayConfig};
-pub use cluster::{ClusterEngine, ClusterEngineConfig, ClusterEngineError};
+pub use cluster::{
+    ClusterEngine, ClusterEngineConfig, ClusterEngineError, OwnedSeatEvent, SeatClusterEngine,
+    SeatEgress,
+};
 pub use deepbook_fix::frame;
 pub use deepbook_fix::frame::{FrameDecoder, FrameError};
 pub use metrics::GatewayMetrics;

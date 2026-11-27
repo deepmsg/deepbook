@@ -10,7 +10,7 @@ use deepbook_types::{
     AccountId, EMPTY_ORDER_ID, LogPos, OrderId, OrderState, Price, Qty, Seq, Side, SymbolId,
 };
 
-use crate::book::{Book, BookView, OrderCold, OrderHot};
+use crate::book::{Book, BookView, OrderCold, OrderHot, PriceLevel};
 use crate::command::{
     CancelOrder, Command, NewOrder, OrdType, RejectReason, ReplaceOrder, TimeInForce,
 };
@@ -18,7 +18,7 @@ use crate::event::{
     BookUpdateEvent, CancelRejectEvent, Event, EventHeader, EventSeq, EventSink, ExecType,
     ExecutionReportEvent, SnapshotEvent, TradeEvent,
 };
-use crate::ids::{ClientOrderId, IdMap, MAX_SLOTS, Seen, SeenState};
+use crate::ids::{ClientOrderId, EMPTY_SLOT, IdMap, MAX_SLOTS, Seen, SeenState};
 use crate::risk::{RiskConfig, SelfTradePrevention};
 use crate::snapshot::{EngineSnapshot, SnapshotError};
 
@@ -58,7 +58,74 @@ pub struct Engine {
     event_seq: EventSeq,
 }
 
+/// One resting order as seen by the resync path (ADR 0012).
+///
+/// `avg_px` is derived by the caller from `notional / filled`; the summary
+/// carries the raw integers so the service can reproduce the report exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RestingOrderSummary {
+    /// The order's client id.
+    pub cl_ord_id: ClientOrderId,
+    /// The packed engine order id.
+    pub order_id: OrderId,
+    /// Buy or sell.
+    pub side: Side,
+    /// Limit price.
+    pub price: Price,
+    /// Original quantity.
+    pub order_qty: Qty,
+    /// Already filled quantity.
+    pub filled: Qty,
+    /// Filled notional, for `avg_px`.
+    pub notional: i128,
+    /// `New` or `Partial`.
+    pub state: OrderState,
+}
+
 impl Engine {
+    /// Collect this account's resting orders in a deterministic order.
+    ///
+    /// Bids are walked best-first (descending price), asks best-first
+    /// (ascending price), and each price level in FIFO order. The walk only
+    /// touches non-empty levels, so it is O(open orders), not O(slab capacity).
+    /// This is read-only: it never changes the book, the slab or the metrics.
+    pub fn resting_orders_for_account(
+        &self,
+        account: AccountId,
+        out: &mut Vec<RestingOrderSummary>,
+    ) {
+        out.clear();
+        self.collect_resting(account, self.book.levels_descending(Side::Buy), out);
+        self.collect_resting(account, self.book.levels_ascending(Side::Sell), out);
+    }
+
+    fn collect_resting<I>(&self, account: AccountId, levels: I, out: &mut Vec<RestingOrderSummary>)
+    where
+        I: Iterator<Item = (Price, PriceLevel)>,
+    {
+        for (_price, level) in levels {
+            let mut slot = level.head;
+            while slot != EMPTY_SLOT {
+                let order = &self.book.orders[slot as usize];
+                if order.account == account
+                    && matches!(order.state, OrderState::New | OrderState::Partial)
+                {
+                    out.push(RestingOrderSummary {
+                        cl_ord_id: self.book.cold[slot as usize].cl_ord_id,
+                        order_id: order.id,
+                        side: order.side,
+                        price: order.price,
+                        order_qty: order.qty,
+                        filled: order.filled,
+                        notional: order.notional,
+                        state: order.state,
+                    });
+                }
+                slot = order.next;
+            }
+        }
+    }
+
     /// Build an engine with `config.max_orders` slab slots.
     #[must_use]
     pub fn new(config: EngineConfig) -> Self {
@@ -2246,5 +2313,85 @@ mod tests {
         assert!(view.asks.is_empty(), "the outlier ask should be gone");
         assert_eq!(view.bids.len(), 1);
         assert_eq!(view.bids[0].price, 500_000);
+    }
+
+    #[test]
+    fn resting_orders_are_best_first_and_filtered_by_account() {
+        let mut engine = new_engine();
+        run(
+            &mut engine,
+            &[
+                limit(
+                    1,
+                    "B1",
+                    Side::Buy,
+                    99,
+                    5,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(
+                    1,
+                    "B2",
+                    Side::Buy,
+                    101,
+                    7,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(
+                    2,
+                    "S1",
+                    Side::Sell,
+                    102,
+                    3,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(
+                    1,
+                    "S2",
+                    Side::Sell,
+                    104,
+                    4,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                // Partially fill B2 so the summary reports filled/notional.
+                limit(
+                    3,
+                    "S3",
+                    Side::Sell,
+                    101,
+                    2,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+            ],
+        );
+
+        let hash = engine.book_hash();
+        let mut orders = Vec::new();
+        engine.resting_orders_for_account(1, &mut orders);
+        assert_eq!(engine.book_hash(), hash, "the walk is read-only");
+        assert_eq!(
+            orders
+                .iter()
+                .map(|order| order.cl_ord_id)
+                .collect::<Vec<_>>(),
+            vec![cl("B2"), cl("B1"), cl("S2")]
+        );
+        assert_eq!(orders[0].side, Side::Buy);
+        assert_eq!(orders[0].price, 101);
+        assert_eq!(orders[0].order_qty, 7);
+        assert_eq!(orders[0].filled, 2);
+        assert_eq!(orders[0].notional, 202);
+        assert_eq!(orders[0].state, OrderState::Partial);
+        assert_eq!(orders[1].state, OrderState::New);
+
+        engine.resting_orders_for_account(2, &mut orders);
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0].cl_ord_id, cl("S1"));
+        assert_eq!(orders[0].side, Side::Sell);
     }
 }

@@ -321,8 +321,13 @@ impl SeatGateway {
             }
             Event::Read { id, result } => match result {
                 Ok(0) => self.close(id, unbind_reasons::CLIENT_CLOSED),
-                Ok(_) => {
-                    let bytes = self.event_loop.read_data(id).to_vec();
+                Ok(count) => {
+                    let bytes = self
+                        .event_loop
+                        .read_data(id)
+                        .get(..count)
+                        .unwrap_or(&[])
+                        .to_vec();
                     if let Some(connection) = self.connections.get_mut(&id) {
                         connection.last_inbound = Instant::now();
                         connection.buffer.extend_from_slice(&bytes);
@@ -480,6 +485,7 @@ impl SeatGateway {
             connection.state = ConnState::Binding;
         }
         self.owners.insert(seat_id, id);
+        eprintln!("ouch-gateway: login seat {seat_id} connection {id}");
         self.cluster.bind(seat_id, seat.account_id, last);
     }
 
@@ -676,7 +682,8 @@ impl SeatGateway {
         self.protocol_violation_id(id, &error.to_string());
     }
 
-    fn protocol_violation_id(&mut self, id: u64, _detail: &str) {
+    fn protocol_violation_id(&mut self, id: u64, detail: &str) {
+        eprintln!("ouch-gateway: protocol violation on {id}: {detail}");
         if let Some(connection) = self.connections.get_mut(&id) {
             let _ = connection.push(&Message::Logout {
                 reason: logout::PROTOCOL_VIOLATION,
@@ -818,6 +825,7 @@ impl SeatGateway {
         if already_accepted {
             // A cluster reconnect: the client already has its login; only the
             // journal caught up. Resume live without a second LoginAccepted.
+            eprintln!("ouch-gateway: seat {seat_id} caught up (already accepted)");
             if let Some(connection) = self.connections.get_mut(&id) {
                 connection.state = ConnState::Live;
             }
@@ -848,6 +856,10 @@ impl SeatGateway {
                     connection.state = ConnState::Live;
                     connection.accepted = true;
                     connection.last_outbound = Instant::now();
+                    eprintln!(
+                        "ouch-gateway: seat {seat_id} live at seq {}",
+                        outcome.first_seq
+                    );
                 }
             }
             Err(error) => {
@@ -968,6 +980,10 @@ impl SeatGateway {
         let Some(connection) = self.connections.remove(&id) else {
             return;
         };
+        eprintln!(
+            "ouch-gateway: close connection {id} seat={:?} state={:?} reason={unbind_reason}",
+            connection.seat_id, connection.state
+        );
         if let Some(seat_id) = connection.seat_id {
             if self.owners.get(&seat_id) == Some(&id) {
                 self.owners.remove(&seat_id);

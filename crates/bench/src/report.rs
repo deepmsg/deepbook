@@ -38,6 +38,8 @@ pub struct Summary {
     pub p90_ns: u64,
     /// 99th percentile.
     pub p99_ns: u64,
+    /// Mean of the samples below `p99`.
+    pub truncated_mean_ns: u64,
     /// 99.9th percentile.
     pub p999_ns: u64,
     /// Slowest sample.
@@ -56,6 +58,7 @@ impl Report {
                 p50_ns: 0,
                 p90_ns: 0,
                 p99_ns: 0,
+                truncated_mean_ns: 0,
                 p999_ns: 0,
                 max_ns: 0,
             };
@@ -65,13 +68,26 @@ impl Report {
         let total: u128 = sorted.iter().map(|value| u128::from(*value)).sum();
         #[allow(clippy::cast_possible_truncation)] // a mean of u64 nanoseconds
         let mean = (total / sorted.len() as u128) as u64;
+        let p99 = percentile(&sorted, 0.99);
+        let below: Vec<u64> = sorted
+            .iter()
+            .copied()
+            .filter(|value| *value < p99)
+            .collect();
+        let truncated_mean = if below.is_empty() {
+            mean
+        } else {
+            (below.iter().map(|value| u128::from(*value)).sum::<u128>() / below.len() as u128)
+                as u64
+        };
         Summary {
             count: sorted.len() as u64,
             min_ns: sorted[0],
             mean_ns: mean,
             p50_ns: percentile(&sorted, 0.50),
             p90_ns: percentile(&sorted, 0.90),
-            p99_ns: percentile(&sorted, 0.99),
+            p99_ns: p99,
+            truncated_mean_ns: truncated_mean,
             p999_ns: percentile(&sorted, 0.999),
             max_ns: sorted[sorted.len() - 1],
         }
@@ -162,7 +178,8 @@ impl Report {
             "{{\"sent\":{},\"completed\":{},\"rejected\":{},\"unanswered\":{},\
              \"elapsed_ms\":{},\"rate_per_s\":{:.3},\
              \"rtt_ns\":{{\"count\":{},\"min\":{},\"mean\":{},\"p50\":{},\
-             \"p90\":{},\"p99\":{},\"p999\":{},\"max\":{}}}}}",
+             \"p90\":{},\"p99\":{},\"p999\":{},\"max\":{},\
+             \"truncated_mean\":{}}}}}",
             self.sent,
             self.completed,
             self.rejected,
@@ -177,6 +194,7 @@ impl Report {
             summary.p99_ns,
             summary.p999_ns,
             summary.max_ns,
+            summary.truncated_mean_ns,
         )
     }
 }
@@ -240,5 +258,6 @@ mod tests {
         assert!(json.contains("\"p50\":2000"));
         assert!(json.contains("\"unanswered\":0"));
         assert!(json.contains("\"count\":3"));
+        assert!(json.contains("\"truncated_mean\":"));
     }
 }

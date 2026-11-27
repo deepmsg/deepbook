@@ -18,8 +18,25 @@ crates.io, so the dependency is a git dependency pinned to a revision.
 Wired in the root `Cargo.toml` under `[workspace.dependencies]` at:
 
 ```
-654ece4
+03a7797
 ```
+
+The bump from `654ece4` takes eight deepmsg batches (#181–#188) and changes
+nothing in this repository's source: `cargo check --workspace`, `clippy` and
+the workspace tests pass against the new pin unchanged. `#186` moves the
+compatibility baseline to Aeron 1.54.2 — the pinned binaries now report
+`1.54.2` (packed `79362`) in the system counters, which is a claim about the
+contracts deepmsg implements, not a name deepbook reads. `#188` has a cluster
+member reach its own archive on the local control stream; the deployment
+scripts and harnesses here already pass
+`aeron.archive.local.control.channel` and
+`aeron.archive.local.control.stream.id` everywhere a member starts, so no
+configuration moves. The rest is behaviour and tests: one bounds table in
+front of every SBE decoder (#181), the receive side polling every queue the
+device was given (#182), every fuzz target's corpus and the broadcast counter
+the smoke found (#183), the media address read before the configuration
+(#184), a snapshot slot the writer could not have written is refused (#185),
+and the fuzz corpus surviving from one night to the next (#187).
 
 The bump from `5ed87c1` takes five deepmsg batches (#176–#180) and one
 **public name change** deepbook follows in this change. In the cluster

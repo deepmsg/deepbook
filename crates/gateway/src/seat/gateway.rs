@@ -828,6 +828,8 @@ impl SeatGateway {
             eprintln!("ouch-gateway: seat {seat_id} caught up (already accepted)");
             if let Some(connection) = self.connections.get_mut(&id) {
                 connection.state = ConnState::Live;
+                connection.last_inbound = Instant::now();
+                connection.last_outbound = Instant::now();
             }
             return;
         }
@@ -855,6 +857,7 @@ impl SeatGateway {
                     }
                     connection.state = ConnState::Live;
                     connection.accepted = true;
+                    connection.last_inbound = Instant::now();
                     connection.last_outbound = Instant::now();
                     eprintln!(
                         "ouch-gateway: seat {seat_id} live at seq {}",

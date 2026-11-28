@@ -22,7 +22,7 @@ use crate::seat::render::{RenderError, render_event};
 use crate::seat::{LoginPlan, RequestedSeqError, resolve_requested};
 
 /// Maximum events between acknowledgements.
-const ACK_BATCH: u64 = 256;
+const ACK_BATCH: u64 = 64;
 /// Maximum time between acknowledgements.
 const ACK_INTERVAL: Duration = Duration::from_millis(50);
 

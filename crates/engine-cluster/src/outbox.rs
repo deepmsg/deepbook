@@ -22,9 +22,9 @@ use crate::envelope::{
 };
 
 /// The per-seat outbox cap (ADR 0012 §3.6).
-pub const MAX_SEAT_OUTBOX_BYTES: usize = 1 << 20;
+pub const MAX_SEAT_OUTBOX_BYTES: usize = 8 << 20;
 /// The cap across every seat on one service (ADR 0012 §3.6).
-pub const MAX_TOTAL_OUTBOX_BYTES: usize = 64 << 20;
+pub const MAX_TOTAL_OUTBOX_BYTES: usize = 128 << 20;
 /// The persisted bytes per entry before the payload: `seat_seq` 8, `liquidity`
 /// 1, `payload_kind` 1, `flags` 1, `payload_len` 4, and three bytes of slack.
 /// The optional 20-byte replace request is counted separately.

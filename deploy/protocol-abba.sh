@@ -70,6 +70,10 @@ run_ouch() {
 }
 
 echo "protocol-abba: rate=$RATE samples=$SAMPLES warmup=$WARMUP out=$OUT"
+# The first arm after startup carries replay/cache warm-up; discard one FIX and
+# one OUCH arm before the pre-registered four.
+run_fix pre-fix
+run_ouch pre-ouch
 run_fix fix-1
 run_ouch ouch-1
 run_ouch ouch-2

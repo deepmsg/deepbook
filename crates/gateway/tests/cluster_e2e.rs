@@ -357,9 +357,10 @@ impl Harness {
         self.generation += 1;
         let mut args = self.node_args.clone();
         args.push("-Ddeepbook.engine.symbol=1".to_owned());
-        args.push("-Ddeepbook.engine.max-orders=1024".to_owned());
-        args.push("-Ddeepbook.engine.recent-window=1024".to_owned());
+        args.push("-Ddeepbook.engine.max-orders=1048576".to_owned());
+        args.push("-Ddeepbook.engine.recent-window=1000000".to_owned());
         args.push("-Ddeepbook.metrics.bind=off".to_owned());
+        args.push("-Ddeepbook.marketdata.enabled=false".to_owned());
         if let Some(seats) = &self.seats {
             args.push(format!("-Ddeepbook.seats={}", seats.display()));
             args.push("-Ddeepbook.risk.max-open-orders=4096".to_owned());

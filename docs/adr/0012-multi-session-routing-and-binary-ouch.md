@@ -277,8 +277,8 @@ per-seat cap once the resync clears the entries (§3.4).
 
 #### 3.6 Memory budgets and deterministic eviction
 
-- `MAX_SEAT_OUTBOX_BYTES = 1 MiB` per seat;
-- `MAX_TOTAL_OUTBOX_BYTES = 64 MiB` across all seats;
+- `MAX_SEAT_OUTBOX_BYTES = 8 MiB` per seat;
+- `MAX_TOTAL_OUTBOX_BYTES = 128 MiB` across all seats;
 - `MAX_GATEWAY_OUTBOUND_BYTES = 256 MiB` per gateway process;
 - `MAX_SEAT_OUTBOUND_BYTES = 16 MiB` per seat socket.
 
@@ -291,8 +291,10 @@ eviction. If the evicted seat is bound on this node, the service additionally
 queues `FenceEvicted(OutboxOverflow)`; the state change (`overflowed = true`,
 entries dropped) is decided solely by the log.
 
-Capacity assumption for the 64 MiB budget: at most 64 seats at full backlog;
-with the 500-seat target that is 128 KiB per seat on average. Beyond that,
+Capacity assumption for the 128 MiB budget: at most 16 seats at full backlog;
+with the 500-seat target that is 256 KiB per seat on average. The first
+single-host ABBA (2026-11-28) showed a 1 MiB seat cap overflowing at 10k
+orders/s, hence the 8 MiB ceiling; the snapshot cost is recorded in §4.4. Beyond that,
 deterministic eviction followed by resync is the designed degradation.
 
 #### 3.7 Slow consumers
@@ -362,8 +364,8 @@ switches to it.
 
 #### 4.4 Budget
 
-Worst case is 64 MiB of outbox plus ~16 MiB of engine snapshot, about 80 MiB
-per snapshot; with two followers that is roughly 160 MiB of snapshot transfer
+Worst case is 128 MiB of outbox plus ~16 MiB of engine snapshot, about 144 MiB
+per snapshot; with two followers that is roughly 288 MiB of snapshot transfer
 per snapshot event. In steady state most entries are acknowledged and trimmed,
 so snapshots are normally far smaller.
 
@@ -623,8 +625,8 @@ by listener kind on the same `epoll`/`io_uring` loop and the same
   from one buffer.
 - Strict 1:1 seat/account ownership removes multi-authority sequence merging at
   the cost of one TCP session per sub-account and permanent seat pins in v1.
-- The 64 MiB outbox plus ~16 MiB engine snapshot is the dominant worst-case
-  snapshot cost (~80 MiB per snapshot; ~160 MiB of transfer to two followers).
+- The 128 MiB outbox plus ~16 MiB engine snapshot is the dominant worst-case
+  snapshot cost (~144 MiB per snapshot; ~288 MiB of transfer to two followers).
   Steady-state snapshots are much smaller because acknowledged entries are
   trimmed.
 - Gateways are trusted infrastructure inside the venue VPC: token auth protects

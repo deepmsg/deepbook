@@ -17,7 +17,7 @@ use crate::seat::fix_render::{render_cancel_reject, render_report};
 use crate::seat::journal::{SeatJournal, SeatJournalError};
 use crate::seat::session::BoundOutcome;
 
-const ACK_BATCH: u64 = 256;
+const ACK_BATCH: u64 = 64;
 const ACK_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A FIX-seat projection failure.

@@ -33,7 +33,7 @@ use crate::sink::{CommandSink, EventSource, SessionEvent, SessionKey};
 /// Cluster egress frames handled per `poll_event` call. Without a bound, a
 /// busy service keeps the acceptor inside this loop for the whole run and the
 /// FIX reports only reach the socket when the burst ends.
-const MAX_EGRESS_PER_CALL: usize = 64;
+const MAX_EGRESS_PER_CALL: usize = 512;
 
 /// One configured FIX seat's runtime.
 struct SeatRuntime {

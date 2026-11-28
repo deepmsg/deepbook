@@ -230,6 +230,8 @@ pub struct Gateway<E: Engine> {
     /// session. A short disconnect therefore queues the report and a reconnect
     /// sends it, rather than losing it.
     pending_reports: HashMap<SessionKey, VecDeque<ApplicationMessage>>,
+    /// Reused completion buffer; `wait` appends and the cycle drains it.
+    events: Vec<Event>,
     /// What the loopback `/metrics` page reads.
     metrics: Arc<GatewayMetrics>,
 }
@@ -281,6 +283,7 @@ impl<E: Engine> Gateway<E> {
             engine,
             connections: HashMap::new(),
             pending_reports: HashMap::new(),
+            events: Vec::with_capacity(256),
             metrics,
         })
     }
@@ -312,10 +315,13 @@ impl<E: Engine> Gateway<E> {
     ///
     /// The event loop failed. A broken connection is closed, not returned.
     pub fn poll_once(&mut self, timeout: Duration) -> io::Result<usize> {
-        let mut events = Vec::new();
-        self.io.wait(timeout.min(self.config.tick), &mut events)?;
+        let mut events = std::mem::take(&mut self.events);
+        if let Err(error) = self.io.wait(timeout.min(self.config.tick), &mut events) {
+            self.events = events;
+            return Err(error);
+        }
         let mut work = 0;
-        for event in events {
+        for event in events.drain(..) {
             match event {
                 Event::Accepted { id, peer } => {
                     work += self.add_connection(id, peer);
@@ -332,6 +338,7 @@ impl<E: Engine> Gateway<E> {
                 }
             }
         }
+        self.events = events;
         // The accept is one-shot on io_uring; arming it here also restarts it
         // after an accept error. epoll only sets a flag.
         self.io.start_accept()?;
@@ -601,12 +608,12 @@ impl<E: Engine> Gateway<E> {
                 return 1;
             }
         };
-        let bytes = self.io.read_data(id).get(..count).unwrap_or(&[]).to_vec();
         self.metrics.note_fix_bytes(count);
+        let bytes = self.io.read_data(id).get(..count).unwrap_or(&[]);
         let Some(connection) = self.connections.get_mut(&id) else {
             return 1;
         };
-        connection.decoder.push(&bytes);
+        connection.decoder.push(bytes);
 
         let now = SystemClock.now_millis();
         let mut work = 1;

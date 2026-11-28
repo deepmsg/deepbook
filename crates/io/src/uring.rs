@@ -63,6 +63,8 @@ pub struct UringLoop {
     timeout_spec: Box<types::Timespec>,
     timeout_user: Option<u64>,
     timeout_generation: u64,
+    /// Reused completion buffer for `wait`.
+    completed: Vec<(u64, i32)>,
 }
 
 impl UringLoop {
@@ -92,6 +94,7 @@ impl UringLoop {
             timeout_spec: Box::new(types::Timespec::new()),
             timeout_user: None,
             timeout_generation: 0,
+            completed: Vec::with_capacity(256),
         })
     }
 
@@ -347,16 +350,18 @@ impl EventLoop for UringLoop {
                 Err(error) => return Err(error),
             }
         }
-        let mut completed: Vec<(u64, i32)> = Vec::new();
+        let mut completed = std::mem::take(&mut self.completed);
+        completed.clear();
         {
             let mut queue = self.ring.completion();
             for completion in &mut queue {
                 completed.push((completion.user_data(), completion.result()));
             }
         }
-        for (user_data, result) in completed {
+        for (user_data, result) in completed.drain(..) {
             self.on_completion(user_data, result, events);
         }
+        self.completed = completed;
         self.cleanup();
         Ok(())
     }

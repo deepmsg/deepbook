@@ -4,7 +4,7 @@
 //! it takes a log position (the only ordering input) and writes events to a
 //! sink. There is no clock, no socket and no serialization here.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 
 use deepbook_types::{
     AccountId, EMPTY_ORDER_ID, LogPos, OrderId, OrderState, Price, Qty, Seq, Side, SymbolId,
@@ -51,9 +51,9 @@ pub struct Engine {
     config: EngineConfig,
     book: Book,
     ids: IdMap,
-    open_orders: BTreeMap<AccountId, usize>,
+    open_orders: HashMap<AccountId, usize>,
     kill_all: bool,
-    killed_accounts: BTreeSet<AccountId>,
+    killed_accounts: HashSet<AccountId>,
     last_log_pos: LogPos,
     event_seq: EventSeq,
 }
@@ -133,9 +133,9 @@ impl Engine {
         Self {
             book: Book::new(config.symbol, capacity),
             ids: IdMap::new(config.recent_order_window),
-            open_orders: BTreeMap::new(),
+            open_orders: HashMap::new(),
             kill_all: false,
-            killed_accounts: BTreeSet::new(),
+            killed_accounts: HashSet::new(),
             last_log_pos: 0,
             event_seq: 0,
             config,
@@ -169,18 +169,22 @@ impl Engine {
     /// The state a cluster snapshot stores.
     #[must_use]
     pub fn snapshot(&self) -> EngineSnapshot {
+        let mut open_orders: Vec<(AccountId, usize)> = self
+            .open_orders
+            .iter()
+            .map(|(account, count)| (*account, *count))
+            .collect();
+        open_orders.sort_unstable_by_key(|(account, _)| *account);
+        let mut killed_accounts: Vec<AccountId> = self.killed_accounts.iter().copied().collect();
+        killed_accounts.sort_unstable();
         EngineSnapshot {
             symbol: self.config.symbol,
             last_log_pos: self.last_log_pos,
             book: self.book.snapshot(),
             seen: self.ids.snapshot(),
-            open_orders: self
-                .open_orders
-                .iter()
-                .map(|(account, count)| (*account, *count))
-                .collect(),
+            open_orders,
             kill_all: self.kill_all,
-            killed_accounts: self.killed_accounts.iter().copied().collect(),
+            killed_accounts,
         }
     }
 
@@ -2313,6 +2317,62 @@ mod tests {
         assert!(view.asks.is_empty(), "the outlier ask should be gone");
         assert_eq!(view.bids.len(), 1);
         assert_eq!(view.bids[0].price, 500_000);
+    }
+
+    #[test]
+    fn the_snapshot_sorts_per_account_state() {
+        let mut engine = new_engine();
+        run(
+            &mut engine,
+            &[
+                limit(
+                    3,
+                    "A3",
+                    Side::Buy,
+                    90,
+                    1,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(
+                    1,
+                    "A1",
+                    Side::Buy,
+                    91,
+                    1,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+                limit(
+                    2,
+                    "A2",
+                    Side::Buy,
+                    92,
+                    1,
+                    TimeInForce::GoodTillCanceled,
+                    false,
+                ),
+            ],
+        );
+        let snapshot = engine.snapshot();
+        assert_eq!(
+            snapshot
+                .open_orders
+                .iter()
+                .map(|(account, _)| *account)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+
+        run(
+            &mut engine,
+            &[
+                Command::KillSwitch { account: Some(3) },
+                Command::KillSwitch { account: Some(1) },
+            ],
+        );
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.killed_accounts, vec![1, 3]);
     }
 
     #[test]

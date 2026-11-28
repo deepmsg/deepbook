@@ -322,15 +322,10 @@ impl SeatGateway {
             Event::Read { id, result } => match result {
                 Ok(0) => self.close(id, unbind_reasons::CLIENT_CLOSED),
                 Ok(count) => {
-                    let bytes = self
-                        .event_loop
-                        .read_data(id)
-                        .get(..count)
-                        .unwrap_or(&[])
-                        .to_vec();
+                    let bytes = self.event_loop.read_data(id).get(..count).unwrap_or(&[]);
                     if let Some(connection) = self.connections.get_mut(&id) {
                         connection.last_inbound = Instant::now();
-                        connection.buffer.extend_from_slice(&bytes);
+                        connection.buffer.extend_from_slice(bytes);
                     }
                     self.process_frames(id);
                     if self.connections.contains_key(&id) {

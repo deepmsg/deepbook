@@ -164,6 +164,9 @@ pub struct EpollLoop {
     accepting: bool,
     /// Completions produced while submitting, drained by the next `wait`.
     pending: VecDeque<Event>,
+    /// Reused readiness buffer; `poll` fills `events`, this copies the fields
+    /// that can be read without holding the `Events` borrow.
+    tokens: Vec<(Token, bool, bool, bool, bool)>,
 }
 
 impl EpollLoop {
@@ -187,6 +190,7 @@ impl EpollLoop {
             next_id: 1,
             accepting: false,
             pending: VecDeque::new(),
+            tokens: Vec::with_capacity(EVENT_CAPACITY),
         })
     }
 
@@ -271,20 +275,18 @@ impl EventLoop for EpollLoop {
             return Ok(());
         }
         self.poll.poll(&mut self.events, Some(timeout))?;
-        let tokens: Vec<(Token, bool, bool, bool, bool)> = self
-            .events
-            .iter()
-            .map(|event| {
-                (
-                    event.token(),
-                    event.is_readable(),
-                    event.is_writable(),
-                    event.is_read_closed() || event.is_write_closed(),
-                    event.is_error(),
-                )
-            })
-            .collect();
-        for (token, readable, writable, closed, error) in tokens {
+        let mut tokens = std::mem::take(&mut self.tokens);
+        tokens.clear();
+        tokens.extend(self.events.iter().map(|event| {
+            (
+                event.token(),
+                event.is_readable(),
+                event.is_writable(),
+                event.is_read_closed() || event.is_write_closed(),
+                event.is_error(),
+            )
+        }));
+        for (token, readable, writable, closed, error) in tokens.drain(..) {
             if token == LISTENER_TOKEN {
                 if self.accepting {
                     self.accepting = false;

@@ -9,6 +9,7 @@
 #   deploy/protocol-abba.sh --fix-addr 127.0.0.1:9876 \
 #       --ouch-addr 127.0.0.1:9880 --seat 1 --token <64 hex> \
 #       [--fix-sender CLIENT --fix-target DEEPBOOK --fix-account 11] \
+#       [--fix-cpus 6 --ouch-cpus 7] \
 #       [--rate 10000] [--samples 100000] [--warmup 5000] [--out DIR]
 #
 # Build first:
@@ -23,6 +24,8 @@ TOKEN=""
 FIX_SENDER=CLIENT
 FIX_TARGET=DEEPBOOK
 FIX_ACCOUNT=11
+FIX_CPUS=""
+OUCH_CPUS=""
 RATE=10000
 SAMPLES=100000
 WARMUP=5000
@@ -39,6 +42,8 @@ while [ $# -gt 0 ]; do
         --fix-sender) FIX_SENDER=$2; shift 2 ;;
         --fix-target) FIX_TARGET=$2; shift 2 ;;
         --fix-account) FIX_ACCOUNT=$2; shift 2 ;;
+        --fix-cpus) FIX_CPUS=$2; shift 2 ;;
+        --ouch-cpus) OUCH_CPUS=$2; shift 2 ;;
         --rate) RATE=$2; shift 2 ;;
         --samples) SAMPLES=$2; shift 2 ;;
         --warmup) WARMUP=$2; shift 2 ;;
@@ -59,13 +64,18 @@ for bin in "$FIX_BENCH" "$OUCH_BENCH"; do
 done
 
 mkdir -p "$OUT"
+FIX_PIN=()
+[ -n "$FIX_CPUS" ] && FIX_PIN=(taskset -c "$FIX_CPUS")
+OUCH_PIN=()
+[ -n "$OUCH_CPUS" ] && OUCH_PIN=(taskset -c "$OUCH_CPUS")
+
 run_fix() {
-    "$FIX_BENCH" --connect "$FIX_ADDR" --sender "$FIX_SENDER" --target "$FIX_TARGET" \
+    "${FIX_PIN[@]}" "$FIX_BENCH" --connect "$FIX_ADDR" --sender "$FIX_SENDER" --target "$FIX_TARGET" \
         --account "$FIX_ACCOUNT" --rate "$RATE" --samples "$SAMPLES" --warmup "$WARMUP" \
         --json > "$OUT/$1.json"
 }
 run_ouch() {
-    "$OUCH_BENCH" --connect "$OUCH_ADDR" --seat "$SEAT" --token "$TOKEN" \
+    "${OUCH_PIN[@]}" "$OUCH_BENCH" --connect "$OUCH_ADDR" --seat "$SEAT" --token "$TOKEN" \
         --rate "$RATE" --samples "$SAMPLES" --warmup "$WARMUP" --json > "$OUT/$1.json"
 }
 

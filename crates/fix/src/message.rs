@@ -90,6 +90,8 @@ pub enum ExecType {
     Trade,
     /// `I`.
     OrderStatus,
+    /// `D`; synthetic resync state (ADR 0012).
+    Restated,
 }
 
 impl ExecType {
@@ -103,6 +105,7 @@ impl ExecType {
             Self::Rejected => '8',
             Self::Trade => 'F',
             Self::OrderStatus => 'I',
+            Self::Restated => 'D',
         }
     }
 
@@ -114,6 +117,7 @@ impl ExecType {
             b'8' => Some(Self::Rejected),
             b'F' => Some(Self::Trade),
             b'I' => Some(Self::OrderStatus),
+            b'D' => Some(Self::Restated),
             _ => None,
         }
     }
@@ -323,6 +327,8 @@ pub struct ExecutionReport {
     pub order_id: String,
     /// `11`.
     pub cl_ord_id: String,
+    /// `41`; present when this report answers a replace.
+    pub orig_cl_ord_id: Option<String>,
     /// `150`.
     pub exec_type: ExecType,
     /// `39`.
@@ -521,6 +527,7 @@ pub fn decode_application(message: &ParsedMessage) -> Result<ApplicationMessage,
             exec_id: required_string(message, tag::EXEC_ID)?,
             order_id: required_string(message, tag::ORDER_ID)?,
             cl_ord_id: required_string(message, tag::CL_ORD_ID)?,
+            orig_cl_ord_id: optional_string(message, tag::ORIG_CL_ORD_ID),
             exec_type: required_exec_type(message)?,
             ord_status: required_ord_status(message)?,
             symbol: required_string(message, tag::SYMBOL)?,
@@ -655,6 +662,10 @@ pub fn encode_application(builder: MessageBuilder, message: &ApplicationMessage)
                 .body_int(tag::LEAVES_QTY, report.leaves_qty)
                 .body_int(tag::CUM_QTY, report.cum_qty)
                 .body_str(tag::AVG_PX, &format_price(report.avg_px));
+            let builder = match &report.orig_cl_ord_id {
+                Some(value) => builder.body_str(tag::ORIG_CL_ORD_ID, value),
+                None => builder,
+            };
             let builder = optional_account(builder, report.account.as_deref());
             let builder = match &report.transact_time {
                 Some(value) => builder.body_str(tag::TRANSACT_TIME, value),
@@ -1005,6 +1016,7 @@ mod tests {
             exec_id: "E-1".to_owned(),
             order_id: "O-1".to_owned(),
             cl_ord_id: "C-1".to_owned(),
+            orig_cl_ord_id: Some("C-0".to_owned()),
             exec_type: ExecType::Trade,
             ord_status: OrdStatus::PartiallyFilled,
             symbol: "AAPL".to_owned(),
@@ -1032,6 +1044,12 @@ mod tests {
         let parsed = parse(&builder.build()).expect("parses");
         let decoded = decode_application(&parsed).expect("decodes");
         assert_eq!(ApplicationMessage::ExecutionReport(report), decoded);
+    }
+
+    #[test]
+    fn restated_is_d() {
+        assert_eq!(ExecType::Restated.as_char(), 'D');
+        assert_eq!(ExecType::parse(b'D'), Some(ExecType::Restated));
     }
 
     #[test]

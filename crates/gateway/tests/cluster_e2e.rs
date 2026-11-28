@@ -213,12 +213,19 @@ struct Harness {
     container: Option<Child>,
     gateway: Option<Child>,
     gateway_addr: SocketAddr,
+    ouch_gateway: Option<Child>,
+    ouch_addr: SocketAddr,
+    seats: Option<PathBuf>,
     generation: u32,
     backend: String,
 }
 
 impl Harness {
     fn start(backend: &str, default_base: u16) -> Option<Self> {
+        Self::start_inner(backend, default_base, None)
+    }
+
+    fn start_inner(backend: &str, default_base: u16, seats: Option<&str>) -> Option<Self> {
         let deepmsg = deepmsg_dir();
         let profile = std::env::var("DEEPMSG_PROFILE").unwrap_or_else(|_| "release".to_owned());
         let binary = |name: &str| deepmsg.join("target").join(&profile).join(name);
@@ -272,6 +279,11 @@ impl Harness {
             std::fs::create_dir_all(directory).expect("run directory");
         }
 
+        let seats_path = seats.map(|text| {
+            let path = root.join("seats.toml");
+            std::fs::write(&path, text).expect("seats.toml");
+            path
+        });
         let members = format!(
             "0,localhost:{base},localhost:{},localhost:{},localhost:0,localhost:{}",
             base + 10,
@@ -300,6 +312,9 @@ impl Harness {
             container: None,
             gateway: None,
             gateway_addr: "127.0.0.1:0".parse().expect("address"),
+            ouch_gateway: None,
+            ouch_addr: "127.0.0.1:0".parse().expect("address"),
+            seats: seats_path,
             generation: 0,
             backend: backend.to_owned(),
             root,
@@ -311,6 +326,9 @@ impl Harness {
         harness.start_container().expect("service container");
         harness.wait_until_active().expect("the module is active");
         harness.start_gateway(base + 50).expect("gateway");
+        if harness.seats.is_some() {
+            harness.start_ouch_gateway(base + 60).expect("ouch gateway");
+        }
         Some(harness)
     }
 
@@ -339,9 +357,14 @@ impl Harness {
         self.generation += 1;
         let mut args = self.node_args.clone();
         args.push("-Ddeepbook.engine.symbol=1".to_owned());
-        args.push("-Ddeepbook.engine.max-orders=1024".to_owned());
-        args.push("-Ddeepbook.engine.recent-window=1024".to_owned());
+        args.push("-Ddeepbook.engine.max-orders=1048576".to_owned());
+        args.push("-Ddeepbook.engine.recent-window=1000000".to_owned());
         args.push("-Ddeepbook.metrics.bind=off".to_owned());
+        args.push("-Ddeepbook.marketdata.enabled=false".to_owned());
+        if let Some(seats) = &self.seats {
+            args.push(format!("-Ddeepbook.seats={}", seats.display()));
+            args.push("-Ddeepbook.risk.max-open-orders=4096".to_owned());
+        }
         let binary =
             engine_container_binary().ok_or_else(|| "engine-container is not built".to_owned())?;
         let child = spawn(&binary, &args, &log)?;
@@ -397,6 +420,12 @@ impl Harness {
             "1".to_owned(),
             "--backend".to_owned(),
             self.backend.clone(),
+            "--tick-us".to_owned(),
+            "200".to_owned(),
+            "--journal-sync".to_owned(),
+            "batch".to_owned(),
+            "--journal-batch".to_owned(),
+            "64".to_owned(),
             "--new-leader-timeout-ms".to_owned(),
             "4000".to_owned(),
             // Tests run in parallel and their own harness owns no metrics
@@ -404,6 +433,11 @@ impl Harness {
             "--metrics-bind".to_owned(),
             "off".to_owned(),
         ];
+        let mut args = args;
+        if let Some(seats) = &self.seats {
+            args.push("--seats".to_owned());
+            args.push(seats.display().to_string());
+        }
         self.gateway = Some(spawn(binary, &args, &log)?);
 
         let deadline = Instant::now() + READY_TIMEOUT;
@@ -425,6 +459,50 @@ impl Harness {
         }
         Err(format!(
             "the gateway did not accept a connection in {READY_TIMEOUT:?}:\n{}",
+            tail(&log)
+        ))
+    }
+
+    fn start_ouch_gateway(&mut self, port: u16) -> Result<(), String> {
+        let Some(seats) = &self.seats else {
+            return Err("no seats file".to_owned());
+        };
+        let address = format!("127.0.0.1:{port}");
+        self.ouch_addr = address.parse().map_err(|_| "address".to_owned())?;
+        let log = self.logs.join("ouch-gateway.log");
+        let binary = Path::new(env!("CARGO_BIN_EXE_ouch-gateway"));
+        let args = vec![
+            "--bind".to_owned(),
+            address,
+            "--driver-dir".to_owned(),
+            self.driver_dir.display().to_string(),
+            "--seats".to_owned(),
+            seats.display().to_string(),
+            "--backend".to_owned(),
+            self.backend.clone(),
+            "--tick-us".to_owned(),
+            "200".to_owned(),
+        ];
+        self.ouch_gateway = Some(spawn(binary, &args, &log)?);
+        let deadline = Instant::now() + READY_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Some(status) = self
+                .ouch_gateway
+                .as_mut()
+                .and_then(|child| child.try_wait().ok().flatten())
+            {
+                return Err(format!(
+                    "the ouch gateway exited while starting ({status}):\n{}",
+                    tail(&log)
+                ));
+            }
+            if TcpStream::connect(self.ouch_addr).is_ok() {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err(format!(
+            "the ouch gateway did not accept a connection in {READY_TIMEOUT:?}:\n{}",
             tail(&log)
         ))
     }
@@ -505,6 +583,7 @@ impl Harness {
 
     fn shutdown(&mut self) {
         for slot in [
+            &mut self.ouch_gateway,
             &mut self.gateway,
             &mut self.container,
             &mut self.node,
@@ -958,4 +1037,212 @@ fn a_recovered_engine_continues_the_book() {
 #[ignore = "starts a media driver, a cluster node and a service container"]
 fn a_recovered_engine_continues_the_book_over_uring() {
     recovered_book("uring", 26_100);
+}
+
+fn ouch_send(stream: &mut TcpStream, message: &deepbook_ouch::wire::Message) {
+    let frame = deepbook_ouch::wire::encode(message).expect("ouch frame");
+    stream.write_all(&frame).expect("ouch send");
+}
+
+fn ouch_read(
+    stream: &mut TcpStream,
+    decoder: &mut Vec<u8>,
+    buffer: &mut [u8],
+) -> deepbook_ouch::wire::Message {
+    loop {
+        match deepbook_ouch::wire::decode(decoder) {
+            Ok((message, used)) => {
+                decoder.drain(..used);
+                return message;
+            }
+            Err(deepbook_ouch::wire::FrameError::Truncated) => {}
+            Err(error) => panic!("ouch decode: {error}"),
+        }
+        let count = stream.read(buffer).expect("ouch read");
+        assert!(count > 0, "ouch gateway closed");
+        decoder.extend_from_slice(&buffer[..count]);
+    }
+}
+
+#[test]
+#[ignore = "starts a media driver, a cluster node and two gateways"]
+fn a_fix_maker_and_an_ouch_taker_meet_across_two_gateways() {
+    let root = std::env::temp_dir().join(format!("deepbook-e2e-seats-{}", std::process::id()));
+    let token = "ab".repeat(32);
+    let seats = format!(
+        r#"
+[[seat]]
+seat_id = 1
+account_id = 11
+protocol = "fix"
+sender = "DEEPBOOK"
+target = "CLIENT"
+journal = "{}"
+
+[[seat]]
+seat_id = 2
+account_id = 12
+protocol = "ouch"
+token = "{token}"
+journal = "{}"
+"#,
+        root.join("fix-1").display(),
+        root.join("ouch-2").display()
+    );
+    let Some(mut harness) = Harness::start_inner("epoll", 26_300, Some(&seats)) else {
+        eprintln!("SKIPPED: the deepmsg or engine-container binaries are not built");
+        return;
+    };
+
+    // FIX seat 1 rests a buy.
+    let mut fix = harness.connect_fix();
+    logon(&mut fix);
+    fix.read_until(MsgType::Logon);
+    new_order(&mut fix, "C-1", "11", b"1", 100, "100.25");
+    let accepted = execution_report(fix.read_application());
+    assert_eq!("C-1", accepted.cl_ord_id);
+    assert_eq!(ExecType::New, accepted.exec_type);
+
+    // OUCH seat 2 sells into it.
+    let mut ouch = TcpStream::connect(harness.ouch_addr).expect("ouch connect");
+    ouch.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("timeout");
+    let token_bytes = [0xab_u8; 32];
+    ouch_send(
+        &mut ouch,
+        &deepbook_ouch::wire::Message::LoginRequest {
+            seat_id: 2,
+            token: token_bytes,
+            requested_seq: u64::MAX,
+        },
+    );
+    let mut decoder = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match ouch_read(&mut ouch, &mut decoder, &mut buffer) {
+            deepbook_ouch::wire::Message::LoginAccepted { .. } => break,
+            deepbook_ouch::wire::Message::LoginRejected { reason } => {
+                panic!("ouch login rejected: {reason}");
+            }
+            _ => {}
+        }
+    }
+    ouch_send(
+        &mut ouch,
+        &deepbook_ouch::wire::Message::EnterOrder {
+            cl_ord_id: 1,
+            price: 10_025,
+            qty: 40,
+            symbol: 1,
+            side: deepbook_ouch::wire::side::SELL,
+            ord_type: deepbook_ouch::wire::ord_type::LIMIT,
+            tif: deepbook_ouch::wire::tif::GTC,
+            flags: 0,
+        },
+    );
+    loop {
+        match ouch_read(&mut ouch, &mut decoder, &mut buffer) {
+            deepbook_ouch::wire::Message::OrderExecuted {
+                cl_ord_id,
+                fill_qty,
+                liquidity,
+                ..
+            } => {
+                assert_eq!(cl_ord_id, 1);
+                assert_eq!(fill_qty, 40);
+                assert_eq!(liquidity, deepbook_ouch::wire::liquidity::TAKER);
+                break;
+            }
+            deepbook_ouch::wire::Message::OrderRejected { reason, .. } => {
+                panic!("ouch order rejected: {reason}");
+            }
+            _ => {}
+        }
+    }
+
+    // The maker's report is on the other gateway's FIX session.
+    let maker = loop {
+        let report = execution_report(fix.read_application());
+        if report.cl_ord_id == "C-1" && report.exec_type == ExecType::Trade {
+            break report;
+        }
+    };
+    assert_eq!(Some(40), maker.last_qty);
+    assert_eq!(40, maker.cum_qty);
+    assert_eq!(60, maker.leaves_qty);
+
+    let _ = std::fs::remove_dir_all(root);
+    let _ = &mut harness;
+}
+
+#[test]
+#[ignore = "starts a media driver, a cluster node, two gateways and four bench arms"]
+fn the_fix_vs_ouch_abba_runs() {
+    let root = std::env::temp_dir().join(format!("deepbook-e2e-abba-{}", std::process::id()));
+    let token = "cd".repeat(32);
+    let seats = format!(
+        r#"
+[[seat]]
+seat_id = 1
+account_id = 11
+protocol = "fix"
+sender = "DEEPBOOK"
+target = "CLIENT"
+journal = "{}"
+
+[[seat]]
+seat_id = 2
+account_id = 12
+protocol = "ouch"
+token = "{token}"
+journal = "{}"
+"#,
+        root.join("fix-1").display(),
+        root.join("ouch-2").display()
+    );
+    let Some(mut harness) = Harness::start_inner("epoll", 26_500, Some(&seats)) else {
+        eprintln!("SKIPPED: the deepmsg or engine-container binaries are not built");
+        return;
+    };
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/protocol-abba.sh");
+    if !script.is_file() {
+        eprintln!("SKIPPED: {} is not present", script.display());
+        return;
+    }
+    let rate = std::env::var("ABBA_RATE").unwrap_or_else(|_| "10000".to_owned());
+    let samples = std::env::var("ABBA_SAMPLES").unwrap_or_else(|_| "100000".to_owned());
+    let warmup = std::env::var("ABBA_WARMUP").unwrap_or_else(|_| "5000".to_owned());
+    let output = Process::new("bash")
+        .arg(&script)
+        .args([
+            "--fix-addr",
+            &harness.gateway_addr.to_string(),
+            "--ouch-addr",
+            &harness.ouch_addr.to_string(),
+            "--seat",
+            "2",
+            "--token",
+            &token,
+            "--fix-account",
+            "11",
+            "--rate",
+            &rate,
+            "--samples",
+            &samples,
+            "--warmup",
+            &warmup,
+            "--out",
+            &harness.root.join("abba").display().to_string(),
+        ])
+        .output()
+        .expect("run protocol-abba.sh");
+    println!("{}", String::from_utf8_lossy(&output.stdout));
+    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "protocol-abba.sh failed with {}",
+        output.status
+    );
+    let _ = std::fs::remove_dir_all(root);
+    let _ = &mut harness;
 }

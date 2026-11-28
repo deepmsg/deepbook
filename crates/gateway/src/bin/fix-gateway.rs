@@ -24,6 +24,7 @@ use deepbook_gateway::metrics::{self, GatewayMetrics};
 use deepbook_gateway::obs::{COMPONENTS, Gateway as GatewayComponent};
 use deepbook_gateway::{
     ClusterEngine, ClusterEngineConfig, Engine, Gateway, GatewayConfig, SessionKey, StubEngine,
+    seat::{SeatFixEngine, SeatRegistry},
 };
 use deepbook_io::BackendKind;
 use deepmsg_log::Guard;
@@ -67,15 +68,16 @@ fn run() -> Result<(), String> {
         SyncPolicy::Each
     };
 
+    if options.seats.is_some() && !options.cluster {
+        return Err("--seats needs --cluster".to_owned());
+    }
     if options.cluster {
         let driver_dir = options
             .driver_dir
             .clone()
             .ok_or_else(|| "--cluster needs --driver-dir".to_owned())?;
-        let mut cluster_config = ClusterEngineConfig::new(
-            driver_dir,
-            SessionKey::new(&options.sender, &options.target),
-        );
+        let session_key = SessionKey::new(&options.sender, &options.target);
+        let mut cluster_config = ClusterEngineConfig::new(driver_dir, session_key.clone());
         cluster_config.ingress_channel = options.ingress_channel.clone();
         cluster_config.ingress_endpoints = options.ingress_endpoints.clone();
         cluster_config.ingress_stream_id = options.ingress_stream_id;
@@ -87,6 +89,24 @@ fn run() -> Result<(), String> {
             .then(|| options.new_leader_timeout_ms.saturating_mul(1_000_000));
         cluster_config.symbol = options.symbol_id;
         cluster_config.symbol_name = options.symbol.clone();
+
+        if let Some(path) = &options.seats {
+            let text = std::fs::read_to_string(path)
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let registry = SeatRegistry::parse(&text).map_err(|error| error.to_string())?;
+            let engine =
+                SeatFixEngine::connect_with(cluster_config, &registry, Arc::clone(&metrics))
+                    .map_err(|error| format!("cannot connect the seat cluster client: {error}"))?;
+            println!(
+                "fix-gateway seats={} aeron={}",
+                path.display(),
+                options
+                    .driver_dir
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string())
+            );
+            return serve(config, engine, &options, metrics);
+        }
 
         let engine = ClusterEngine::connect_with(cluster_config, Arc::clone(&metrics))
             .map_err(|error| format!("cannot connect the cluster: {error}"))?;
@@ -147,6 +167,8 @@ struct Options {
     journal_sync_batch: bool,
     journal_batch: u32,
     cluster: bool,
+    /// The shared seat registry; `Some` selects the seat-envelope path.
+    seats: Option<PathBuf>,
     driver_dir: Option<PathBuf>,
     ingress_channel: String,
     ingress_endpoints: Option<String>,
@@ -181,6 +203,7 @@ impl Options {
             journal_sync_batch: false,
             journal_batch: 64,
             cluster: false,
+            seats: None,
             driver_dir: None,
             ingress_channel: "aeron:ipc".to_owned(),
             ingress_endpoints: None,
@@ -263,6 +286,7 @@ impl Options {
                         .map_err(|_| "--journal-batch must be a number".to_owned())?;
                 }
                 "--cluster" => options.cluster = true,
+                "--seats" => options.seats = Some(value("--seats")?.into()),
                 "--driver-dir" => options.driver_dir = Some(value("--driver-dir")?.into()),
                 "--ingress-channel" => options.ingress_channel = value("--ingress-channel")?,
                 "--ingress-endpoints" => {

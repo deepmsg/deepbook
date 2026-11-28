@@ -108,6 +108,7 @@ fn execution_report_event(session: SessionKey) -> SessionEvent {
             exec_id: "1-0".to_owned(),
             order_id: "1".to_owned(),
             cl_ord_id: "C-1".to_owned(),
+            orig_cl_ord_id: None,
             exec_type: ExecType::New,
             ord_status: OrdStatus::New,
             symbol: "AAPL".to_owned(),
@@ -485,5 +486,153 @@ fn a_full_outbound_queue_stops_reading_the_peer() {
 
     drop(stream);
     handle.join().expect("gateway thread");
+    std::fs::remove_dir_all(directory).expect("cleanup");
+}
+
+fn logon_as(seq: u64, sender: &str) -> Vec<u8> {
+    MessageBuilder::new(
+        MsgType::Logon,
+        sender,
+        "DEEPBOOK",
+        seq,
+        "20261025-12:34:56.000",
+    )
+    .body_int(tag::ENCRYPT_METHOD, 0)
+    .body_int(tag::HEART_BT_INT, 30)
+    .build()
+}
+
+fn new_order_as(seq: u64, sender: &str, cl_ord_id: &str) -> Vec<u8> {
+    MessageBuilder::new(
+        MsgType::NewOrderSingle,
+        sender,
+        "DEEPBOOK",
+        seq,
+        "20261025-12:34:56.001",
+    )
+    .body_str(tag::CL_ORD_ID, cl_ord_id)
+    .body_str(tag::SYMBOL, "AAPL")
+    .body(tag::SIDE, b"1".to_vec())
+    .body_int(tag::ORDER_QTY, 100)
+    .body(tag::ORD_TYPE, b"2".to_vec())
+    .body_str(tag::PRICE, "100.25")
+    .body(tag::TIME_IN_FORCE, b"0".to_vec())
+    .body_str(tag::TRANSACT_TIME, "20261025-12:34:56.001")
+    .build()
+}
+
+#[test]
+fn two_fix_seats_log_on_through_the_same_listener() {
+    let directory = temporary_directory("multi-seat");
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let registry = deepbook_gateway::seat::SeatRegistry::parse(
+        r#"
+[[seat]]
+seat_id = 1
+account_id = 11
+protocol = "fix"
+sender = "DEEPBOOK"
+target = "CLIENT1"
+
+[[seat]]
+seat_id = 2
+account_id = 12
+protocol = "fix"
+sender = "DEEPBOOK"
+target = "CLIENT2"
+"#,
+    )
+    .expect("seats");
+    let mut config = GatewayConfig::new(
+        "127.0.0.1:0".parse().expect("address"),
+        &directory,
+        "DEEPBOOK",
+        "CLIENT",
+    );
+    config.seats = Some(registry);
+    let mut gateway = Gateway::bind(
+        config,
+        RecordingSink {
+            messages: Arc::clone(&messages),
+        },
+    )
+    .expect("bind");
+    let address = gateway.local_addr().expect("local address");
+    let handle = std::thread::spawn(move || {
+        gateway
+            .run_until(Instant::now() + Duration::from_secs(4))
+            .expect("gateway");
+    });
+
+    let mut first = TcpStream::connect(address).expect("first connect");
+    first
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("timeout");
+    first
+        .write_all(&logon_as(1, "CLIENT1"))
+        .expect("first logon");
+    assert_eq!(
+        MsgType::Logon,
+        read_frame(&mut first).msg_type().expect("first reply")
+    );
+
+    let mut second = TcpStream::connect(address).expect("second connect");
+    second
+        .set_read_timeout(Some(Duration::from_millis(100)))
+        .expect("timeout");
+    second
+        .write_all(&logon_as(1, "CLIENT2"))
+        .expect("second logon");
+    assert_eq!(
+        MsgType::Logon,
+        read_frame(&mut second).msg_type().expect("second reply")
+    );
+
+    first
+        .write_all(&new_order_as(2, "CLIENT1", "C-1"))
+        .expect("first order");
+    second
+        .write_all(&new_order_as(2, "CLIENT2", "C-2"))
+        .expect("second order");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if messages.lock().expect("sink").len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "both seats did not reach the sink"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let delivered = messages.lock().expect("sink");
+    let ids: Vec<&str> = delivered
+        .iter()
+        .filter_map(|message| match message {
+            ApplicationMessage::NewOrderSingle(order) => Some(order.cl_ord_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&"C-1"));
+    assert!(ids.contains(&"C-2"));
+    drop(delivered);
+
+    drop(first);
+    drop(second);
+    handle.join().expect("gateway thread");
+
+    assert!(
+        directory
+            .join(SessionKey::new("DEEPBOOK", "CLIENT1").directory_name())
+            .join("journal.bin")
+            .is_file()
+    );
+    assert!(
+        directory
+            .join(SessionKey::new("DEEPBOOK", "CLIENT2").directory_name())
+            .join("journal.bin")
+            .is_file()
+    );
     std::fs::remove_dir_all(directory).expect("cleanup");
 }

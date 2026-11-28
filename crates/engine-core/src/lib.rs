@@ -35,7 +35,7 @@ pub use book::{BookView, LevelView, OrderView};
 pub use command::{
     CancelOrder, Command, NewOrder, OrdType, RejectReason, ReplaceOrder, TimeInForce,
 };
-pub use engine::{Engine, EngineConfig};
+pub use engine::{Engine, EngineConfig, RestingOrderSummary};
 pub use event::{
     BookUpdateEvent, CancelRejectEvent, Event, EventHeader, EventSeq, EventSink, ExecType,
     ExecutionReportEvent, SnapshotEvent, TradeEvent,
@@ -45,4 +45,6 @@ pub use risk::{RiskConfig, SelfTradePrevention};
 pub use snapshot::{
     BookSnapshot, EngineSnapshot, LevelSnapshot, OrderSlotSnapshot, SeenEntry, SnapshotError,
 };
-pub use wire::{WireError, decode_command, decode_event, encode_command, encode_event};
+pub use wire::{
+    WireError, decode_command, decode_event, encode_command, encode_event, reject_reason_code,
+};

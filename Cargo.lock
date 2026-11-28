@@ -122,6 +122,7 @@ version = "0.1.0"
 dependencies = [
  "deepbook-fix",
  "deepbook-gateway",
+ "deepbook-ouch",
  "deepbook-types",
  "deepmsg-log",
 ]
@@ -165,10 +166,12 @@ dependencies = [
 name = "deepbook-gateway"
 version = "0.1.0"
 dependencies = [
+ "deepbook-engine-cluster",
  "deepbook-engine-core",
  "deepbook-fix",
  "deepbook-http",
  "deepbook-io",
+ "deepbook-ouch",
  "deepbook-types",
  "deepmsg-client",
  "deepmsg-cluster-client",
@@ -200,6 +203,13 @@ dependencies = [
  "deepmsg-client",
  "deepmsg-core",
  "proptest",
+]
+
+[[package]]
+name = "deepbook-ouch"
+version = "0.1.0"
+dependencies = [
+ "deepbook-engine-core",
 ]
 
 [[package]]
